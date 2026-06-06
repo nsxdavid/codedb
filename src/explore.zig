@@ -225,13 +225,25 @@ pub const DependencyGraph = struct {
     forward: std.StringHashMap(std.ArrayList([]const u8)),
     reverse: std.StringHashMap(std.StringHashMap(void)),
     allocator: std.mem.Allocator,
+    /// Owns the resolved dependency strings the graph creates (e.g. relative
+    /// imports normalized to repo paths). Raw specifiers handed in by callers
+    /// are still borrowed; only graph-minted strings live here. Freed after the
+    /// maps in deinit, so map keys/values never outlive their backing bytes.
+    str_arena: std.heap.ArenaAllocator,
 
     pub fn init(allocator: std.mem.Allocator) DependencyGraph {
         return .{
             .forward = std.StringHashMap(std.ArrayList([]const u8)).init(allocator),
             .reverse = std.StringHashMap(std.StringHashMap(void)).init(allocator),
             .allocator = allocator,
+            .str_arena = std.heap.ArenaAllocator.init(allocator),
         };
+    }
+
+    /// Intern a string into the graph-owned arena, returning a slice valid for
+    /// the lifetime of the graph. Use for resolved paths that have no other owner.
+    pub fn internString(self: *DependencyGraph, s: []const u8) ![]const u8 {
+        return self.str_arena.allocator().dupe(u8, s);
     }
 
     pub fn deinit(self: *DependencyGraph) void {
@@ -246,6 +258,9 @@ pub const DependencyGraph = struct {
             entry.value_ptr.deinit();
         }
         self.reverse.deinit();
+
+        // Free interned strings last: the maps above borrow from this arena.
+        self.str_arena.deinit();
     }
 
     pub fn setDeps(self: *DependencyGraph, path: []const u8, deps: std.ArrayList([]const u8)) !void {
@@ -4507,10 +4522,10 @@ pub const Explorer = struct {
         defer seen.deinit();
 
         for (outline.imports.items) |imp| {
-            if (std.mem.indexOf(u8, imp, "..") != null) continue;
-            const gop = try seen.getOrPut(imp);
+            const dep = (try resolveDependencyKey(&self.dep_graph, outline.path, imp, self.allocator)) orelse continue;
+            const gop = try seen.getOrPut(dep);
             if (gop.found_existing) continue;
-            try deps.append(self.allocator, imp);
+            try deps.append(self.allocator, dep);
         }
 
         try self.dep_graph.setDeps(path, deps);
@@ -5903,7 +5918,9 @@ fn extractStringLiteral(s: []const u8) ?[]const u8 {
 
 fn normalizePath(path: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
-    errdefer parts.deinit(allocator);
+    // `parts` holds borrowed slices into `path`; free the list on every path
+    // (success included). Previously errdefer-only, which leaked on success.
+    defer parts.deinit(allocator);
 
     var it = std.mem.splitSequence(u8, path, "/");
     while (it.next()) |part| {
@@ -5927,6 +5944,47 @@ fn normalizePath(path: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
         buf.appendSlice(allocator, part) catch return null;
     }
     return buf.toOwnedSlice(allocator) catch null;
+}
+
+fn isRelativeImport(spec: []const u8) bool {
+    return std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../");
+}
+
+/// Resolve a relative import specifier (`./` or `../`) against the importing
+/// file's path into a repo-rooted path, e.g.
+///   ("daemon/src/role/role-driver.ts", "../bus/x.ts") -> "daemon/src/bus/x.ts"
+/// Returns null if the path escapes the repo root or allocation fails. The
+/// caller owns the returned slice (allocated with `allocator`).
+fn resolveRelativeImportPath(file_path: []const u8, raw: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    const dir = if (std.mem.lastIndexOfScalar(u8, file_path, '/')) |sep|
+        file_path[0..sep]
+    else
+        ".";
+    const joined = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, raw }) catch return null;
+    defer allocator.free(joined);
+    return normalizePath(joined, allocator);
+}
+
+/// Map a raw import specifier to the dependency key the graph should store:
+///   - relative (./ ../) specifiers resolve to repo paths, interned in the
+///     graph arena (so they outlive the call without mutating outline.imports);
+///   - any other specifier containing ".." can't map to a repo path -> null (skip);
+///   - everything else is returned as-is (borrowed from the caller).
+/// Shared by Explorer.rebuildDepsFor and the snapshot restore path so the two
+/// never diverge. `tmp_allocator` is only used for transient resolution scratch.
+pub fn resolveDependencyKey(
+    dep_graph: *DependencyGraph,
+    importer_path: []const u8,
+    spec: []const u8,
+    tmp_allocator: std.mem.Allocator,
+) !?[]const u8 {
+    if (isRelativeImport(spec)) {
+        const tmp = resolveRelativeImportPath(importer_path, spec, tmp_allocator) orelse return null;
+        defer tmp_allocator.free(tmp);
+        return try dep_graph.internString(tmp);
+    }
+    if (std.mem.indexOf(u8, spec, "..") != null) return null;
+    return spec;
 }
 
 fn resolveDartImport(raw: []const u8, file_path: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
