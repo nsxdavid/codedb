@@ -2,22 +2,46 @@
 //!
 //! 0.16 removed std.fs.File.{stdout,stderr,stdin}, cio.Mutex/RwLock,
 //! std.time.Timer, std.time.nanoTimestamp, std.process.Child.run, and
-//! cio.posixGetenv. This shim wraps libc/pthread primitives so existing
-//! call sites continue to work with minimal import-line changes.
+//! cio.posixGetenv. This shim wraps libc/pthread primitives on POSIX and
+//! libc/kernel32 on native Windows so existing call sites continue to work
+//! with minimal import-line changes.
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+const is_windows = builtin.os.tag == .windows;
+
+pub const Fd = c_int;
 
 extern "c" fn write(fd: c_int, ptr: [*]const u8, len: usize) isize;
 extern "c" fn read(fd: c_int, ptr: [*]u8, len: usize) isize;
 extern "c" fn isatty(fd: c_int) c_int;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-extern "c" fn clock_gettime(id: c_int, ts: *std.c.timespec) c_int;
 extern "c" fn pipe(fds: *[2]c_int) c_int;
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn open(path: [*:0]const u8, oflag: c_int) c_int;
+extern "c" fn getpid() c_int;
+extern "c" fn getuid() c_uint;
+extern "c" fn _write(fd: c_int, ptr: [*]const u8, len: c_uint) c_int;
+extern "c" fn _read(fd: c_int, ptr: [*]u8, len: c_uint) c_int;
+extern "c" fn _isatty(fd: c_int) c_int;
+extern "c" fn _putenv_s(name: [*:0]const u8, value: [*:0]const u8) c_int;
+const FileTime = extern struct { lo: u32, hi: u32 };
+const PosixTimespec = extern struct { sec: isize, nsec: isize };
+extern "c" fn clock_gettime(id: c_int, ts: *PosixTimespec) c_int;
+extern "kernel32" fn GetSystemTimeAsFileTime(ft: *FileTime) callconv(.winapi) void;
+extern "kernel32" fn AcquireSRWLockExclusive(lock: *?*anyopaque) callconv(.winapi) void;
+extern "kernel32" fn ReleaseSRWLockExclusive(lock: *?*anyopaque) callconv(.winapi) void;
+extern "kernel32" fn AcquireSRWLockShared(lock: *?*anyopaque) callconv(.winapi) void;
+extern "kernel32" fn ReleaseSRWLockShared(lock: *?*anyopaque) callconv(.winapi) void;
+extern "kernel32" fn TryAcquireSRWLockExclusive(lock: *?*anyopaque) callconv(.winapi) std.os.windows.BOOLEAN;
+extern "kernel32" fn TryAcquireSRWLockShared(lock: *?*anyopaque) callconv(.winapi) std.os.windows.BOOLEAN;
+extern "kernel32" fn QueryPerformanceCounter(value: *i64) callconv(.winapi) c_int;
+extern "kernel32" fn QueryPerformanceFrequency(value: *i64) callconv(.winapi) c_int;
+extern "kernel32" fn Sleep(ms: std.os.windows.DWORD) callconv(.winapi) void;
 
 pub fn ignoreSigpipe() void {
+    if (is_windows) return;
     var act: std.posix.Sigaction = .{
         .handler = .{ .handler = std.posix.SIG.IGN },
         .mask = std.posix.sigemptyset(),
@@ -33,6 +57,7 @@ pub fn ignoreSigpipe() void {
 /// failure here only means the daemon keeps an inherited fd, not that it
 /// malfunctions. Called once at cli-daemon startup.
 pub fn detachFromTerminal() void {
+    if (is_windows) return;
     _ = std.c.setsid();
     // O_RDWR == 2 on both Darwin and Linux.
     const fd = open("/dev/null", 2);
@@ -44,13 +69,10 @@ pub fn detachFromTerminal() void {
     }
 }
 
-const CLOCK_REALTIME: c_int = 0;
-const CLOCK_MONOTONIC: c_int = if (builtin.os.tag == .macos) 6 else 1;
-
 // ── Stdio ────────────────────────────────────────────────────────────────
 
 pub const File = struct {
-    handle: c_int,
+    handle: Fd,
 
     pub fn stdout() File {
         return .{ .handle = 1 };
@@ -63,13 +85,14 @@ pub const File = struct {
     }
 
     pub fn isTty(self: File) bool {
+        if (is_windows) return _isatty(self.handle) != 0;
         return isatty(self.handle) != 0;
     }
 
     pub fn writeAll(self: File, data: []const u8) !void {
         var rem = data;
         while (rem.len > 0) {
-            const n = write(self.handle, rem.ptr, rem.len);
+            const n = writeRaw(self.handle, rem);
             if (n <= 0) return error.WriteFailed;
             rem = rem[@intCast(n)..];
         }
@@ -86,41 +109,118 @@ pub const File = struct {
     }
 };
 
+pub fn writeFd(fd: c_int, data: []const u8) void {
+    (File{ .handle = fd }).writeAll(data) catch {};
+}
+
+fn writeRaw(fd: c_int, buf: []const u8) isize {
+    if (is_windows) return _write(fd, buf.ptr, @intCast(@min(buf.len, std.math.maxInt(c_uint))));
+    return write(fd, buf.ptr, buf.len);
+}
+
+fn readRaw(fd: c_int, buf: []u8) isize {
+    if (is_windows) return _read(fd, buf.ptr, @intCast(@min(buf.len, std.math.maxInt(c_uint))));
+    return read(fd, buf.ptr, buf.len);
+}
+
+pub fn processId() u64 {
+    if (is_windows) return 0;
+    return @intCast(getpid());
+}
+
+pub fn userId() usize {
+    if (is_windows) return 0;
+    return @intCast(getuid());
+}
+
+pub fn mapFileRead(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, size: usize) ![]align(std.heap.page_size_min) const u8 {
+    if (is_windows) {
+        const buf = try allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), size);
+        errdefer allocator.free(buf);
+        if ((file.readPositionalAll(io, buf, 0) catch 0) != size) return error.ReadFailed;
+        return buf;
+    }
+    return std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
+}
+
+pub fn unmapFileRead(allocator: std.mem.Allocator, data: []align(std.heap.page_size_min) const u8) void {
+    if (is_windows) {
+        allocator.free(@constCast(data));
+        return;
+    }
+    std.posix.munmap(data);
+}
+
 // ── Threads / Sync ───────────────────────────────────────────────────────
 
-pub const Mutex = struct {
+// Windows uses kernel32 SRWLOCK (zero-initialized pointer-sized lock) for both
+// shapes; POSIX keeps the pthread primitives so concurrent readers stay free.
+pub const Mutex = if (is_windows) struct {
+    inner: ?*anyopaque = null,
+
+    pub fn lock(self: *@This()) void {
+        AcquireSRWLockExclusive(&self.inner);
+    }
+    pub fn unlock(self: *@This()) void {
+        ReleaseSRWLockExclusive(&self.inner);
+    }
+    pub fn tryLock(self: *@This()) bool {
+        return TryAcquireSRWLockExclusive(&self.inner) != 0;
+    }
+} else struct {
     inner: std.c.pthread_mutex_t = .{},
 
-    pub fn lock(self: *Mutex) void {
+    pub fn lock(self: *@This()) void {
         _ = std.c.pthread_mutex_lock(&self.inner);
     }
-    pub fn unlock(self: *Mutex) void {
+    pub fn unlock(self: *@This()) void {
         _ = std.c.pthread_mutex_unlock(&self.inner);
     }
-    pub fn tryLock(self: *Mutex) bool {
+    pub fn tryLock(self: *@This()) bool {
         return std.c.pthread_mutex_trylock(&self.inner) == .SUCCESS;
     }
 };
 
-pub const RwLock = struct {
+pub const RwLock = if (is_windows) struct {
+    inner: ?*anyopaque = null,
+
+    pub fn lock(self: *@This()) void {
+        AcquireSRWLockExclusive(&self.inner);
+    }
+    pub fn unlock(self: *@This()) void {
+        ReleaseSRWLockExclusive(&self.inner);
+    }
+    pub fn lockShared(self: *@This()) void {
+        AcquireSRWLockShared(&self.inner);
+    }
+    pub fn unlockShared(self: *@This()) void {
+        ReleaseSRWLockShared(&self.inner);
+    }
+    pub fn tryLock(self: *@This()) bool {
+        return TryAcquireSRWLockExclusive(&self.inner) != 0;
+    }
+    pub fn tryLockShared(self: *@This()) bool {
+        return TryAcquireSRWLockShared(&self.inner) != 0;
+    }
+} else struct {
     inner: std.c.pthread_rwlock_t = .{},
 
-    pub fn lock(self: *RwLock) void {
+    pub fn lock(self: *@This()) void {
         _ = std.c.pthread_rwlock_wrlock(&self.inner);
     }
-    pub fn unlock(self: *RwLock) void {
+    pub fn unlock(self: *@This()) void {
         _ = std.c.pthread_rwlock_unlock(&self.inner);
     }
-    pub fn lockShared(self: *RwLock) void {
+    pub fn lockShared(self: *@This()) void {
         _ = std.c.pthread_rwlock_rdlock(&self.inner);
     }
-    pub fn unlockShared(self: *RwLock) void {
+    pub fn unlockShared(self: *@This()) void {
         _ = std.c.pthread_rwlock_unlock(&self.inner);
     }
-    pub fn tryLock(self: *RwLock) bool {
+    pub fn tryLock(self: *@This()) bool {
         return std.c.pthread_rwlock_trywrlock(&self.inner) == .SUCCESS;
     }
-    pub fn tryLockShared(self: *RwLock) bool {
+    pub fn tryLockShared(self: *@This()) bool {
         return std.c.pthread_rwlock_tryrdlock(&self.inner) == .SUCCESS;
     }
 };
@@ -128,42 +228,60 @@ pub const RwLock = struct {
 // ── Time ─────────────────────────────────────────────────────────────────
 
 pub fn nanoTimestamp() i128 {
-    var ts: std.c.timespec = undefined;
-    _ = clock_gettime(CLOCK_REALTIME, &ts);
+    if (is_windows) {
+        var ft: FileTime = undefined;
+        GetSystemTimeAsFileTime(&ft);
+        const hns = (@as(u64, ft.hi) << 32) | ft.lo;
+        return (@as(i128, @intCast(hns)) - 116444736000000000) * 100;
+    }
+    var ts: PosixTimespec = undefined;
+    _ = clock_gettime(0, &ts);
     return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
 }
 
 pub fn milliTimestamp() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = clock_gettime(CLOCK_REALTIME, &ts);
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+    return @intCast(@divTrunc(nanoTimestamp(), 1_000_000));
 }
 
 pub const Timer = struct {
     start_ns: i128,
 
     pub fn start() !Timer {
-        var ts: std.c.timespec = undefined;
-        _ = clock_gettime(CLOCK_MONOTONIC, &ts);
-        return .{ .start_ns = @as(i128, ts.sec) * 1_000_000_000 + ts.nsec };
+        return .{ .start_ns = monotonicNow() };
     }
 
     pub fn read(self: *Timer) u64 {
-        var ts: std.c.timespec = undefined;
-        _ = clock_gettime(CLOCK_MONOTONIC, &ts);
-        const now = @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
-        return @intCast(now - self.start_ns);
+        return @intCast(monotonicNow() - self.start_ns);
     }
 
     pub fn lap(self: *Timer) u64 {
-        var ts: std.c.timespec = undefined;
-        _ = clock_gettime(CLOCK_MONOTONIC, &ts);
-        const now = @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+        const now = monotonicNow();
         const delta: u64 = @intCast(now - self.start_ns);
         self.start_ns = now;
         return delta;
     }
 };
+
+// The performance-counter frequency is fixed at boot, so query it once and
+// cache it. Concurrent first calls race benignly: every writer stores the
+// same value.
+var qpf_cache = std.atomic.Value(i64).init(0);
+
+fn monotonicNow() i128 {
+    if (is_windows) {
+        var freq = qpf_cache.load(.monotonic);
+        if (freq <= 0) {
+            if (QueryPerformanceFrequency(&freq) == 0 or freq <= 0) return nanoTimestamp();
+            qpf_cache.store(freq, .monotonic);
+        }
+        var counter: i64 = 0;
+        if (QueryPerformanceCounter(&counter) == 0) return nanoTimestamp();
+        return @divTrunc(@as(i128, counter) * 1_000_000_000, freq);
+    }
+    var ts: PosixTimespec = undefined;
+    _ = clock_gettime(if (builtin.os.tag == .macos) 6 else 1, &ts);
+    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+}
 
 // ── Environment ──────────────────────────────────────────────────────────
 
@@ -172,12 +290,11 @@ pub const Timer = struct {
 /// suffix collision avoidance. Thread-safe: each thread gets a unique
 /// mix per-call even at the same nanosecond.
 pub fn randU64() u64 {
-    var ts: std.c.timespec = undefined;
-    _ = clock_gettime(CLOCK_REALTIME, &ts);
-    const ns = @as(u64, @intCast(ts.nsec));
-    const sec = @as(u64, @intCast(ts.sec));
+    const now = nanoTimestamp();
+    const ns = @as(u64, @intCast(@mod(now, 1_000_000_000)));
+    const sec = @as(u64, @intCast(@divTrunc(now, 1_000_000_000)));
     const tid = std.Thread.getCurrentId();
-    const pid: u64 = @intCast(std.c.getpid());
+    const pid: u64 = processId();
     // splitmix64-style final mixing to avoid close-timestamp collisions
     var x = ns ^ (sec *% 2) ^ (tid *% (1 << 17)) ^ (pid *% (1 << 23));
     x ^= x >> 33;
@@ -189,6 +306,10 @@ pub fn randU64() u64 {
 }
 
 pub fn sleepMs(ms: u64) void {
+    if (is_windows) {
+        Sleep(@intCast(@min(ms, std.math.maxInt(std.os.windows.DWORD))));
+        return;
+    }
     var ts: std.c.timespec = .{
         .sec = @intCast(ms / 1000),
         .nsec = @intCast((ms % 1000) * 1_000_000),
@@ -198,16 +319,30 @@ pub fn sleepMs(ms: u64) void {
 
 pub const PipeError = error{PipeFailed};
 pub fn makePipe() PipeError![2]c_int {
+    if (is_windows) return error.PipeFailed;
     var fds: [2]c_int = .{ -1, -1 };
     if (pipe(&fds) != 0) return error.PipeFailed;
     return fds;
 }
 
 pub fn closeFd(fd: c_int) void {
+    if (is_windows) return;
     _ = close(fd);
 }
 
 pub fn posixGetenv(name: []const u8) ?[]const u8 {
+    if (getenvZ(name)) |value| return value;
+    if (is_windows and std.mem.eql(u8, name, "HOME")) return getenvZ("USERPROFILE");
+    return null;
+}
+
+/// Per-user home directory for the central codedb cache: HOME on POSIX,
+/// HOME-or-USERPROFILE on native Windows (posixGetenv does that fallback).
+pub fn userHome() ?[]const u8 {
+    return posixGetenv("HOME");
+}
+
+fn getenvZ(name: []const u8) ?[]const u8 {
     var buf: [256]u8 = undefined;
     if (name.len >= buf.len) return null;
     @memcpy(buf[0..name.len], name);
@@ -231,7 +366,11 @@ pub fn posixSetenv(name: []const u8, value: []const u8) void {
     nbuf[name.len] = 0;
     @memcpy(vbuf[0..value.len], value);
     vbuf[value.len] = 0;
-    _ = setenv(@ptrCast(&nbuf), @ptrCast(&vbuf), 1);
+    if (is_windows) {
+        _ = _putenv_s(@ptrCast(&nbuf), @ptrCast(&vbuf));
+    } else {
+        _ = setenv(@ptrCast(&nbuf), @ptrCast(&vbuf), 1);
+    }
 }
 
 /// Remove an environment variable (libc unsetenv).
@@ -240,14 +379,18 @@ pub fn posixUnsetenv(name: []const u8) void {
     if (name.len >= nbuf.len) return;
     @memcpy(nbuf[0..name.len], name);
     nbuf[name.len] = 0;
-    _ = unsetenv(@ptrCast(&nbuf));
+    if (is_windows) {
+        _ = _putenv_s(@ptrCast(&nbuf), "");
+    } else {
+        _ = unsetenv(@ptrCast(&nbuf));
+    }
 }
 
 /// Read one line from stdin (fd 0) into `buf`, trimming trailing CR/LF. Returns
 /// null on EOF/error. For interactive CLI prompts only — NEVER call this in the
 /// MCP server path, where stdin is the JSON-RPC transport.
 pub fn readLine(buf: []u8) ?[]const u8 {
-    const n = read(0, buf.ptr, buf.len);
+    const n = readRaw(0, buf);
     if (n <= 0) return null;
     return std.mem.trimEnd(u8, buf[0..@intCast(n)], "\r\n");
 }
@@ -266,6 +409,18 @@ var process_args: ?[]const [*:0]const u8 = null;
 /// platforms. No-op on macOS (it reads from `_NSGetArgv` directly).
 pub fn setProcessArgs(args: []const [*:0]const u8) void {
     process_args = args;
+}
+
+/// Windows delivers the command line as WTF-16. `Args.toSlice` converts it to
+/// WTF-8 null-terminated strings; flatten those into the posix-shaped C-string
+/// argv the rest of the code uses. Allocated from the c allocator and
+/// intentionally leaked for the process lifetime.
+pub fn windowsArgv(args: std.process.Args) ![]const [*:0]const u8 {
+    const a = std.heap.c_allocator;
+    const slices = try args.toSlice(a);
+    const out = try a.alloc([*:0]const u8, slices.len);
+    for (slices, 0..) |s, i| out[i] = s.ptr;
+    return out;
 }
 
 /// Shim for cio.argsAlloc (removed in 0.16). Returns a duplicated
@@ -390,6 +545,37 @@ const PosixSpawnFAStorage = [256]u8;
 /// a background thread to avoid pipe-buffer deadlock when the child writes
 /// substantially to either stream).
 pub fn runCapture(opts: RunOptions) !CaptureResult {
+    if (is_windows) return runCaptureWindows(opts);
+    return runCapturePosix(opts);
+}
+
+fn runCaptureWindows(opts: RunOptions) !CaptureResult {
+    const alloc = opts.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const result = try std.process.run(alloc, io, .{
+        .argv = opts.argv,
+        .cwd = if (opts.cwd) |cwd| .{ .path = cwd } else .inherit,
+        // Match the POSIX capture path: subprocess probes are bounded so noisy
+        // tools cannot turn a small git/status check into unbounded memory use.
+        .stdout_limit = .limited(opts.max_output_bytes),
+        .stderr_limit = .limited(opts.max_output_bytes),
+    });
+    const term: CaptureResult.Term = switch (result.term) {
+        .exited => |code| .{ .Exited = code },
+        .signal => |sig| .{ .Signal = @intFromEnum(sig) },
+        .stopped => |sig| .{ .Stopped = @intFromEnum(sig) },
+        .unknown => |code| .{ .Unknown = code },
+    };
+    return .{
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+        .term = term,
+    };
+}
+
+fn runCapturePosix(opts: RunOptions) !CaptureResult {
     if (opts.argv.len == 0) return error.EmptyArgv;
     const alloc = opts.allocator;
 
@@ -532,6 +718,45 @@ pub fn runCapture(opts: RunOptions) !CaptureResult {
 /// failures are swallowed — auto-spawn is best-effort and the cold path still
 /// produces correct output regardless.
 pub fn spawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) void {
+    if (is_windows) {
+        spawnDetachedWindows(allocator, argv);
+        return;
+    }
+    spawnDetachedPosix(allocator, argv);
+}
+
+fn spawnDetachedWindows(allocator: std.mem.Allocator, argv: []const []const u8) void {
+    if (argv.len == 0) return;
+
+    var cmd: std.ArrayList(u8) = .empty;
+    defer cmd.deinit(allocator);
+    for (argv, 0..) |arg, i| {
+        if (i != 0) cmd.append(allocator, ' ') catch return;
+        cmd.append(allocator, '"') catch return;
+        for (arg) |ch| {
+            if (ch == '"') cmd.append(allocator, '\\') catch return;
+            cmd.append(allocator, ch) catch return;
+        }
+        cmd.append(allocator, '"') catch return;
+    }
+    const cmd_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, cmd.items) catch return;
+    defer allocator.free(cmd_w);
+
+    var si: std.os.windows.STARTUPINFOW = std.mem.zeroes(std.os.windows.STARTUPINFOW);
+    si.cb = @sizeOf(std.os.windows.STARTUPINFOW);
+    var pi: std.os.windows.PROCESS.INFORMATION = undefined;
+    // Windows has no setsid/dev-null equivalent for this use case. DETACHED
+    // PROCESS + CREATE_NO_WINDOW gives the same user-visible behavior: the
+    // warm cli-daemon outlives the spawning CLI and does not flash a console.
+    // Use the wide API so self_exe/root paths outside the active ANSI code page
+    // still launch correctly from non-ASCII Windows profiles/checkouts.
+    const flags: std.os.windows.CreateProcessFlags = .{ .detached_process = true, .create_no_window = true };
+    if (std.os.windows.kernel32.CreateProcessW(null, cmd_w.ptr, null, null, .FALSE, flags, null, null, &si, &pi) == .FALSE) return;
+    std.os.windows.CloseHandle(pi.hThread);
+    std.os.windows.CloseHandle(pi.hProcess);
+}
+
+fn spawnDetachedPosix(allocator: std.mem.Allocator, argv: []const []const u8) void {
     if (argv.len == 0) return;
 
     const c_argv = allocator.alloc(?[*:0]const u8, argv.len + 1) catch return;
