@@ -208,12 +208,13 @@ const ProjectCtx = struct {
 
 fn getProjectDataDir(allocator: std.mem.Allocator, project_path: []const u8) ?[]u8 {
     const hash = std.hash.Wyhash.hash(0, project_path);
-    const home = cio.posixGetenv("HOME") orelse {
+    const home = cio.userHome() orelse {
         return std.fmt.allocPrint(allocator, "{s}/.codedb", .{project_path}) catch null;
     };
 
     return std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}", .{ home, hash }) catch null;
 }
+
 
 fn loadProjectTrigramFromDiskIfPresent(io: std.Io, explorer: *Explorer, project_path: []const u8, allocator: std.mem.Allocator) void {
     explorer.mu.lockShared();
@@ -427,7 +428,7 @@ const ProjectCache = struct {
             const hash = std.hash.Wyhash.hash(0, p);
             var central_buf: [std.fs.max_path_bytes]u8 = undefined;
             const loaded_central = blk: {
-                const home = cio.posixGetenv("HOME") orelse break :blk false;
+                const home = cio.userHome() orelse break :blk false;
                 const central = std.fmt.bufPrint(&central_buf, "{s}/.codedb/projects/{x}/codedb.snapshot", .{ home, hash }) catch break :blk false;
                 break :blk snapshot_mod.loadSnapshot(io, central, &new_entry.explorer, &new_entry.store, self.alloc);
             };
@@ -5615,6 +5616,15 @@ test "issue-258: cached project reads use the project root after contents are re
     try testing.expect(std.mem.indexOf(u8, out.items, "const project = \"secondary\";") != null);
 }
 
+/// Point HOME at a `.home` directory inside `tmp` so central-cache tests
+/// (which derive their path from cio.userHome) stay inside the tmp dir.
+fn setTestHome(io_p: std.Io, tmp_dir: std.Io.Dir) !void {
+    try tmp_dir.createDirPath(io_p, ".home");
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home_len = try tmp_dir.realPathFile(io_p, ".home", &home_buf);
+    cio.posixSetenv("HOME", home_buf[0..home_len]);
+}
+
 test "ProjectCache loads project from central snapshot cache" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -5629,6 +5639,7 @@ test "ProjectCache loads project from central snapshot cache" {
     var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
     const project_path = project_path_buf[0..project_path_len];
+    try setTestHome(io, tmp.dir);
 
     const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
     defer testing.allocator.free(data_dir);
@@ -5684,6 +5695,7 @@ test "issue-353: explicit default project loads snapshot when default explorer i
     var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
     const project_path = project_path_buf[0..project_path_len];
+    try setTestHome(io, tmp.dir);
 
     const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
     defer testing.allocator.free(data_dir);
@@ -5728,6 +5740,7 @@ test "issue-353: project cache invalidation reloads newly written snapshots" {
     var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
     const project_path = project_path_buf[0..project_path_len];
+    try setTestHome(io, tmp.dir);
 
     const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
     defer testing.allocator.free(data_dir);
