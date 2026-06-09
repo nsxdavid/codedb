@@ -904,6 +904,15 @@ fn loadSnapshotFast(
     store: *Store,
     allocator: std.mem.Allocator,
 ) !bool {
+    const content_section_mark = explorer.contentSectionMark();
+    var load_ok = false;
+    defer if (!load_ok) {
+        // POSIX mmap and Windows' aligned heap-read fallback both feed borrowed
+        // content slices into Explorer. If validation rejects the snapshot after
+        // adoption, unwind those sections here so failed warm loads do not leak.
+        explorer.releaseContentSectionsFrom(content_section_mark);
+    };
+
     // Optional phase profiler (CODEDB_LOAD_PROFILE): prints a load breakdown to
     // stderr. Near-zero cost when off (one getenv + a few timestamps).
     const prof = cio.posixGetenv("CODEDB_LOAD_PROFILE") != null;
@@ -980,12 +989,15 @@ fn loadSnapshotFast(
     var content_borrowed = false;
     const section: []const u8 = section_blk: {
         const fsize: usize = std.math.cast(usize, file_stat.size) orelse return false;
-        if (std.posix.mmap(null, fsize, .{ .READ = true }, .{ .TYPE = .SHARED }, content_file.handle, 0)) |m| {
+        // POSIX returns a true mmap that can be unmapped with any allocator
+        // parameter; Windows uses an aligned heap buffer, so allocate with the
+        // Explorer allocator that will own the adopted section on success.
+        if (cio.mapFileRead(io, explorer.allocator, content_file, fsize)) |m| {
             if (explorer.adoptContentSection(m)) {
                 content_borrowed = true;
                 break :section_blk m[sec_base..][0..sec_len];
             } else |_| {
-                std.posix.munmap(m);
+                cio.unmapFileRead(explorer.allocator, m);
             }
         } else |_| {}
         const h = allocator.alloc(u8, sec_len) catch return false;
@@ -1160,27 +1172,23 @@ fn loadSnapshotFast(
     explorer.markWordIndexIncomplete(word_index_can_load_from_disk);
 
     if (sections.get(@intFromEnum(SectionId.freq_table))) |freq_entry| {
-        if (freq_entry.length == 256 * 256 * 2) {
+        if (freq_entry.length == 256 * 256 * 2) freq_load: {
             const index_mod = @import("index.zig");
-            const ft = allocator.create([256][256]u16) catch return file_count > 0;
-            const freq_file = std.Io.Dir.cwd().openFile(io, snapshot_path, .{}) catch return file_count > 0;
+            // setFrequencyTable copies the table, so ft is freed on every
+            // path -- including success -- and a single defer covers them all.
+            const ft = allocator.create([256][256]u16) catch break :freq_load;
+            defer allocator.destroy(ft);
+            const freq_file = std.Io.Dir.cwd().openFile(io, snapshot_path, .{}) catch break :freq_load;
             defer freq_file.close(io);
             var bulk_buf: [256 * 256 * 2]u8 = undefined;
-            const nr = freq_file.readPositionalAll(io, &bulk_buf, freq_entry.offset) catch {
-                allocator.destroy(ft);
-                return file_count > 0;
-            };
-            if (nr != bulk_buf.len) {
-                allocator.destroy(ft);
-                return file_count > 0;
-            }
+            const nr = freq_file.readPositionalAll(io, &bulk_buf, freq_entry.offset) catch break :freq_load;
+            if (nr != bulk_buf.len) break :freq_load;
             for (0..256) |a| {
                 for (0..256) |b| {
                     ft[a][b] = std.mem.readInt(u16, bulk_buf[(a * 256 + b) * 2 ..][0..2], .little);
                 }
             }
             index_mod.setFrequencyTable(ft);
-            allocator.destroy(ft);
         }
     }
 
@@ -1220,6 +1228,7 @@ fn loadSnapshotFast(
         );
     }
 
+    load_ok = true;
     return true;
 }
 
@@ -1399,7 +1408,7 @@ pub fn writeProjectCacheSnapshot(
     allocator: std.mem.Allocator,
 ) !void {
     const hash = std.hash.Wyhash.hash(0, root_path);
-    const home_raw = cio.posixGetenv("HOME") orelse return;
+    const home_raw = cio.userHome() orelse return;
     const home = allocator.dupe(u8, home_raw) catch return;
     defer allocator.free(home);
     const secondary = std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}/codedb.snapshot", .{ home, hash }) catch return;
@@ -1417,6 +1426,7 @@ pub fn writeProjectCacheSnapshot(
 
     try writeSnapshot(io, explorer, root_path, secondary, allocator);
 }
+
 
 fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
     for (s) |c| {

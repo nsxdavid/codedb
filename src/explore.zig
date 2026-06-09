@@ -873,7 +873,7 @@ pub const Explorer = struct {
         // munmap'd after contents.deinit (above): the cache holds borrowed slices
         // into these maps, but deinit skips freeing borrowed values, so the maps
         // are still valid through it and only released here.
-        for (self.content_section_maps.items) |m| std.posix.munmap(m);
+        for (self.content_section_maps.items) |m| cio.unmapFileRead(self.allocator, m);
         self.content_section_maps.deinit(self.allocator);
         if (self.root_dir) |d| {
             if (self.io) |io| d.close(io);
@@ -890,6 +890,17 @@ pub const Explorer = struct {
     /// borrows (value_owned=false) slices from. munmap'd at deinit.
     pub fn adoptContentSection(self: *Explorer, map: []align(std.heap.page_size_min) const u8) !void {
         try self.content_section_maps.append(self.allocator, map);
+    }
+
+    pub fn contentSectionMark(self: *const Explorer) usize {
+        return self.content_section_maps.items.len;
+    }
+
+    pub fn releaseContentSectionsFrom(self: *Explorer, mark: usize) void {
+        while (self.content_section_maps.items.len > mark) {
+            const map = self.content_section_maps.pop().?;
+            cio.unmapFileRead(self.allocator, map);
+        }
     }
 
     /// Number of slots in the heap trigram index id_to_path array (benchmark helper).
@@ -3172,16 +3183,17 @@ pub const Explorer = struct {
         @memcpy(buf[pos..][0..close.len], close);
         pos += close.len;
 
-        var file = std.Io.Dir.cwd().openFile(io_inst, path, .{ .mode = .write_only }) catch blk: {
-            break :blk std.Io.Dir.cwd().createFile(io_inst, path, .{ .truncate = false }) catch return;
-        };
+        // .truncate = false opens the existing file or creates it in one call.
+        // .read = true because Windows requires read access on the handle for
+        // length() below, even though we only append with positional writes.
+        var file = std.Io.Dir.cwd().createFile(io_inst, path, .{ .read = true, .truncate = false }) catch return;
         var current_size = file.length(io_inst) catch {
             file.close(io_inst);
             return;
         };
         if (current_size >= size_limit) {
             file.close(io_inst);
-            file = std.Io.Dir.cwd().createFile(io_inst, path, .{ .truncate = true }) catch return;
+            file = std.Io.Dir.cwd().createFile(io_inst, path, .{ .read = true, .truncate = true }) catch return;
             current_size = 0;
         }
         defer file.close(io_inst);

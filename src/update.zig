@@ -285,7 +285,7 @@ fn downloadAndReplaceBinary(io: std.Io, allocator: std.mem.Allocator, version: [
         return error.ChecksumMismatch;
     }
 
-    {
+    if (builtin.os.tag != .windows) {
         var tmp_file = try std.Io.Dir.openFileAbsolute(io, tmp_path, .{ .mode = .read_write });
         defer tmp_file.close(io);
         try tmp_file.setPermissions(io, std.Io.File.Permissions.fromMode(0o755));

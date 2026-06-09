@@ -1,5 +1,6 @@
 const std = @import("std");
 const cio = @import("cio.zig");
+const builtin = @import("builtin");
 const sty = @import("style.zig");
 
 const Out = struct {
@@ -37,7 +38,7 @@ pub fn run(io: std.Io, stdout: cio.File, s: sty.Style, allocator: std.mem.Alloca
 
     var stats = NukeStats{};
 
-    const self_pid = std.c.getpid();
+    const self_pid = cio.processId();
     stats.killed_processes = killOtherCodedbProcesses(allocator, self_pid, self_exe);
     stats.integrations_removed = deregisterInstalledIntegrations(io, allocator, home);
     stats.snapshots_removed = removeRegisteredSnapshots(io, allocator, home);
@@ -73,7 +74,8 @@ pub fn run(io: std.Io, stdout: cio.File, s: sty.Style, allocator: std.mem.Alloca
     out.p("\n  to reinstall: {s}curl -fsSL https://codedb.codegraff.com/install.sh | bash{s}\n", .{ s.cyan, s.reset });
 }
 
-fn killOtherCodedbProcesses(allocator: std.mem.Allocator, self_pid: std.c.pid_t, self_exe: ?[]const u8) usize {
+fn killOtherCodedbProcesses(allocator: std.mem.Allocator, self_pid: u64, self_exe: ?[]const u8) usize {
+    if (builtin.os.tag == .windows) return 0;
     const executable_path = self_exe orelse return 0;
     var killed: usize = 0;
     var pid_buf: [32]u8 = undefined;
