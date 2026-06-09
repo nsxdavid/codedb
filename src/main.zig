@@ -99,14 +99,21 @@ const Out = struct {
 /// fallible work into mainImpl which runs after we've already had a chance
 /// to surface usage / --version output via the fast path.
 pub fn main(init: std.process.Init.Minimal) void {
-    cio.setProcessArgs(init.args.vector);
-    if (handleFastPath(init.args.vector)) return;
+    // Linux/macOS hand over a C-string argv directly. Windows hands over the
+    // command line as WTF-16, so materialize it once as a WTF-8 C-string argv
+    // and the rest of the (posix-shaped) program is unchanged.
+    const argv: []const [*:0]const u8 = if (builtin.os.tag == .windows)
+        (cio.windowsArgv(init.args) catch &.{})
+    else
+        init.args.vector;
+    cio.setProcessArgs(argv);
+    if (handleFastPath(argv)) return;
     mainTrampoline() catch |err| {
         // Surface the failure on stderr so users see something even if the
         // worker thread crashes during startup.
         var buf: [256]u8 = undefined;
         if (std.fmt.bufPrint(&buf, "codedb: fatal startup error: {s}\n", .{@errorName(err)})) |msg| {
-            _ = std.c.write(2, msg.ptr, msg.len);
+            cio.writeFd(2, msg);
         } else |_| {}
         std.process.exit(1);
     };
@@ -124,15 +131,12 @@ fn mainTrampoline() !void {
 /// further down the stack can't take out plain `codedb` / `--help` /
 /// `--version` invocations.
 fn handleFastPath(argv: []const [*:0]const u8) bool {
-    const stdout_fd: c_int = 1;
-    const stderr_fd: c_int = 2;
-
     if (argv.len < 2) {
         const msg =
             "codedb  code intelligence server\n\n" ++
             "  usage: codedb [root] <command> [args...]\n\n" ++
             "  run `codedb --help` for the full command list.\n";
-        _ = std.c.write(stderr_fd, msg.ptr, msg.len);
+        cio.writeFd(2, msg);
         std.process.exit(1);
     }
 
@@ -142,7 +146,7 @@ fn handleFastPath(argv: []const [*:0]const u8) bool {
         const out = std.fmt.bufPrint(&buf, "codedb {s}\n", .{release_info.semver}) catch {
             std.process.exit(0);
         };
-        _ = std.c.write(stdout_fd, out.ptr, out.len);
+        cio.writeFd(1, out);
         std.process.exit(0);
     }
 
@@ -617,13 +621,80 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
 //   response (daemon→client): [u8 exit_code][u32 out_len][out_bytes]
 const cli_blob_max: u32 = 64 * 1024;
 
+const win = std.os.windows;
+const INVALID_HANDLE_VALUE = win.INVALID_HANDLE_VALUE;
+const GENERIC_READ: u32 = 0x80000000;
+const GENERIC_WRITE: u32 = 0x40000000;
+const OPEN_EXISTING: u32 = 3;
+const PIPE_ACCESS_DUPLEX: u32 = 0x00000003;
+const PIPE_TYPE_BYTE: u32 = 0x00000000;
+const PIPE_READMODE_BYTE: u32 = 0x00000000;
+const PIPE_WAIT: u32 = 0x00000000;
+const PIPE_UNLIMITED_INSTANCES: u32 = 255;
+const ERROR_PIPE_CONNECTED: u32 = 535;
+const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x00080000;
+const SECURITY_SQOS_PRESENT: u32 = 0x00100000;
+const SECURITY_IDENTIFICATION: u32 = 0x00010000;
+const SDDL_REVISION_1: u32 = 1;
+
+const SECURITY_ATTRIBUTES = extern struct {
+    nLength: u32,
+    lpSecurityDescriptor: ?*anyopaque,
+    bInheritHandle: win.BOOL,
+};
+
+extern "kernel32" fn CreateNamedPipeA(
+    lpName: [*:0]const u8,
+    dwOpenMode: u32,
+    dwPipeMode: u32,
+    nMaxInstances: u32,
+    nOutBufferSize: u32,
+    nInBufferSize: u32,
+    nDefaultTimeOut: u32,
+    lpSecurityAttributes: ?*anyopaque,
+) callconv(.winapi) win.HANDLE;
+extern "kernel32" fn ConnectNamedPipe(hNamedPipe: win.HANDLE, lpOverlapped: ?*anyopaque) callconv(.winapi) win.BOOL;
+extern "kernel32" fn DisconnectNamedPipe(hNamedPipe: win.HANDLE) callconv(.winapi) win.BOOL;
+extern "kernel32" fn CreateFileA(
+    lpFileName: [*:0]const u8,
+    dwDesiredAccess: u32,
+    dwShareMode: u32,
+    lpSecurityAttributes: ?*anyopaque,
+    dwCreationDisposition: u32,
+    dwFlagsAndAttributes: u32,
+    hTemplateFile: ?win.HANDLE,
+) callconv(.winapi) win.HANDLE;
+extern "kernel32" fn ReadFile(hFile: win.HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: ?*anyopaque) callconv(.winapi) win.BOOL;
+extern "kernel32" fn WriteFile(hFile: win.HANDLE, lpBuffer: [*]const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *u32, lpOverlapped: ?*anyopaque) callconv(.winapi) win.BOOL;
+extern "kernel32" fn CloseHandle(hObject: win.HANDLE) callconv(.winapi) win.BOOL;
+extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorA(
+    sddl: [*:0]const u8,
+    revision: u32,
+    sd: *?*anyopaque,
+    sd_size: ?*u32,
+) callconv(.winapi) win.BOOL;
+
 /// Build the per-project socket path into `buf`. Stays well under sun_path
 /// (104 bytes on macOS / 108 on Linux): "/tmp/codedb-<uid>-<hash16>.sock" is
 /// at most ~40 bytes. Returns null only if formatting somehow overflows `buf`.
 fn cliSocketPath(buf: []u8, abs_root: []const u8) ?[]const u8 {
-    const uid = std.c.getuid();
+    const uid = cio.userId();
     const hash = std.hash.Wyhash.hash(0xc0de, abs_root);
     return std.fmt.bufPrint(buf, "/tmp/codedb-{d}-{x:0>16}.sock", .{ uid, hash }) catch null;
+}
+
+fn cliPipeName(buf: []u8, abs_root: []const u8) ?[:0]const u8 {
+    const hash = std.hash.Wyhash.hash(0xc0de, abs_root);
+    // Windows' behavior-equivalent endpoint is a per-project named pipe. It is
+    // process-independent like the Unix socket path, but lives in the NT pipe
+    // namespace instead of the filesystem. Hash the username in like the uid in
+    // cliSocketPath so two users sharing a machine and project path get
+    // distinct endpoints (the owner-only DACL would refuse the cross-user
+    // connection anyway; distinct names keep both daemons usable).
+    const user_hash = std.hash.Wyhash.hash(0xc0de, cio.posixGetenv("USERNAME") orelse "");
+    return std.fmt.bufPrintZ(buf, "\\\\.\\pipe\\codedb-{x:0>16}-{x:0>16}", .{ hash, user_hash }) catch null;
 }
 
 /// Fill a sockaddr.un for `path` (which must be NUL-terminatable into sun_path).
@@ -640,35 +711,56 @@ fn cliFillSockaddr(path: []const u8) ?struct { addr: std.c.sockaddr.un, len: std
     return .{ .addr = addr, .len = len };
 }
 
-/// Read exactly `buf.len` bytes from a blocking fd, looping over short reads.
-/// Returns false on EOF-before-full or a hard error (EINTR is retried).
-fn cliReadFull(fd: c_int, buf: []u8) bool {
+/// One CLI proxy connection. Each platform has exactly one transport: a Unix
+/// domain socket fd on POSIX, a named-pipe HANDLE on Windows. Everything above
+/// cliReadFull/cliWriteFull (framing, serve, respond, proxy) is shared.
+const CliConn = if (builtin.os.tag == .windows) win.HANDLE else c_int;
+
+/// Read exactly `buf.len` bytes from a blocking connection, looping over short
+/// reads. Returns false on EOF-before-full or a hard error (EINTR is retried).
+fn cliReadFull(conn: CliConn, buf: []u8) bool {
     var off: usize = 0;
     while (off < buf.len) {
-        const n = std.c.read(fd, buf.ptr + off, buf.len - off);
-        if (n > 0) {
-            off += @intCast(n);
-            continue;
+        if (builtin.os.tag == .windows) {
+            var got: u32 = 0;
+            const want: u32 = @intCast(@min(buf.len - off, std.math.maxInt(u32)));
+            if (ReadFile(conn, buf.ptr + off, want, &got, null) == .FALSE) return false;
+            if (got == 0) return false;
+            off += got;
+        } else {
+            const n = std.c.read(conn, buf.ptr + off, buf.len - off);
+            if (n > 0) {
+                off += @intCast(n);
+                continue;
+            }
+            if (n == 0) return false; // peer closed early
+            if (std.c.errno(n) == .INTR) continue;
+            return false;
         }
-        if (n == 0) return false; // peer closed early
-        if (std.c.errno(n) == .INTR) continue;
-        return false;
     }
     return true;
 }
 
-/// Write all of `data` to a blocking fd, looping over short/partial writes.
-/// Returns false on a hard error (EINTR is retried).
-fn cliWriteFull(fd: c_int, data: []const u8) bool {
+/// Write all of `data` to a blocking connection, looping over short/partial
+/// writes. Returns false on a hard error (EINTR is retried).
+fn cliWriteFull(conn: CliConn, data: []const u8) bool {
     var off: usize = 0;
     while (off < data.len) {
-        const n = std.c.write(fd, data.ptr + off, data.len - off);
-        if (n > 0) {
-            off += @intCast(n);
-            continue;
+        if (builtin.os.tag == .windows) {
+            var wrote: u32 = 0;
+            const want: u32 = @intCast(@min(data.len - off, std.math.maxInt(u32)));
+            if (WriteFile(conn, data.ptr + off, want, &wrote, null) == .FALSE) return false;
+            if (wrote == 0) return false;
+            off += wrote;
+        } else {
+            const n = std.c.write(conn, data.ptr + off, data.len - off);
+            if (n > 0) {
+                off += @intCast(n);
+                continue;
+            }
+            if (n < 0 and std.c.errno(n) == .INTR) continue;
+            return false;
         }
-        if (n < 0 and std.c.errno(n) == .INTR) continue;
-        return false;
     }
     return true;
 }
@@ -689,14 +781,6 @@ fn cliIsQueryCmd(cmd: []const u8) bool {
     return false;
 }
 
-/// Daemon side. Bind a per-project Unix socket and serve framed query requests
-/// against the warm `explorer`/`store`. Runs on its own detached thread so it
-/// never blocks the daemon's primary loop. Connections are handled sequentially
-/// (CLI calls are infrequent and runQuery already tolerates concurrent reads
-/// from the watcher). On a fatal bind failure it logs and returns — the daemon
-/// keeps working and clients simply fall back to the cold path.
-/// Daemon side. Bind a per-project Unix socket and serve framed query requests
-/// against the warm `explorer`/`store`. Runs on its own detached thread so it
 /// #592: per-project cli-daemon spawn lock. Open-or-create
 /// `<data_dir>/cli-daemon.lock` and take an exclusive non-blocking flock.
 /// Returns the fd on success — callers keep it open for the process lifetime
@@ -723,9 +807,14 @@ pub fn daemonLockAvailable(data_dir: []const u8) bool {
     _ = std.c.close(fd);
     return true;
 }
-/// never blocks the daemon's primary loop. Connections are handled sequentially
-/// (CLI calls are infrequent and runQuery already tolerates concurrent reads
-/// from the watcher).
+
+/// Daemon side. Bind the per-project endpoint (Unix socket on POSIX, named
+/// pipe on Windows) and serve framed query requests against the warm
+/// `explorer`/`store`. Runs on its own detached thread so it never blocks the
+/// daemon's primary loop. Connections are handled sequentially (CLI calls are
+/// infrequent and runQuery already tolerates concurrent reads from the
+/// watcher). On a fatal bind failure it logs and returns — the daemon keeps
+/// working and clients simply fall back to the cold path.
 ///
 /// `last_activity_ms` is bumped to the current ms timestamp at the start of
 /// every accepted connection so a time-based idle watchdog (cli-daemon) can
@@ -735,6 +824,63 @@ pub fn daemonLockAvailable(data_dir: []const u8) bool {
 /// long-lived serve/mcp daemons pass a `shutdown` flag they never watch, so for
 /// them a bind failure simply disables the proxy (clients fall back to cold).
 fn cliDaemonListen(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store: *Store, abs_root: []const u8, last_activity_ms: *std.atomic.Value(i64), shutdown: *std.atomic.Value(bool)) void {
+    if (builtin.os.tag == .windows) {
+        var name_buf: [256]u8 = undefined;
+        const pipe_name = cliPipeName(&name_buf, abs_root) orelse {
+            shutdown.store(true, .release);
+            return;
+        };
+
+        // Owner-only protected DACL — parity with the chmod 0600 on the Unix
+        // socket path. Fail closed: no proxy beats a default-DACL pipe that
+        // other local users could open.
+        var sd: ?*anyopaque = null;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorA("D:P(A;;GA;;;OW)", SDDL_REVISION_1, &sd, null) == .FALSE) {
+            shutdown.store(true, .release);
+            return;
+        }
+        defer _ = LocalFree(sd);
+        var sa_pipe: SECURITY_ATTRIBUTES = .{
+            .nLength = @sizeOf(SECURITY_ATTRIBUTES),
+            .lpSecurityDescriptor = sd,
+            .bInheritHandle = .FALSE,
+        };
+
+        while (!shutdown.load(.acquire)) {
+            // FILE_FLAG_FIRST_PIPE_INSTANCE: creating the name only succeeds
+            // when no instance exists, so a daemon that lost the race to a
+            // live daemon — or to a squatter — exits instead of serving
+            // alongside it (clients then fall back to the cold path).
+            const pipe = CreateNamedPipeA(
+                pipe_name.ptr,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                cli_blob_max + 5,
+                cli_blob_max + 5,
+                0,
+                &sa_pipe,
+            );
+            if (pipe == INVALID_HANDLE_VALUE) {
+                // Another live daemon owns the per-project pipe, or the pipe
+                // namespace is unavailable. Signal cli-daemon startup to exit;
+                // serve/mcp callers ignore this flag and simply lose the proxy.
+                shutdown.store(true, .release);
+                return;
+            }
+            const connected = ConnectNamedPipe(pipe, null) != .FALSE or GetLastError() == ERROR_PIPE_CONNECTED;
+            if (!connected) {
+                _ = CloseHandle(pipe);
+                continue;
+            }
+            last_activity_ms.store(cio.milliTimestamp(), .release);
+            cliServeConn(io, allocator, explorer, store, abs_root, pipe);
+            _ = DisconnectNamedPipe(pipe);
+            _ = CloseHandle(pipe);
+        }
+        return;
+    }
+
     var path_buf: [128]u8 = undefined;
     const sock_path = cliSocketPath(&path_buf, abs_root) orelse {
         std.log.warn("cli-proxy: could not build socket path", .{});
@@ -818,7 +964,7 @@ fn cliDaemonListen(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer
 
 /// Handle one client connection: read the framed request, run the query into a
 /// sink buffer via runQuery, and write the framed response.
-fn cliServeConn(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store: *Store, abs_root: []const u8, conn: c_int) void {
+fn cliServeConn(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store: *Store, abs_root: []const u8, conn: CliConn) void {
     // Header: [u8 color][u32 blob_len]
     var hdr: [5]u8 = undefined;
     if (!cliReadFull(conn, &hdr)) return;
@@ -869,7 +1015,7 @@ fn cliServeConn(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, s
 }
 
 /// Write the framed response [u8 code][u32 out_len][out_bytes] to `conn`.
-fn cliRespond(conn: c_int, code: u8, out_bytes: []const u8) void {
+fn cliRespond(conn: CliConn, code: u8, out_bytes: []const u8) void {
     var hdr: [5]u8 = undefined;
     hdr[0] = code;
     std.mem.writeInt(u32, hdr[1..5], @intCast(out_bytes.len), .little);
@@ -886,16 +1032,8 @@ fn cliTryProxy(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8, a
     _ = io;
     if (args.len < 2) return null;
 
-    var path_buf: [128]u8 = undefined;
-    const sock_path = cliSocketPath(&path_buf, abs_root) orelse return null;
-    const sa = cliFillSockaddr(sock_path) orelse return null;
-
-    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
-    if (fd < 0) return null;
-    defer _ = std.c.close(fd);
-
-    var sa_mut = sa;
-    if (std.c.connect(fd, @ptrCast(&sa_mut.addr), sa_mut.len) != 0) return null;
+    const conn = cliConnect(abs_root) orelse return null;
+    defer cliCloseConn(conn);
 
     // Build the NUL-joined blob from args[1..].
     var blob: std.ArrayList(u8) = .empty;
@@ -910,22 +1048,57 @@ fn cliTryProxy(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8, a
     var hdr: [5]u8 = undefined;
     hdr[0] = if (color) 1 else 0;
     std.mem.writeInt(u32, hdr[1..5], @intCast(blob.items.len), .little);
-    if (!cliWriteFull(fd, &hdr)) return null;
-    if (!cliWriteFull(fd, blob.items)) return null;
+    if (!cliWriteFull(conn, &hdr)) return null;
+    if (!cliWriteFull(conn, blob.items)) return null;
 
     // Response header: [u8 code][u32 out_len]
     var resp_hdr: [5]u8 = undefined;
-    if (!cliReadFull(fd, &resp_hdr)) return null;
+    if (!cliReadFull(conn, &resp_hdr)) return null;
     const code = resp_hdr[0];
     const out_len = std.mem.readInt(u32, resp_hdr[1..5], .little);
 
     if (out_len > 0) {
         const out_bytes = allocator.alloc(u8, out_len) catch return null;
         defer allocator.free(out_bytes);
-        if (!cliReadFull(fd, out_bytes)) return null;
+        if (!cliReadFull(conn, out_bytes)) return null;
         cio.File.stdout().writeAll(out_bytes) catch {};
     }
     return code;
+}
+
+/// Connect to the per-project daemon endpoint, or null if no daemon is
+/// reachable (caller falls back to the cold in-process path).
+fn cliConnect(abs_root: []const u8) ?CliConn {
+    if (builtin.os.tag == .windows) {
+        var name_buf: [256]u8 = undefined;
+        const pipe_name = cliPipeName(&name_buf, abs_root) orelse return null;
+        // SECURITY_IDENTIFICATION caps the impersonation level the pipe server
+        // gets from this connection: it may query the client's identity but
+        // cannot impersonate the client's token, so a rogue process squatting
+        // on the pipe name cannot act with this client's privileges.
+        const pipe = CreateFileA(pipe_name.ptr, GENERIC_READ | GENERIC_WRITE, 0, null, OPEN_EXISTING, SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, null);
+        if (pipe == INVALID_HANDLE_VALUE) return null;
+        return pipe;
+    }
+    var path_buf: [128]u8 = undefined;
+    const sock_path = cliSocketPath(&path_buf, abs_root) orelse return null;
+    const sa = cliFillSockaddr(sock_path) orelse return null;
+    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return null;
+    var sa_mut = sa;
+    if (std.c.connect(fd, @ptrCast(&sa_mut.addr), sa_mut.len) != 0) {
+        _ = std.c.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+fn cliCloseConn(conn: CliConn) void {
+    if (builtin.os.tag == .windows) {
+        _ = CloseHandle(conn);
+        return;
+    }
+    _ = std.c.close(conn);
 }
 fn mainImpl() !void {
     // Use c_allocator (libc malloc) — better page reclamation than GPA
@@ -1664,12 +1837,14 @@ fn mainImpl() !void {
         // racing the detached listener thread against freed explorer/store.
         const idle_exit = cliIdleWatchdog(&shutdown, &last_activity_ms, idle_ms);
         shutdown.store(true, .release);
-        // If WE owned the socket (exited on idle, not a bind-race loss), unlink
-        // it on the way out. The listener thread's own `defer unlink` never runs
-        // because std.process.exit kills it mid-accept; do it here so we don't
-        // leave a stale node behind. On a bind-race loss the socket belongs to
-        // the winning daemon, so idle_exit is false and we leave it alone.
-        if (idle_exit) {
+        // POSIX only: if WE owned the socket (exited on idle, not a bind-race
+        // loss), unlink it on the way out. The listener thread's own `defer
+        // unlink` never runs because std.process.exit kills it mid-accept; do
+        // it here so we don't leave a stale node behind. On a bind-race loss
+        // the socket belongs to the winning daemon, so idle_exit is false and
+        // we leave it alone. A Windows named pipe is a kernel object with no
+        // filesystem node — it vanishes with the process, nothing to clean up.
+        if (builtin.os.tag != .windows and idle_exit) {
             var sock_buf: [128]u8 = undefined;
             if (cliSocketPath(&sock_buf, abs_root)) |sock_path| {
                 var sock_z_buf: [128]u8 = undefined;
@@ -2554,6 +2729,12 @@ fn watcherDeferredLoop(ctx: *mcp_server.DeferredScan) void {
 
 fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
     const mcp = @import("mcp.zig");
+    if (builtin.os.tag == .windows) {
+        while (!shutdown.load(.acquire)) {
+            cio.sleepMs(mcp.dead_client_poll_ms);
+        }
+        return;
+    }
     const stdin = cio.File.stdin();
     while (!shutdown.load(.acquire)) {
         // Quick liveness check: poll stdin for POLLHUP (client disconnected).
