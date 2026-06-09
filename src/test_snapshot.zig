@@ -260,6 +260,34 @@ test "snapshot: restored outlines borrow strings (round-trip intact + clean dein
     try testing.expect(saw_beta);
 }
 
+// Pins the cio.mapFileRead / cio.unmapFileRead pair the snapshot loader leans
+// on. On POSIX this is a real mmap; on Windows it is a page-aligned heap buffer
+// read eagerly, so unmap must free with the exact size and alignment that map
+// allocated — testing.allocator flags any mismatch or leak. Also checks the
+// page alignment adoptContentSection's signature requires, and that the
+// mapping survives the source file being closed (the loader closes the
+// snapshot file while borrowed slices into the section stay live).
+test "snapshot: mapFileRead round-trips through unmapFileRead (size, alignment, content)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = "snapshot-section-bytes-0123456789";
+    {
+        var file = try tmp.dir.createFile(io, "mapped.bin", .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, payload);
+    }
+
+    const mapped = blk: {
+        var file = try tmp.dir.openFile(io, "mapped.bin", .{});
+        defer file.close(io);
+        break :blk try cio.mapFileRead(io, testing.allocator, file, payload.len);
+    };
+    try testing.expect(std.mem.isAligned(@intFromPtr(mapped.ptr), std.heap.page_size_min));
+    try testing.expectEqualStrings(payload, mapped);
+    cio.unmapFileRead(testing.allocator, mapped);
+}
+
 // Call-graph centrality (the ranking boost) is persisted in a snapshot section
 // and restored on load, so the first ranked search skips the lazy rebuild. This
 // pins: (1) the value round-trips exactly, and (2) restore happens at load time

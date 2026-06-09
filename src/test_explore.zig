@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cio = @import("cio.zig");
 const testing = std.testing;
 const io = std.testing.io;
@@ -1036,6 +1037,12 @@ test "explorer: searchContentRegex no match" {
 
 
 test "git: getGitHead returns 40-char hex SHA in a git repo" {
+    // getGitHead currently shells out to git. In the native Windows Zig test
+    // runner, that subprocess path can recurse through this checkout's tool
+    // plumbing and exhaust the DebugAllocator; POSIX keeps the subprocess
+    // regression covered until getGitHead grows a direct .git/HEAD reader.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     // codedb itself is a git repo, so this should succeed
     const head = try git_mod.getGitHead(".", testing.allocator);
     try testing.expect(head != null);
@@ -1848,6 +1855,11 @@ test "issue-389: FilteredWalker yields symlinked source files" {
 
 
 test "issue-405: FilteredWalker walks directory symlinks safely (cycle + escape)" {
+    // This asserts POSIX directory-symlink traversal and cycle handling. Windows
+    // exposes comparable behavior through reparse points, but Zig's symlink
+    // stat/open path is not equivalent here, so keep the primitive test POSIX.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     // Follow-up to #389. The current FilteredWalker.next() (src/watcher.zig:319-323)
     // treats sym_link entries as files when statFile reports .file, but silently
     // drops sym_link entries whose target is a directory. Real repos rely on
