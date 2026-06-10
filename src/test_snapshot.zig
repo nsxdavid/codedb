@@ -17,6 +17,20 @@ const git_mod = @import("git.zig");
 const AgentRegistry = @import("agent.zig").AgentRegistry;
 const edit_mod = @import("edit.zig");
 
+/// Shared snapshot round-trip recipe for the load-path coverage tests
+/// (issue-537/539 family): write `exp`'s snapshot as `snap_name` inside `tmp`,
+/// then load it into the caller-owned `exp2`/`store`. Returns loadSnapshot's
+/// success flag.
+fn snapshotRoundTrip(exp: *Explorer, tmp: *testing.TmpDir, snap_name: []const u8, exp2: *Explorer, store: *Store, load_alloc: std.mem.Allocator) !bool {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ dir_path, snap_name });
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, exp, dir_path, snap_path, testing.allocator);
+    return snapshot_mod.loadSnapshot(io, snap_path, exp2, store, load_alloc);
+}
+
 
 test "issue-35: edits immediately update explorer and snapshot output" {
     var tmp = testing.tmpDir(.{});
@@ -451,13 +465,6 @@ test "issue-537: snapshot-restored files stay searchable when trigram index is n
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
-    const dir_path = path_buf[0..dir_path_len];
-    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/cold.codedb", .{dir_path});
-    defer testing.allocator.free(snap_path);
-    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
-
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena2.deinit();
     const aa2 = arena2.allocator();
@@ -465,7 +472,7 @@ test "issue-537: snapshot-restored files stay searchable when trigram index is n
     var store = Store.init(testing.allocator);
     defer store.deinit();
 
-    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, aa2);
+    const loaded = try snapshotRoundTrip(&exp, &tmp, "cold.codedb", &exp2, &store, aa2);
     try testing.expect(loaded);
     try testing.expect(exp2.outlines.get("cold_pkg/buried.zig") != null);
 
@@ -1134,13 +1141,6 @@ test "issue-537b: snapshot-restored files resolve call edges (symbol_index diver
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
-    const dir_path = path_buf[0..dir_path_len];
-    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/callgraph.codedb", .{dir_path});
-    defer testing.allocator.free(snap_path);
-    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
-
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena2.deinit();
     const aa2 = arena2.allocator();
@@ -1148,7 +1148,7 @@ test "issue-537b: snapshot-restored files resolve call edges (symbol_index diver
     var store = Store.init(testing.allocator);
     defer store.deinit();
 
-    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, aa2);
+    const loaded = try snapshotRoundTrip(&exp, &tmp, "callgraph.codedb", &exp2, &store, aa2);
     try testing.expect(loaded);
     try testing.expect(exp2.outlines.get("main_537b.zig") != null);
 
@@ -1178,13 +1178,6 @@ test "issue-539: search recall includes snapshot-restored files (parity with wor
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
-    const dir_path = path_buf[0..dir_path_len];
-    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/recall.codedb", .{dir_path});
-    defer testing.allocator.free(snap_path);
-    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
-
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena2.deinit();
     const aa2 = arena2.allocator();
@@ -1192,7 +1185,7 @@ test "issue-539: search recall includes snapshot-restored files (parity with wor
     var store = Store.init(testing.allocator);
     defer store.deinit();
 
-    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, aa2);
+    const loaded = try snapshotRoundTrip(&exp, &tmp, "recall.codedb", &exp2, &store, aa2);
     try testing.expect(loaded);
 
     // Trigram non-empty (a hot file WITHOUT the term) so Tier 5 is ruled out —
@@ -1240,20 +1233,13 @@ test "issue-539b: search recall ranks a relevant restored file above quota witho
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
-    const dir_path = path_buf[0..dir_path_len];
-    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/recallq.codedb", .{dir_path});
-    defer testing.allocator.free(snap_path);
-    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
-
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena2.deinit();
     const aa2 = arena2.allocator();
     var exp2 = Explorer.init(aa2, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     var store = Store.init(testing.allocator);
     defer store.deinit();
-    _ = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, aa2);
+    _ = try snapshotRoundTrip(&exp, &tmp, "recallq.codedb", &exp2, &store, aa2);
 
     // HOT files (trigram) with the term ONCE each — quota pressure at max_results=2.
     try exp2.indexFile("h_a.zig", "pub fn a() void { const y = recallterm539; _ = y; }\n");
