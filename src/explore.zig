@@ -2507,21 +2507,6 @@ pub const Explorer = struct {
     }
 
     pub fn searchContent(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
-        // #539: ensure the word index — Tier 0's recall source — is populated.
-        // After a snapshot fast-load it is built lazily (see issue-220); without
-        // this, searchContent's recall collapses to the trigram/skip_trigram tiers
-        // and a relevant restored file can be crowded out of max_results by
-        // less-relevant hot files. Rebuild here so the complete inverted index
-        // feeds Tier 0's ranked candidate set (mirrors searchWord). Runs at most
-        // once per load — rebuildWordIndex sets word_index_complete = true. Must
-        // precede the shared lock below: rebuildWordIndex takes the exclusive lock.
-        if (max_results > 0) {
-            self.mu.lockShared();
-            const needs_rebuild = !self.word_index_complete and
-                (self.contents.len() > 0 or (self.io != null and self.root_dir != null));
-            self.mu.unlockShared();
-            if (needs_rebuild) try self.rebuildWordIndex();
-        }
         // #550: the graph-distance gate in rerankAndFinalize reads
         // symbol_index, which a snapshot fast-load defers (#564). Identifier-
         // shaped queries ensure it here, pre-shared-lock — ensureSymbolIndex
@@ -2536,6 +2521,11 @@ pub const Explorer = struct {
         defer self.mu.unlockShared();
 
         if (max_results == 0) return try allocator.alloc(SearchResult, 0);
+        const reserve_skip_trigram_quota = !self.word_index_complete and self.skip_trigram_files.count() > 0;
+        const primary_tier_limit = if (reserve_skip_trigram_quota and max_results > 1)
+            max_results - 1
+        else
+            max_results;
 
         var breakdown: SearchBreakdown = .{};
         defer self.last_search_breakdown = breakdown;
@@ -2608,15 +2598,15 @@ pub const Explorer = struct {
                 }.lessThan);
             }
 
-            const tier0_per_file_cap: usize = if (tier0_files.items.len <= 1) max_results else @max(1, max_results / 5);
+            const tier0_per_file_cap: usize = if (tier0_files.items.len <= 1) primary_tier_limit else @max(1, primary_tier_limit / 5);
             var tier0_exact_capacity: usize = 0;
             for (tier0_files.items) |stats| {
                 tier0_exact_capacity += @min(@as(usize, stats.count), tier0_per_file_cap);
-                if (tier0_exact_capacity >= max_results) break;
+                if (tier0_exact_capacity >= primary_tier_limit) break;
             }
-            const use_line_hits = tier0_exact_capacity >= max_results and tier0_per_file_cap <= 256;
+            const use_line_hits = tier0_exact_capacity >= primary_tier_limit and tier0_per_file_cap <= 256;
             for (tier0_files.items) |stats| {
-                if (result_list.items.len >= max_results) break;
+                if (result_list.items.len >= primary_tier_limit) break;
                 const ref = self.readContentForSearch(stats.path, allocator) orelse continue;
                 defer ref.deinit();
                 if (use_line_hits) {
@@ -2631,21 +2621,30 @@ pub const Explorer = struct {
                             target_count += 1;
                         }
                     }
-                    try appendTargetLineHits(stats.path, ref.data, allocator, target_lines[0..target_count], max_results, &result_list);
-                    if (result_list.items.len < max_results) searched.put(stats.path, {}) catch {};
+                    try appendTargetLineHits(stats.path, ref.data, allocator, target_lines[0..target_count], primary_tier_limit, &result_list);
+                    if (reserve_skip_trigram_quota or result_list.items.len < primary_tier_limit) searched.put(stats.path, {}) catch {};
                 } else {
                     searched.put(stats.path, {}) catch {};
-                    try searchInContent(stats.path, ref.data, query, allocator, tier0_per_file_cap, max_results, &result_list);
+                    try searchInContent(stats.path, ref.data, query, allocator, tier0_per_file_cap, primary_tier_limit, &result_list);
                 }
             }
-            if (result_list.items.len >= max_results) {
+            if (result_list.items.len >= primary_tier_limit) {
                 breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
                 breakdown.tier_reached = 0;
                 breakdown.result_count = @intCast(result_list.items.len);
-                const t_rerank = cio.nanoTimestamp();
-                const res = self.rerankAndFinalize(&result_list, query, allocator);
-                breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
-                return res;
+                if (reserve_skip_trigram_quota) {
+                    // Keep one result slot open for restored/outline-only files in
+                    // Tier 3. A partial word index can contain newly hot files only;
+                    // returning here would starve snapshot-restored files and
+                    // rebuilding the full index here regresses warm search latency.
+                } else if (use_line_hits) {
+                    return result_list.toOwnedSlice(allocator);
+                } else {
+                    const t_rerank = cio.nanoTimestamp();
+                    const res = self.rerankAndFinalize(&result_list, query, allocator);
+                    breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
+                    return res;
+                }
             }
         }
         breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
@@ -2727,11 +2726,12 @@ pub const Explorer = struct {
                     if (searched.contains(path)) continue;
                     const ref = self.readContentForSearch(path, allocator) orelse continue;
                     defer ref.deinit();
-                    try searchInContent(path, ref.data, query, allocator, max_per_file, max_results, &result_list);
-                    if (result_list.items.len >= max_results) {
+                    try searchInContent(path, ref.data, query, allocator, max_per_file, primary_tier_limit, &result_list);
+                    if (result_list.items.len >= primary_tier_limit) {
                         breakdown.tier1_ns = cio.nanoTimestamp() - t1_start;
                         breakdown.tier_reached = 2;
                         breakdown.result_count = @intCast(result_list.items.len);
+                        if (reserve_skip_trigram_quota) break;
                         const t_rerank = cio.nanoTimestamp();
                         const res = self.rerankAndFinalize(&result_list, query, allocator);
                         breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;

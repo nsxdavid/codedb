@@ -5,6 +5,57 @@ fn isExactOrChild(path: []const u8, prefix: []const u8) bool {
     if (!std.mem.startsWith(u8, path, prefix)) return false;
     return path.len == prefix.len or path[prefix.len] == '/';
 }
+
+fn isPathSep(c: u8) bool {
+    return c == '/' or c == '\\';
+}
+
+fn matchPathSegment(path: []const u8, index: *usize, segment: []const u8) bool {
+    const start = index.*;
+    const end = start + segment.len;
+    if (end > path.len) return false;
+    if (!std.ascii.eqlIgnoreCase(path[start..end], segment)) return false;
+    if (end == path.len) {
+        index.* = end;
+        return true;
+    }
+    if (!isPathSep(path[end])) return false;
+    index.* = end + 1;
+    return true;
+}
+
+fn consumeAnyPathSegment(path: []const u8, index: *usize) bool {
+    const start = index.*;
+    var end = start;
+    while (end < path.len and !isPathSep(path[end])) : (end += 1) {}
+    if (end == start or end == path.len) return false;
+    index.* = end + 1;
+    return true;
+}
+
+fn isNativeWindowsTempRoot(path: []const u8) bool {
+    if (path.len < 3 or path[1] != ':' or !std.ascii.isAlphabetic(path[0]) or !isPathSep(path[2])) return false;
+
+    var windows_idx: usize = 3;
+    if (matchPathSegment(path, &windows_idx, "Windows") and
+        matchPathSegment(path, &windows_idx, "Temp"))
+    {
+        return true;
+    }
+
+    var user_idx: usize = 3;
+    if (matchPathSegment(path, &user_idx, "Users") and
+        consumeAnyPathSegment(path, &user_idx) and
+        matchPathSegment(path, &user_idx, "AppData") and
+        matchPathSegment(path, &user_idx, "Local") and
+        matchPathSegment(path, &user_idx, "Temp"))
+    {
+        return true;
+    }
+
+    return false;
+}
+
 /// Temp-root indexing is an opt-in escape hatch for CI / SWE-bench harnesses
 /// that clone throwaway checkouts under /tmp. Off by default (footgun guard,
 /// #80/#346). Enabled by CODEDB_ALLOW_TEMP=1; the `--allow-temp` CLI flag sets
@@ -22,6 +73,7 @@ pub fn isIndexableRoot(path: []const u8) bool {
     if (!tempIndexingAllowed()) {
         if (isExactOrChild(path, "/private/tmp")) return false;
         if (isExactOrChild(path, "/tmp")) return false;
+        if (isNativeWindowsTempRoot(path)) return false;
     }
 
     const system_prefixes = [_][]const u8{
@@ -87,3 +139,10 @@ test "issue-80: /tmp is denied" {
     try testing.expect(!isIndexableRoot("/tmp/foo"));
 }
 
+test "issue-538: native Windows temp roots are denied" {
+    try testing.expect(!isIndexableRoot("C:\\Users\\dev\\AppData\\Local\\Temp"));
+    try testing.expect(!isIndexableRoot("C:\\Users\\dev\\AppData\\Local\\Temp\\repo"));
+    try testing.expect(!isIndexableRoot("C:/Users/dev/AppData/Local/Temp/repo"));
+    try testing.expect(!isIndexableRoot("C:\\Windows\\Temp\\repo"));
+    try testing.expect(isIndexableRoot("C:\\Users\\dev\\projects\\repo"));
+}

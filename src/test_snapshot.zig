@@ -1215,13 +1215,13 @@ test "issue-539: search recall includes snapshot-restored files (parity with wor
     try testing.expect(whits.len >= 1);
 }
 
-test "issue-539b: search recall ranks a relevant restored file above quota (index-blending)" {
+test "issue-539b: search recall ranks a relevant restored file above quota without rebuilding word index" {
     // #539 quota residual: even with restored files Tier-3-searchable, a MORE
     // relevant cold file was crowded out of a small max_results by less-relevant
-    // hot files — because searchContent never populated the (complete) word index
-    // that Tier 0 ranks from after a fast load. Fix: searchContent rebuilds the
-    // lazy word index (like searchWord), so the canonical file competes on
-    // relevance and isn't lost to tier-ordering.
+    // hot files. Plain search must not rebuild the full word index on every CLI
+    // invocation when a fast snapshot load leaves it incomplete; instead it
+    // reserves quota for restored skip-trigram files so reranking can still surface
+    // the canonical file without a full-repo rebuild.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -1262,6 +1262,7 @@ test "issue-539b: search recall ranks a relevant restored file above quota (inde
 
     // The most-relevant (cold, 3 hits) file must make a 2-slot result set.
     const res = try exp2.searchContent("recallterm539", aa2, 2);
+    try testing.expect(!exp2.wordIndexIsComplete());
     var found_canonical = false;
     for (res) |r| if (std.mem.eql(u8, r.path, "recallpkg/canonical.zig")) {
         found_canonical = true;
