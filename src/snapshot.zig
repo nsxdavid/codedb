@@ -904,12 +904,19 @@ fn loadSnapshotFast(
     store: *Store,
     allocator: std.mem.Allocator,
 ) !bool {
+    const outline_section_mark = explorer.outlineSectionMark();
     const content_section_mark = explorer.contentSectionMark();
+    var inserted_paths: std.ArrayList([]const u8) = .empty;
+    defer inserted_paths.deinit(allocator);
+    explorer.invalidateCallGraph();
     var load_ok = false;
     defer if (!load_ok) {
         // POSIX mmap and Windows' aligned heap-read fallback both feed borrowed
         // content slices into Explorer. If validation rejects the snapshot after
-        // adoption, unwind those sections here so failed warm loads do not leak.
+        // adoption, remove files inserted during this attempt before dropping the
+        // backing sections they may still borrow from.
+        for (inserted_paths.items) |path| explorer.removeFile(path);
+        explorer.releaseOutlineSectionsFrom(outline_section_mark);
         explorer.releaseContentSectionsFrom(content_section_mark);
     };
 
@@ -1116,6 +1123,7 @@ fn loadSnapshotFast(
     explorer.markSymbolIndexIncomplete();
     var insert_ns: i128 = 0;
     var store_ns: i128 = 0;
+    inserted_paths.ensureTotalCapacity(allocator, records.items.len) catch return false;
     for (records.items, fresh_results) |record, fr| {
         const path = record.path;
         const content = record.content;
@@ -1136,6 +1144,7 @@ fn loadSnapshotFast(
                 stale_outline.deinit();
             }
             explorer.indexFile(path, dc) catch continue;
+            inserted_paths.appendAssumeCapacity(path);
             const hash = std.hash.Wyhash.hash(0, dc);
             _ = store.recordSnapshot(path, dc.len, hash) catch {};
         } else if (outline_states.fetchRemove(path)) |removed| {
@@ -1147,6 +1156,7 @@ fn loadSnapshotFast(
                 continue;
             };
             if (prof) insert_ns += cio.nanoTimestamp() - t_ins;
+            inserted_paths.appendAssumeCapacity(removed.key);
             const hash = record.stored_hash orelse std.hash.Wyhash.hash(0, content);
             const t_st: i128 = if (prof) cio.nanoTimestamp() else 0;
             _ = store.recordSnapshot(removed.key, content.len, hash) catch {};
@@ -1154,6 +1164,7 @@ fn loadSnapshotFast(
         } else {
             word_index_can_load_from_disk = false;
             explorer.indexFileOutlineOnly(path, content) catch continue;
+            inserted_paths.appendAssumeCapacity(path);
             const hash = record.stored_hash orelse std.hash.Wyhash.hash(0, content);
             _ = store.recordSnapshot(path, content.len, hash) catch {};
         }

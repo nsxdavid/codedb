@@ -886,6 +886,17 @@ pub const Explorer = struct {
         try self.outline_section_bufs.append(self.allocator, buf);
     }
 
+    pub fn outlineSectionMark(self: *const Explorer) usize {
+        return self.outline_section_bufs.items.len;
+    }
+
+    pub fn releaseOutlineSectionsFrom(self: *Explorer, mark: usize) void {
+        while (self.outline_section_bufs.items.len > mark) {
+            const buf = self.outline_section_bufs.pop().?;
+            self.allocator.free(buf);
+        }
+    }
+
     /// Take ownership of an mmap'd snapshot content section that the ContentCache
     /// borrows (value_owned=false) slices from. munmap'd at deinit.
     pub fn adoptContentSection(self: *Explorer, map: []align(std.heap.page_size_min) const u8) !void {
@@ -901,6 +912,23 @@ pub const Explorer = struct {
             const map = self.content_section_maps.pop().?;
             cio.unmapFileRead(self.allocator, map);
         }
+    }
+
+    fn invalidateCallGraphLocked(self: *Explorer) void {
+        if (self.call_centrality) |*c| {
+            c.deinit();
+            self.call_centrality = null;
+        }
+        if (self.call_graph) |*cg| {
+            cg.deinit(self.allocator);
+            self.call_graph = null;
+        }
+    }
+
+    pub fn invalidateCallGraph(self: *Explorer) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.invalidateCallGraphLocked();
     }
 
     /// Number of slots in the heap trigram index id_to_path array (benchmark helper).
@@ -1035,6 +1063,7 @@ pub const Explorer = struct {
 
         try self.rebuildDepsFor(stable_path, &persistent_outline);
         self.rebuildSymbolIndexFor(stable_path, &persistent_outline, !is_new);
+        self.invalidateCallGraphLocked();
 
         // Last fallible step: put frees the prior cache value in place, so it
         // must run only once nothing after it can still need prior_content.
@@ -1640,6 +1669,7 @@ pub const Explorer = struct {
         self.contents.remove(path);
         self.word_index.removeFile(path);
         self.trigram_index.removeFile(path);
+        self.invalidateCallGraphLocked();
 
         if (self.outlines.fetchRemove(path)) |kv| {
             var outline = kv.value;
