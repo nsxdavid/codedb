@@ -124,7 +124,7 @@ fn readRaw(fd: c_int, buf: []u8) isize {
 }
 
 pub fn processId() u64 {
-    if (is_windows) return 0;
+    if (is_windows) return std.os.windows.GetCurrentProcessId();
     return @intCast(getpid());
 }
 
@@ -331,23 +331,30 @@ pub fn closeFd(fd: c_int) void {
 }
 
 pub fn posixGetenv(name: []const u8) ?[]const u8 {
-    if (getenvZ(name)) |value| return value;
-    if (is_windows and std.mem.eql(u8, name, "HOME")) return getenvZ("USERPROFILE");
-    return null;
+    return getenvZ(name);
 }
 
 /// Per-user home directory for the central codedb cache: HOME on POSIX,
-/// HOME-or-USERPROFILE on native Windows (posixGetenv does that fallback).
+/// HOME-or-USERPROFILE on native Windows. All HOME readers must go through
+/// this so the Windows fallback lives in exactly one place.
 pub fn userHome() ?[]const u8 {
-    return posixGetenv("HOME");
+    if (getenvZ("HOME")) |home| return home;
+    if (is_windows) return getenvZ("USERPROFILE");
+    return null;
+}
+
+/// NUL-terminate `s` into `buf` for a libc call. Null if it doesn't fit.
+fn zTerm(buf: []u8, s: []const u8) ?[*:0]const u8 {
+    if (s.len >= buf.len) return null;
+    @memcpy(buf[0..s.len], s);
+    buf[s.len] = 0;
+    return @ptrCast(buf.ptr);
 }
 
 fn getenvZ(name: []const u8) ?[]const u8 {
     var buf: [256]u8 = undefined;
-    if (name.len >= buf.len) return null;
-    @memcpy(buf[0..name.len], name);
-    buf[name.len] = 0;
-    const ptr = getenv(@ptrCast(&buf)) orelse return null;
+    const name_z = zTerm(&buf, name) orelse return null;
+    const ptr = getenv(name_z) orelse return null;
     return std.mem.span(ptr);
 }
 
@@ -361,28 +368,23 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 pub fn posixSetenv(name: []const u8, value: []const u8) void {
     var nbuf: [256]u8 = undefined;
     var vbuf: [4096]u8 = undefined;
-    if (name.len >= nbuf.len or value.len >= vbuf.len) return;
-    @memcpy(nbuf[0..name.len], name);
-    nbuf[name.len] = 0;
-    @memcpy(vbuf[0..value.len], value);
-    vbuf[value.len] = 0;
+    const name_z = zTerm(&nbuf, name) orelse return;
+    const value_z = zTerm(&vbuf, value) orelse return;
     if (is_windows) {
-        _ = _putenv_s(@ptrCast(&nbuf), @ptrCast(&vbuf));
+        _ = _putenv_s(name_z, value_z);
     } else {
-        _ = setenv(@ptrCast(&nbuf), @ptrCast(&vbuf), 1);
+        _ = setenv(name_z, value_z, 1);
     }
 }
 
 /// Remove an environment variable (libc unsetenv).
 pub fn posixUnsetenv(name: []const u8) void {
     var nbuf: [256]u8 = undefined;
-    if (name.len >= nbuf.len) return;
-    @memcpy(nbuf[0..name.len], name);
-    nbuf[name.len] = 0;
+    const name_z = zTerm(&nbuf, name) orelse return;
     if (is_windows) {
-        _ = _putenv_s(@ptrCast(&nbuf), "");
+        _ = _putenv_s(name_z, "");
     } else {
-        _ = unsetenv(@ptrCast(&nbuf));
+        _ = unsetenv(name_z);
     }
 }
 

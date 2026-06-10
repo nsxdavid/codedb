@@ -2261,7 +2261,7 @@ fn loadBestSnapshot(
 
 fn getDataDir(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8) ![]u8 {
     const hash = std.hash.Wyhash.hash(0, abs_root);
-    const home_env = cio.posixGetenv("HOME") orelse {
+    const home_env = cio.userHome() orelse {
         return std.fmt.allocPrint(allocator, "{s}/.codedb", .{abs_root});
     };
     const home = try allocator.dupe(u8, home_env);

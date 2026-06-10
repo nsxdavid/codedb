@@ -357,7 +357,7 @@ pub fn shouldRunAutoUpdate(now_ms: i64, last_check_ms: ?i64, env_disabled: bool)
 
 pub fn maybeAutoUpdate(io: std.Io, allocator: std.mem.Allocator) void {
     const env_disabled = cio.posixGetenv("CODEDB_NO_AUTO_UPDATE") != null;
-    const home = cio.posixGetenv("HOME") orelse return;
+    const home = cio.userHome() orelse return;
     if (home.len == 0) return;
 
     const dir_path = std.fmt.allocPrint(allocator, "{s}/.codedb", .{home}) catch return;

@@ -24,7 +24,7 @@ const NukeStats = struct {
 
 pub fn run(io: std.Io, stdout: cio.File, s: sty.Style, allocator: std.mem.Allocator) void {
     const out = Out{ .file = stdout, .alloc = allocator };
-    const home_env = cio.posixGetenv("HOME") orelse {
+    const home_env = cio.userHome() orelse {
         out.p("{s}\xe2\x9c\x97{s} cannot determine HOME directory\n", .{ s.red, s.reset });
         std.process.exit(1);
     };

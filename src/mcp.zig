@@ -3846,7 +3846,7 @@ pub fn appendRemoteErrorHint(alloc: std.mem.Allocator, out: *std.ArrayList(u8), 
 // ── Local project tools ─────────────────────────────────────────────────────
 
 fn handleProjects(io: std.Io, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) void {
-    const home = cio.posixGetenv("HOME") orelse {
+    const home = cio.userHome() orelse {
         out.appendSlice(alloc, "error: cannot read HOME") catch {};
         return;
     };
