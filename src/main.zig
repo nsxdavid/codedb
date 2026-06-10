@@ -164,15 +164,20 @@ fn mainInner() void {
 /// without exiting the daemon process. Returns a u8 exit code; the caller
 /// is responsible for flushing `out`. Covers: tree, outline, find, search,
 /// word, read, hot. Unknown commands return 1.
+/// Print the usage error for an arity-zero command invoked with extra
+/// positional args. Returns true when extra args were present (caller exits 1).
+fn rejectExtraArgs(out: *Out, s: sty.Style, args: []const []const u8, cmd_args_start: usize, cmd_name: []const u8) bool {
+    if (!hasExtraCliArgs(args, cmd_args_start)) return false;
+    out.p("{s}\xe2\x9c\x97{s} unexpected extra argument: {s}{s}{s}  (usage: codedb [root] {s}{s}{s})\n", .{
+        s.red, s.reset, s.bold, args[cmd_args_start], s.reset, s.cyan, cmd_name, s.reset,
+    });
+    return true;
+}
+
 fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store: *Store, root: []const u8, cmd: []const u8, args: []const []const u8, cmd_args_start: usize, out: *Out, s: sty.Style) u8 {
     const use_color = s.reset.len != 0;
     if (std.mem.eql(u8, cmd, "tree")) {
-        if (hasExtraCliArgs(args, cmd_args_start)) {
-            out.p("{s}\xe2\x9c\x97{s} unexpected extra argument: {s}{s}{s}  (usage: codedb [root] {s}tree{s})\n", .{
-                s.red, s.reset, s.bold, args[cmd_args_start], s.reset, s.cyan, s.reset,
-            });
-            return 1;
-        }
+        if (rejectExtraArgs(out, s, args, cmd_args_start, "tree")) return 1;
         const t0 = cio.nanoTimestamp();
         const tree = explorer.getTree(allocator, use_color) catch return 1;
         defer allocator.free(tree);
@@ -522,12 +527,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
             }
         }
     } else if (std.mem.eql(u8, cmd, "hot")) {
-        if (hasExtraCliArgs(args, cmd_args_start)) {
-            out.p("{s}\xe2\x9c\x97{s} unexpected extra argument: {s}{s}{s}  (usage: codedb [root] {s}hot{s})\n", .{
-                s.red, s.reset, s.bold, args[cmd_args_start], s.reset, s.cyan, s.reset,
-            });
-            return 1;
-        }
+        if (rejectExtraArgs(out, s, args, cmd_args_start, "hot")) return 1;
         const t0 = cio.nanoTimestamp();
         const hot = explorer.getHotFiles(store, allocator, 10) catch return 1;
         defer {
@@ -551,12 +551,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
     } else if (std.mem.eql(u8, cmd, "status")) {
         // #528 item 1: read-only CLI status mirroring codedb_status, so
         // `codedb status` works without going through the MCP surface.
-        if (hasExtraCliArgs(args, cmd_args_start)) {
-            out.p("{s}\xe2\x9c\x97{s} unexpected extra argument: {s}{s}{s}  (usage: codedb [root] {s}status{s})\n", .{
-                s.red, s.reset, s.bold, args[cmd_args_start], s.reset, s.cyan, s.reset,
-            });
-            return 1;
-        }
+        if (rejectExtraArgs(out, s, args, cmd_args_start, "status")) return 1;
         const t0 = cio.nanoTimestamp();
         store.mu.lock();
         const file_count = store.files.count();
@@ -631,17 +626,10 @@ const PIPE_TYPE_BYTE: u32 = 0x00000000;
 const PIPE_READMODE_BYTE: u32 = 0x00000000;
 const PIPE_WAIT: u32 = 0x00000000;
 const PIPE_UNLIMITED_INSTANCES: u32 = 255;
-const ERROR_PIPE_CONNECTED: u32 = 535;
 const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x00080000;
 const SECURITY_SQOS_PRESENT: u32 = 0x00100000;
 const SECURITY_IDENTIFICATION: u32 = 0x00010000;
 const SDDL_REVISION_1: u32 = 1;
-
-const SECURITY_ATTRIBUTES = extern struct {
-    nLength: u32,
-    lpSecurityDescriptor: ?*anyopaque,
-    bInheritHandle: win.BOOL,
-};
 
 extern "kernel32" fn CreateNamedPipeA(
     lpName: [*:0]const u8,
@@ -666,8 +654,6 @@ extern "kernel32" fn CreateFileA(
 ) callconv(.winapi) win.HANDLE;
 extern "kernel32" fn ReadFile(hFile: win.HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: ?*anyopaque) callconv(.winapi) win.BOOL;
 extern "kernel32" fn WriteFile(hFile: win.HANDLE, lpBuffer: [*]const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *u32, lpOverlapped: ?*anyopaque) callconv(.winapi) win.BOOL;
-extern "kernel32" fn CloseHandle(hObject: win.HANDLE) callconv(.winapi) win.BOOL;
-extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorA(
     sddl: [*:0]const u8,
@@ -716,27 +702,46 @@ fn cliFillSockaddr(path: []const u8) ?struct { addr: std.c.sockaddr.un, len: std
 /// cliReadFull/cliWriteFull (framing, serve, respond, proxy) is shared.
 const CliConn = if (builtin.os.tag == .windows) win.HANDLE else c_int;
 
+/// One blocking read from the connection. Returns the byte count (0 = EOF),
+/// null on a hard error. EINTR is retried here so callers never see it.
+fn connRead(conn: CliConn, buf: []u8) ?usize {
+    if (builtin.os.tag == .windows) {
+        var got: u32 = 0;
+        const want: u32 = @intCast(@min(buf.len, std.math.maxInt(u32)));
+        if (ReadFile(conn, buf.ptr, want, &got, null) == .FALSE) return null;
+        return got;
+    }
+    while (true) {
+        const n = std.c.read(conn, buf.ptr, buf.len);
+        if (n >= 0) return @intCast(n);
+        if (std.c.errno(n) != .INTR) return null;
+    }
+}
+
+/// One blocking write to the connection. Returns the byte count written,
+/// null on a hard error. EINTR is retried here so callers never see it.
+fn connWrite(conn: CliConn, data: []const u8) ?usize {
+    if (builtin.os.tag == .windows) {
+        var wrote: u32 = 0;
+        const want: u32 = @intCast(@min(data.len, std.math.maxInt(u32)));
+        if (WriteFile(conn, data.ptr, want, &wrote, null) == .FALSE) return null;
+        return wrote;
+    }
+    while (true) {
+        const n = std.c.write(conn, data.ptr, data.len);
+        if (n >= 0) return @intCast(n);
+        if (std.c.errno(n) != .INTR) return null;
+    }
+}
+
 /// Read exactly `buf.len` bytes from a blocking connection, looping over short
 /// reads. Returns false on EOF-before-full or a hard error (EINTR is retried).
 fn cliReadFull(conn: CliConn, buf: []u8) bool {
     var off: usize = 0;
     while (off < buf.len) {
-        if (builtin.os.tag == .windows) {
-            var got: u32 = 0;
-            const want: u32 = @intCast(@min(buf.len - off, std.math.maxInt(u32)));
-            if (ReadFile(conn, buf.ptr + off, want, &got, null) == .FALSE) return false;
-            if (got == 0) return false;
-            off += got;
-        } else {
-            const n = std.c.read(conn, buf.ptr + off, buf.len - off);
-            if (n > 0) {
-                off += @intCast(n);
-                continue;
-            }
-            if (n == 0) return false; // peer closed early
-            if (std.c.errno(n) == .INTR) continue;
-            return false;
-        }
+        const n = connRead(conn, buf[off..]) orelse return false;
+        if (n == 0) return false; // peer closed early
+        off += n;
     }
     return true;
 }
@@ -746,21 +751,9 @@ fn cliReadFull(conn: CliConn, buf: []u8) bool {
 fn cliWriteFull(conn: CliConn, data: []const u8) bool {
     var off: usize = 0;
     while (off < data.len) {
-        if (builtin.os.tag == .windows) {
-            var wrote: u32 = 0;
-            const want: u32 = @intCast(@min(data.len - off, std.math.maxInt(u32)));
-            if (WriteFile(conn, data.ptr + off, want, &wrote, null) == .FALSE) return false;
-            if (wrote == 0) return false;
-            off += wrote;
-        } else {
-            const n = std.c.write(conn, data.ptr + off, data.len - off);
-            if (n > 0) {
-                off += @intCast(n);
-                continue;
-            }
-            if (n < 0 and std.c.errno(n) == .INTR) continue;
-            return false;
-        }
+        const n = connWrite(conn, data[off..]) orelse return false;
+        if (n == 0) return false;
+        off += n;
     }
     return true;
 }
@@ -840,8 +833,8 @@ fn cliDaemonListen(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer
             return;
         }
         defer _ = LocalFree(sd);
-        var sa_pipe: SECURITY_ATTRIBUTES = .{
-            .nLength = @sizeOf(SECURITY_ATTRIBUTES),
+        var sa_pipe: win.SECURITY_ATTRIBUTES = .{
+            .nLength = @sizeOf(win.SECURITY_ATTRIBUTES),
             .lpSecurityDescriptor = sd,
             .bInheritHandle = .FALSE,
         };
@@ -868,15 +861,15 @@ fn cliDaemonListen(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer
                 shutdown.store(true, .release);
                 return;
             }
-            const connected = ConnectNamedPipe(pipe, null) != .FALSE or GetLastError() == ERROR_PIPE_CONNECTED;
+            const connected = ConnectNamedPipe(pipe, null) != .FALSE or win.GetLastError() == .PIPE_CONNECTED;
             if (!connected) {
-                _ = CloseHandle(pipe);
+                win.CloseHandle(pipe);
                 continue;
             }
             last_activity_ms.store(cio.milliTimestamp(), .release);
             cliServeConn(io, allocator, explorer, store, abs_root, pipe);
             _ = DisconnectNamedPipe(pipe);
-            _ = CloseHandle(pipe);
+            win.CloseHandle(pipe);
         }
         return;
     }
@@ -1095,7 +1088,7 @@ fn cliConnect(abs_root: []const u8) ?CliConn {
 
 fn cliCloseConn(conn: CliConn) void {
     if (builtin.os.tag == .windows) {
-        _ = CloseHandle(conn);
+        win.CloseHandle(conn);
         return;
     }
     _ = std.c.close(conn);
