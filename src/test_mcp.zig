@@ -2405,3 +2405,31 @@ test "issue-531: codedb_context max_tokens packs sections by value under the bud
     try testing.expect(std.mem.indexOf(u8, out_budget.items, "## Most-relevant files") != null);
     try testing.expect(std.mem.indexOf(u8, out_budget.items, "## Top sites") == null);
 }
+
+test "issue-XX: spawnDetached command line round-trips argv with trailing backslashes" {
+    // spawnDetachedWindows quotes every arg but escapes only embedded quotes.
+    // Per CommandLineToArgvW rules, backslashes preceding a quote must be
+    // doubled: an arg ending in a backslash (any Windows root path like
+    // `D:\` or `D:\proj\`) is emitted as "D:\proj\" whose trailing \" escapes
+    // the CLOSING quote, so the spawned child sees that arg fused with
+    // whatever follows. This is the real cli-daemon auto-spawn argv shape
+    // (self_exe, abs_root, "cli-daemon") with a drive-root project. The
+    // command line is split back with std's Windows argv parser — the same
+    // CRT-compatible rules every spawned child applies.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    const argv = [_][]const u8{ "C:\\tools\\codedb.exe", "D:\\", "cli-daemon" };
+    const cmd = cio.windowsCommandLine(alloc, &argv) orelse return error.TestUnexpectedResult;
+    defer alloc.free(cmd);
+    const cmd_w = try std.unicode.utf8ToUtf16LeAlloc(alloc, cmd);
+    defer alloc.free(cmd_w);
+
+    var it = try std.process.Args.Iterator.Windows.init(alloc, cmd_w);
+    defer it.deinit();
+    for (argv) |expected| {
+        const got = it.next() orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(expected, got);
+    }
+    try testing.expect(it.next() == null);
+}

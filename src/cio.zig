@@ -727,21 +727,30 @@ pub fn spawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) voi
     spawnDetachedPosix(allocator, argv);
 }
 
-fn spawnDetachedWindows(allocator: std.mem.Allocator, argv: []const []const u8) void {
-    if (argv.len == 0) return;
-
+/// Build a CreateProcessW command line from argv (each arg quoted). Callers
+/// spawn children that split it back with CommandLineToArgvW-compatible rules.
+/// Caller owns the returned slice; null on allocation failure.
+pub fn windowsCommandLine(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
     var cmd: std.ArrayList(u8) = .empty;
     defer cmd.deinit(allocator);
     for (argv, 0..) |arg, i| {
-        if (i != 0) cmd.append(allocator, ' ') catch return;
-        cmd.append(allocator, '"') catch return;
+        if (i != 0) cmd.append(allocator, ' ') catch return null;
+        cmd.append(allocator, '"') catch return null;
         for (arg) |ch| {
-            if (ch == '"') cmd.append(allocator, '\\') catch return;
-            cmd.append(allocator, ch) catch return;
+            if (ch == '"') cmd.append(allocator, '\\') catch return null;
+            cmd.append(allocator, ch) catch return null;
         }
-        cmd.append(allocator, '"') catch return;
+        cmd.append(allocator, '"') catch return null;
     }
-    const cmd_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, cmd.items) catch return;
+    return cmd.toOwnedSlice(allocator) catch null;
+}
+
+fn spawnDetachedWindows(allocator: std.mem.Allocator, argv: []const []const u8) void {
+    if (argv.len == 0) return;
+
+    const cmd = windowsCommandLine(allocator, argv) orelse return;
+    defer allocator.free(cmd);
+    const cmd_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, cmd) catch return;
     defer allocator.free(cmd_w);
 
     var si: std.os.windows.STARTUPINFOW = std.mem.zeroes(std.os.windows.STARTUPINFOW);
