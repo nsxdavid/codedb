@@ -2253,14 +2253,14 @@ pub const Explorer = struct {
 
         var ol_iter = self.outlines.iterator();
         while (ol_iter.next()) |entry| {
+            if (list.items.len >= spec.max_results) break;
             for (entry.value_ptr.symbols.items) |sym| {
+                if (list.items.len >= spec.max_results) break;
                 const score = symbolMatchScore(spec, sym.name) orelse continue;
                 if (spec.kind) |k| if (sym.kind != k) continue;
                 if (Dedup.contains(list.items, entry.key_ptr.*, sym.line_start)) continue;
                 try appendOne(&list, allocator, entry.key_ptr.*, sym, score);
-                if (list.items.len >= spec.max_results) break;
             }
-            if (list.items.len >= spec.max_results) break;
         }
 
         const SortCtx = struct {
@@ -3492,70 +3492,59 @@ pub const Explorer = struct {
         var edges_tmp = codegraph.buildEdges(a, funcs.items, &resolve, false) catch return;
         defer edges_tmp.deinit(a);
 
-        const edges_owned = self.allocator.alloc(codegraph.Edge, edges_tmp.items.len) catch return;
-        @memcpy(edges_owned, edges_tmp.items);
+        const buildOwned = struct {
+            fn call(
+                exp: *Explorer,
+                edges_src: []const codegraph.Edge,
+                paths: []const []const u8,
+                names: []const []const u8,
+                lines: []const u32,
+            ) !void {
+                const alloc = exp.allocator;
+                const n = paths.len;
 
-        const adj = codegraph.buildAdjacency(self.allocator, edges_owned, n_nodes) catch {
-            self.allocator.free(edges_owned);
-            return;
-        };
+                const edges_owned = try alloc.dupe(codegraph.Edge, edges_src);
+                errdefer alloc.free(edges_owned);
 
-        const np = self.allocator.alloc([]const u8, n_nodes) catch {
-            self.allocator.free(edges_owned);
-            codegraph.freeAdjacency(self.allocator, adj);
-            return;
-        };
-        @memcpy(np, node_path.items);
+                const adj = try codegraph.buildAdjacency(alloc, edges_owned, n);
+                errdefer codegraph.freeAdjacency(alloc, adj);
 
-        const nn = self.allocator.alloc([]const u8, n_nodes) catch {
-            self.allocator.free(edges_owned);
-            codegraph.freeAdjacency(self.allocator, adj);
-            self.allocator.free(np);
-            return;
-        };
-        @memcpy(nn, node_name.items);
+                const np = try alloc.dupe([]const u8, paths);
+                errdefer alloc.free(np);
 
-        const nl = self.allocator.alloc(u32, n_nodes) catch {
-            self.allocator.free(edges_owned);
-            codegraph.freeAdjacency(self.allocator, adj);
-            self.allocator.free(np);
-            self.allocator.free(nn);
-            return;
-        };
-        @memcpy(nl, node_line.items);
+                const nn = try alloc.dupe([]const u8, names);
+                errdefer alloc.free(nn);
 
-        const node_scores = if (cio.posixGetenv("CODEDB_IN_DEGREE_CENTRALITY") != null)
-            codegraph.inDegreeCentrality(self.allocator, edges_owned, n_nodes) catch null
-        else
-            codegraph.pageRank(self.allocator, edges_owned, n_nodes, 0.85, 20) catch null;
-        if (node_scores == null) {
-            self.allocator.free(edges_owned);
-            codegraph.freeAdjacency(self.allocator, adj);
-            self.allocator.free(np);
-            self.allocator.free(nn);
-            self.allocator.free(nl);
-            return;
-        }
-        defer self.allocator.free(node_scores.?);
+                const nl = try alloc.dupe(u32, lines);
+                errdefer alloc.free(nl);
 
-        if (self.call_centrality == null) {
-            var cmap = std.StringHashMap(f32).init(self.allocator);
-            for (np, node_scores.?) |path, score| {
-                if (score == 0) continue;
-                const gop = cmap.getOrPut(path) catch continue;
-                if (!gop.found_existing) gop.value_ptr.* = 0;
-                gop.value_ptr.* += score;
+                const node_scores = if (cio.posixGetenv("CODEDB_IN_DEGREE_CENTRALITY") != null)
+                    try codegraph.inDegreeCentrality(alloc, edges_owned, n)
+                else
+                    try codegraph.pageRank(alloc, edges_owned, n, 0.85, 20);
+                defer alloc.free(node_scores);
+
+                if (exp.call_centrality == null) {
+                    var cmap = std.StringHashMap(f32).init(alloc);
+                    for (np, node_scores) |path, score| {
+                        if (score == 0) continue;
+                        const gop = cmap.getOrPut(path) catch continue;
+                        if (!gop.found_existing) gop.value_ptr.* = 0;
+                        gop.value_ptr.* += score;
+                    }
+                    exp.call_centrality = cmap;
+                }
+
+                exp.call_graph = .{
+                    .edges = edges_owned,
+                    .adj = adj,
+                    .node_path = np,
+                    .node_name = nn,
+                    .node_line = nl,
+                };
             }
-            self.call_centrality = cmap;
-        }
-
-        self.call_graph = .{
-            .edges = edges_owned,
-            .adj = adj,
-            .node_path = np,
-            .node_name = nn,
-            .node_line = nl,
-        };
+        }.call;
+        buildOwned(self, edges_tmp.items, node_path.items, node_name.items, node_line.items) catch return;
     }
 
     /// Build `call_centrality` once (idempotent, mutex-guarded). Must be called
@@ -6940,11 +6929,8 @@ fn isRelativeImport(spec: []const u8) bool {
 /// File extension of a path including the leading dot (".ts"), or null if the
 /// final segment has none. A leading-dot file (".env") counts as no extension.
 fn pathExtension(path: []const u8) ?[]const u8 {
-    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| path[s + 1 ..] else path;
-    if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| {
-        if (dot > 0) return base[dot..];
-    }
-    return null;
+    const ext = std.fs.path.extension(path);
+    return if (ext.len == 0) null else ext;
 }
 
 /// Resolve a relative import specifier (`./` or `../`) against the importing
@@ -7004,14 +6990,7 @@ fn resolveDartImport(raw: []const u8, file_path: []const u8, allocator: std.mem.
         return allocator.dupe(u8, raw) catch null;
     }
 
-    const dir = if (std.mem.lastIndexOfScalar(u8, file_path, '/')) |sep|
-        file_path[0..sep]
-    else
-        ".";
-    const joined = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, raw }) catch return null;
-    const result = normalizePath(joined, allocator);
-    allocator.free(joined);
-    return result;
+    return resolveRelativeImportPath(file_path, raw, allocator);
 }
 
 fn containsAny(s: []const u8, needles: []const []const u8) bool {
