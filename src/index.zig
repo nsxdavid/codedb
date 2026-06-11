@@ -893,8 +893,8 @@ pub const WordIndex = struct {
         const data = cio.mapFileRead(io, allocator, file, size) catch return null;
         errdefer cio.unmapFileRead(allocator, data);
 
-        if (!std.mem.eql(u8, data[0..4], &DISK_MAGIC)) return null;
-        if (std.mem.readInt(u16, data[4..6], .little) != DISK_FORMAT_VERSION) return null;
+        if (!std.mem.eql(u8, data[0..4], &DISK_MAGIC)) return error.MalformedIndex;
+        if (std.mem.readInt(u16, data[4..6], .little) != DISK_FORMAT_VERSION) return error.MalformedIndex;
         const file_count = std.mem.readInt(u32, data[6..10], .little);
 
         var result = WordIndex.init(allocator);
@@ -907,35 +907,35 @@ pub const WordIndex = struct {
         try result.id_to_path.ensureTotalCapacity(allocator, file_count);
         var pos: usize = 51;
         for (0..file_count) |_| {
-            if (pos + 2 > data.len) return null;
+            if (pos + 2 > data.len) return error.MalformedIndex;
             const plen = std.mem.readInt(u16, data[pos..][0..2], .little);
             pos += 2;
-            if (plen == 0 or pos + plen > data.len) return null;
+            if (plen == 0 or pos + plen > data.len) return error.MalformedIndex;
             const path = try allocator.dupe(u8, data[pos .. pos + plen]);
             result.id_to_path.appendAssumeCapacity(path);
             pos += plen;
         }
 
-        if (pos + 4 > data.len) return null;
+        if (pos + 4 > data.len) return error.MalformedIndex;
         const word_count = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
         const word_dir = try allocator.alloc(u32, word_count);
         errdefer allocator.free(word_dir);
         for (0..word_count) |i| {
-            if (pos + 2 > data.len) return null;
+            if (pos + 2 > data.len) return error.MalformedIndex;
             word_dir[i] = @intCast(pos);
             const wlen = std.mem.readInt(u16, data[pos..][0..2], .little);
             pos += 2 + wlen;
-            if (pos + 4 > data.len) return null;
+            if (pos + 4 > data.len) return error.MalformedIndex;
             const hit_count = std.mem.readInt(u32, data[pos..][0..4], .little);
             pos += 4 + @as(usize, hit_count) * @sizeOf(WordHit);
-            if (pos > data.len) return null;
+            if (pos > data.len) return error.MalformedIndex;
         }
 
-        if (pos + 4 > data.len) return null;
+        if (pos + 4 > data.len) return error.MalformedIndex;
         const dl_count = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
-        if (dl_count != file_count or pos + @as(usize, dl_count) * 4 + 8 > data.len) return null;
+        if (dl_count != file_count or pos + @as(usize, dl_count) * 4 + 8 > data.len) return error.MalformedIndex;
         for (0..dl_count) |i| {
             const len = std.mem.readInt(u32, data[pos..][0..4], .little);
             pos += 4;
@@ -943,7 +943,7 @@ pub const WordIndex = struct {
         }
         result.total_tokens = std.mem.readInt(u64, data[pos..][0..8], .little);
         pos += 8;
-        if (pos != data.len) return null;
+        if (pos != data.len) return error.MalformedIndex;
 
         // Hand off: switch to zero-copy mode. result.deinit now takes the mmap path.
         result.mmap_data = data;
@@ -2070,19 +2070,19 @@ pub const MmapTrigramIndex = struct {
         errdefer cio.unmapFileRead(allocator, lookup_data);
 
         // Validate postings header
-        if (!std.mem.eql(u8, postings_data[0..4], &TrigramIndex.POSTINGS_MAGIC)) return null;
+        if (!std.mem.eql(u8, postings_data[0..4], &TrigramIndex.POSTINGS_MAGIC)) return error.MalformedIndex;
         const post_version = std.mem.readInt(u16, postings_data[4..6], .little);
-        if (post_version < 1 or post_version > TrigramIndex.FORMAT_VERSION) return null;
+        if (post_version < 1 or post_version > TrigramIndex.FORMAT_VERSION) return error.MalformedIndex;
         const file_count: u32 = if (post_version >= 3)
             std.mem.readInt(u32, postings_data[6..10], .little)
         else
             std.mem.readInt(u16, postings_data[6..8], .little);
 
         const file_table_start: usize = if (post_version >= 3) blk: {
-            if (postings_data.len < 51) return null;
+            if (postings_data.len < 51) return error.MalformedIndex;
             break :blk 51;
         } else if (post_version >= 2) blk: {
-            if (postings_data.len < 49) return null;
+            if (postings_data.len < 49) return error.MalformedIndex;
             break :blk 49;
         } else 8;
 
@@ -2095,10 +2095,10 @@ pub const MmapTrigramIndex = struct {
         }
         var pos: usize = file_table_start;
         for (0..file_count) |i| {
-            if (pos + 2 > postings_data.len) return null;
+            if (pos + 2 > postings_data.len) return error.MalformedIndex;
             const path_len = std.mem.readInt(u16, postings_data[pos..][0..2], .little);
             pos += 2;
-            if (pos + path_len > postings_data.len) return null;
+            if (pos + path_len > postings_data.len) return error.MalformedIndex;
             file_table[i] = try allocator.dupe(u8, postings_data[pos .. pos + path_len]);
             parsed += 1;
             pos += path_len;
@@ -2114,11 +2114,11 @@ pub const MmapTrigramIndex = struct {
         const postings_start = pos;
 
         // Validate lookup header
-        if (!std.mem.eql(u8, lookup_data[0..4], &TrigramIndex.LOOKUP_MAGIC)) return null;
+        if (!std.mem.eql(u8, lookup_data[0..4], &TrigramIndex.LOOKUP_MAGIC)) return error.MalformedIndex;
         const lk_version = std.mem.readInt(u16, lookup_data[4..6], .little);
-        if (lk_version < 1 or lk_version > TrigramIndex.FORMAT_VERSION) return null;
+        if (lk_version < 1 or lk_version > TrigramIndex.FORMAT_VERSION) return error.MalformedIndex;
         const entry_count = std.mem.readInt(u32, lookup_data[8..12], .little);
-        if (lookup_data.len < 12 + entry_count * @sizeOf(TrigramIndex.LookupEntry)) return null;
+        if (lookup_data.len < 12 + entry_count * @sizeOf(TrigramIndex.LookupEntry)) return error.MalformedIndex;
 
         return MmapTrigramIndex{
             .postings_data = postings_data,

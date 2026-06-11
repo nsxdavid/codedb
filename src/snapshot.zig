@@ -908,7 +908,6 @@ fn loadSnapshotFast(
     const content_section_mark = explorer.contentSectionMark();
     var inserted_paths: std.ArrayList([]const u8) = .empty;
     defer inserted_paths.deinit(allocator);
-    explorer.invalidateCallGraph();
     var load_ok = false;
     defer if (!load_ok) {
         // POSIX mmap and Windows' aligned heap-read fallback both feed borrowed
@@ -1116,6 +1115,13 @@ fn loadSnapshotFast(
     if (prof) fresh_ns += cio.nanoTimestamp() - t_fresh0;
     const rss_fresh: u64 = if (prof) loadMaxRssBytes() else 0;
     // ── Pass C: insert restored / changed / outline-only files (sequential). ──
+    // Invalidate the stale call graph at the first explorer mutation — after
+    // header/section validation (so an early-rejected snapshot leaves the
+    // existing graph untouched) but before the snapshot's restored centrality
+    // lands (which this must not wipe). Failed loads from here roll back via
+    // removeFile, which re-invalidates as it goes.
+    explorer.invalidateCallGraph();
+
     // #564: defer the global symbol index — Pass C's per-file rebuilds become
     // no-ops and ensureSymbolIndex builds it from outlines on first
     // symbol/caller/callpath use. Plain search never needs it, so one-shot
