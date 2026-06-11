@@ -5633,11 +5633,34 @@ test "issue-258: cached project reads use the project root after contents are re
 
 /// Point HOME at a `.home` directory inside `tmp` so central-cache tests
 /// (which derive their path from cio.userHome) stay inside the tmp dir.
-fn setTestHome(io_p: std.Io, tmp_dir: std.Io.Dir) !void {
+const TestHomeGuard = struct {
+    had_prev: bool,
+    prev_len: usize,
+    prev: [std.fs.max_path_bytes]u8,
+
+    fn restore(self: *const TestHomeGuard) void {
+        if (self.had_prev) {
+            cio.posixSetenv("HOME", self.prev[0..self.prev_len]);
+        } else {
+            cio.posixUnsetenv("HOME");
+        }
+    }
+};
+
+fn setTestHome(io_p: std.Io, tmp_dir: std.Io.Dir) !TestHomeGuard {
+    var guard = TestHomeGuard{ .had_prev = false, .prev_len = 0, .prev = undefined };
+    if (cio.posixGetenv("HOME")) |prev| {
+        if (prev.len <= guard.prev.len) {
+            @memcpy(guard.prev[0..prev.len], prev);
+            guard.prev_len = prev.len;
+            guard.had_prev = true;
+        }
+    }
     try tmp_dir.createDirPath(io_p, ".home");
     var home_buf: [std.fs.max_path_bytes]u8 = undefined;
     const home_len = try tmp_dir.realPathFile(io_p, ".home", &home_buf);
     cio.posixSetenv("HOME", home_buf[0..home_len]);
+    return guard;
 }
 
 test "ProjectCache loads project from central snapshot cache" {
@@ -5654,7 +5677,8 @@ test "ProjectCache loads project from central snapshot cache" {
     var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
     const project_path = project_path_buf[0..project_path_len];
-    try setTestHome(io, tmp.dir);
+    const home_guard = try setTestHome(io, tmp.dir);
+    defer home_guard.restore();
 
     const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
     defer testing.allocator.free(data_dir);
@@ -5710,7 +5734,8 @@ test "issue-353: explicit default project loads snapshot when default explorer i
     var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
     const project_path = project_path_buf[0..project_path_len];
-    try setTestHome(io, tmp.dir);
+    const home_guard = try setTestHome(io, tmp.dir);
+    defer home_guard.restore();
 
     const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
     defer testing.allocator.free(data_dir);
@@ -5755,7 +5780,8 @@ test "issue-353: project cache invalidation reloads newly written snapshots" {
     var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
     const project_path = project_path_buf[0..project_path_len];
-    try setTestHome(io, tmp.dir);
+    const home_guard = try setTestHome(io, tmp.dir);
+    defer home_guard.restore();
 
     const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
     defer testing.allocator.free(data_dir);

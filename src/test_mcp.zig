@@ -36,6 +36,36 @@ fn builtCodedbExe() []const u8 {
     return if (builtin.os.tag == .windows) ".\\zig-out\\bin\\codedb.exe" else "./zig-out/bin/codedb";
 }
 
+/// Save an env var's current value so a test that overrides it can put the
+/// ORIGINAL back, instead of unconditionally unsetting (which would strip e.g.
+/// the runner's HOME/USERPROFILE for every later test in the process).
+const EnvVarGuard = struct {
+    name: []const u8,
+    had_prev: bool,
+    prev_len: usize,
+    prev: [4096]u8,
+
+    fn save(name: []const u8) EnvVarGuard {
+        var g = EnvVarGuard{ .name = name, .had_prev = false, .prev_len = 0, .prev = undefined };
+        if (cio.posixGetenv(name)) |v| {
+            if (v.len <= g.prev.len) {
+                @memcpy(g.prev[0..v.len], v);
+                g.prev_len = v.len;
+                g.had_prev = true;
+            }
+        }
+        return g;
+    }
+
+    fn restore(self: *const EnvVarGuard) void {
+        if (self.had_prev) {
+            cio.posixSetenv(self.name, self.prev[0..self.prev_len]);
+        } else {
+            cio.posixUnsetenv(self.name);
+        }
+    }
+};
+
 fn buildCliForHelpTests() !void {
     const build = try cio.runCapture(.{
         .allocator = testing.allocator,
@@ -77,14 +107,18 @@ test "windows cli-daemon auto-spawn proxies next query from unicode root" {
     const home_len = try tmp.dir.realPathFile(io, ".home", &home_buf);
     const test_home = home_buf[0..home_len];
 
+    const g_allow = EnvVarGuard.save("CODEDB_ALLOW_TEMP");
+    defer g_allow.restore();
+    const g_idle = EnvVarGuard.save("CODEDB_CLI_DAEMON_IDLE_MS");
+    defer g_idle.restore();
+    const g_home = EnvVarGuard.save("HOME");
+    defer g_home.restore();
+    const g_profile = EnvVarGuard.save("USERPROFILE");
+    defer g_profile.restore();
     cio.posixSetenv("CODEDB_ALLOW_TEMP", "1");
-    defer cio.posixUnsetenv("CODEDB_ALLOW_TEMP");
     cio.posixSetenv("CODEDB_CLI_DAEMON_IDLE_MS", "750");
-    defer cio.posixUnsetenv("CODEDB_CLI_DAEMON_IDLE_MS");
     cio.posixSetenv("HOME", test_home);
-    defer cio.posixUnsetenv("HOME");
     cio.posixSetenv("USERPROFILE", test_home);
-    defer cio.posixUnsetenv("USERPROFILE");
 
     const cold = try cio.runCapture(.{
         .allocator = testing.allocator,
@@ -316,7 +350,7 @@ test "issue-150: --help prints usage" {
 
     const result = try cio.runCapture(.{
         .allocator = testing.allocator,
-        .argv = &.{ "./zig-out/bin/codedb", "--help" },
+        .argv = &.{ builtCodedbExe(), "--help" },
         .max_output_bytes = 8192,
     });
     defer testing.allocator.free(result.stdout);
@@ -337,7 +371,7 @@ test "issue-150: -h prints usage" {
 
     const result = try cio.runCapture(.{
         .allocator = testing.allocator,
-        .argv = &.{ "./zig-out/bin/codedb", "-h" },
+        .argv = &.{ builtCodedbExe(), "-h" },
         .max_output_bytes = 8192,
     });
     defer testing.allocator.free(result.stdout);

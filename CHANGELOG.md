@@ -73,9 +73,9 @@ roots** (#538), and **CLI hardening** (#528).
   specifiers resolve to repo-rooted paths (with extensionless-import handling) so
   they show up in `deps` / `imported_by`; resolved keys are interned so re-indexing
   doesn't grow the arena per import.
-- **No bogus deps from strings** (#548) — a line that merely *contains* `import `
-  (e.g. an error message) is no longer captured as a dependency; only
-  statement-position imports are.
+- **No bogus deps from strings** (#548) — a line that merely *contains* an
+  `import` keyword (e.g. an error message) is no longer captured as a
+  dependency; only statement-position imports are.
 
 ### `search` consults the word index (#547)
 
