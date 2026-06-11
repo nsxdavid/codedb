@@ -544,7 +544,7 @@ pub const BenchContext = struct {
         dispatch(io, alloc, tool, args, &out, store, explorer, agents, &self.cache, null, 1);
         const elapsed = cio.nanoTimestamp() - t0;
 
-        const is_error = std.mem.startsWith(u8, out.items, "error:");
+        const is_error = toolOutputIsError(out.items);
         telem.recordToolCall(name, elapsed, is_error, out.items.len);
 
         var summary: std.ArrayList(u8) = .empty;
@@ -1168,7 +1168,7 @@ fn handleCall(
     dispatch(io, alloc, tool, args, &out, store, explorer, agents, cache, deferred_scan, edit_agent_id);
     const elapsed = cio.nanoTimestamp() - t0;
 
-    const is_error = std.mem.startsWith(u8, out.items, "error:");
+    const is_error = toolOutputIsError(out.items);
     telem.recordToolCall(name, elapsed, is_error, out.items.len);
 
     if (std.mem.eql(u8, name, "codedb_search") or std.mem.eql(u8, name, "codedb_find") or std.mem.eql(u8, name, "codedb_word")) {
@@ -1526,7 +1526,15 @@ fn handleSymbol(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             appendJsonStr(out, alloc, r.symbol.name);
             out.append(alloc, ',') catch {};
             appendJsonKeyNum(out, alloc, "score", r.score);
-            out.appendSlice(alloc, ",\"confidence\":\"indexed\"}") catch {};
+            out.appendSlice(alloc, ",\"confidence\":\"indexed\"") catch {};
+            if (include_body) {
+                if (explorer.getSymbolBody(r.path, r.symbol.line_start, r.symbol.line_end, alloc) catch null) |b| {
+                    defer alloc.free(b);
+                    out.append(alloc, ',') catch {};
+                    appendJsonKeyStr(out, alloc, "body", b);
+                }
+            }
+            out.append(alloc, '}') catch {};
         }
         out.appendSlice(alloc, "]}") catch {};
         return;
@@ -1721,7 +1729,12 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         }
     } else if (is_regex) {
         const results = explorer.searchContentRegex(query, alloc, max_results) catch |e| {
-            out.appendSlice(alloc, if (e == error.InvalidRegex) "error: invalid regex" else "error: regex search failed") catch {};
+            const invalid = e == error.InvalidRegex;
+            if (json_fmt) {
+                writeJsonToolError(out, alloc, "codedb_search", if (invalid) "invalid_regex" else "search_failed", if (invalid) "invalid regex" else "regex search failed");
+            } else {
+                out.appendSlice(alloc, if (invalid) "error: invalid regex" else "error: regex search failed") catch {};
+            }
             return;
         };
         defer {
@@ -1774,7 +1787,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, visible_total - shown }) catch {};
         }
     } else {
-        if (path_glob == null and !compact) {
+        if (path_glob == null and !compact and !json_fmt) {
             const rendered = explorer.renderPlainSearch(query, alloc, out, max_results, paths_only) catch {
                 out.appendSlice(alloc, "error: search failed") catch {};
                 return;
@@ -1792,7 +1805,11 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         const want_count = @min(offset_n + max_results + 1, 100000);
         var fetch_count = want_count;
         var fetched = explorer.searchContentAuto(query, alloc, fetch_count) catch {
-            out.appendSlice(alloc, "error: search failed") catch {};
+            if (json_fmt) {
+                writeJsonToolError(out, alloc, "codedb_search", "search_failed", "search failed");
+            } else {
+                out.appendSlice(alloc, "error: search failed") catch {};
+            }
             return;
         };
         // #560: path_glob filters AFTER ranking, so a window of global results
@@ -1815,7 +1832,11 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
                 }
                 alloc.free(fetched);
                 fetched = explorer.searchContentAuto(query, alloc, fetch_count) catch {
-                    out.appendSlice(alloc, "error: search failed") catch {};
+                    if (json_fmt) {
+                        writeJsonToolError(out, alloc, "codedb_search", "search_failed", "search failed");
+                    } else {
+                        out.appendSlice(alloc, "error: search failed") catch {};
+                    }
                     return;
                 };
             }
@@ -3448,7 +3469,7 @@ fn handleBundle(
         // Issue #357 / #423: per-tool handlers already append the
         // `received keys` diagnostic on missing-arg errors, so the bundle
         // wrapper does NOT re-append it. Doing so emits the line twice.
-        if (std.mem.startsWith(u8, sub_out.items, "error:")) {
+        if (toolOutputIsError(sub_out.items)) {
             fail_count += 1;
         } else {
             ok_count += 1;
@@ -4320,7 +4341,7 @@ fn cliUsage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), usage: []const u8
 /// Zero-result paths (e.g. find's "no matches") use non-`error:` wording and
 /// therefore keep exit 0.
 pub fn finishCli(out: *std.ArrayList(u8), start: usize) u8 {
-    return if (std.mem.startsWith(u8, out.items[start..], "error:")) 1 else 0;
+    return if (toolOutputIsError(out.items[start..])) 1 else 0;
 }
 /// Parsed `deps` invocation. `max_depth` stays null unless `--max-depth N` was
 /// given so the handler keeps its own default for transitive walks.
@@ -5141,6 +5162,12 @@ fn appendJsonKeyNum(out: *std.ArrayList(u8), alloc: std.mem.Allocator, key: []co
         else => std.fmt.bufPrint(&buf, "{d}", .{value}) catch return,
     };
     out.appendSlice(alloc, s) catch {};
+}
+
+/// True when a tool handler's output indicates failure: the plain-text
+/// "error:" marker, or the format=json error envelope from writeJsonToolError.
+pub fn toolOutputIsError(out: []const u8) bool {
+    return std.mem.startsWith(u8, out, "error:") or std.mem.startsWith(u8, out, "{\"ok\":false");
 }
 
 fn writeJsonToolError(out: *std.ArrayList(u8), alloc: std.mem.Allocator, tool: []const u8, code: []const u8, message: []const u8) void {
