@@ -728,7 +728,10 @@ pub fn spawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) voi
 }
 
 /// Build a CreateProcessW command line from argv (each arg quoted). Callers
-/// spawn children that split it back with CommandLineToArgvW-compatible rules.
+/// spawn children that split it back with CommandLineToArgvW-compatible rules:
+/// a run of N backslashes before a quote must become 2N (closing quote) or
+/// 2N+1 (escaped embedded quote) backslashes, otherwise args ending in `\`
+/// (e.g. drive-root paths) fuse with the following arg.
 /// Caller owns the returned slice; null on allocation failure.
 pub fn windowsCommandLine(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
     var cmd: std.ArrayList(u8) = .empty;
@@ -736,10 +739,23 @@ pub fn windowsCommandLine(allocator: std.mem.Allocator, argv: []const []const u8
     for (argv, 0..) |arg, i| {
         if (i != 0) cmd.append(allocator, ' ') catch return null;
         cmd.append(allocator, '"') catch return null;
+        var backslashes: usize = 0;
         for (arg) |ch| {
-            if (ch == '"') cmd.append(allocator, '\\') catch return null;
-            cmd.append(allocator, ch) catch return null;
+            switch (ch) {
+                '\\' => backslashes += 1,
+                '"' => {
+                    cmd.appendNTimes(allocator, '\\', backslashes * 2 + 1) catch return null;
+                    backslashes = 0;
+                    cmd.append(allocator, '"') catch return null;
+                },
+                else => {
+                    cmd.appendNTimes(allocator, '\\', backslashes) catch return null;
+                    backslashes = 0;
+                    cmd.append(allocator, ch) catch return null;
+                },
+            }
         }
+        cmd.appendNTimes(allocator, '\\', backslashes * 2) catch return null;
         cmd.append(allocator, '"') catch return null;
     }
     return cmd.toOwnedSlice(allocator) catch null;

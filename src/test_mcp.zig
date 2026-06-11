@@ -2406,7 +2406,7 @@ test "issue-531: codedb_context max_tokens packs sections by value under the bud
     try testing.expect(std.mem.indexOf(u8, out_budget.items, "## Top sites") == null);
 }
 
-test "issue-XX: spawnDetached command line round-trips argv with trailing backslashes" {
+test "windows: spawnDetached command line round-trips argv with trailing backslashes" {
     // spawnDetachedWindows quotes every arg but escapes only embedded quotes.
     // Per CommandLineToArgvW rules, backslashes preceding a quote must be
     // doubled: an arg ending in a backslash (any Windows root path like
@@ -2419,7 +2419,7 @@ test "issue-XX: spawnDetached command line round-trips argv with trailing backsl
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
-    const argv = [_][]const u8{ "C:\\tools\\codedb.exe", "D:\\", "cli-daemon" };
+    const argv = [_][]const u8{ "C:\\tools\\codedb.exe", "D:\\", "cli-daemon", "say \"hi\"", "a\\\\b", "tail\\\\" };
     const cmd = cio.windowsCommandLine(alloc, &argv) orelse return error.TestUnexpectedResult;
     defer alloc.free(cmd);
     const cmd_w = try std.unicode.utf8ToUtf16LeAlloc(alloc, cmd);
