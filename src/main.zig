@@ -1417,8 +1417,11 @@ fn mainImpl() !void {
         // The word index powers codedb_word and BM25 ranked search. It must be
         // built + persisted for `index` (so a later `mcp` can load it) and for
         // `mcp` itself (so ranked/NL search works in the running server).
+        // #547: `search` needs it too — Tier 0 recall is the word index. The
+        // snapshot path loads it from disk below; the cold-scan path builds it
+        // during the scan, so cold `search` isn't blind to identifier terms.
         const needs_word_index = std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine") or
-            std.mem.eql(u8, cmd, "index") or std.mem.eql(u8, cmd, "mcp");
+            std.mem.eql(u8, cmd, "index") or std.mem.eql(u8, cmd, "mcp") or std.mem.eql(u8, cmd, "search");
         if (snapshot_loaded) {
             if (std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "bench-engine") or std.mem.eql(u8, cmd, "cli-daemon")) {
                 // The cli-daemon serves proxied `search`/`callers`; warm the
@@ -1509,6 +1512,10 @@ fn mainImpl() !void {
             } else {
                 try watcher.initialScan(io, &store, &explorer, root, allocator, true);
             }
+            // The scan just indexed every file with the word index enabled, so
+            // cold `search` has complete Tier-0 recall (non-search commands are
+            // marked in their persist branch below).
+            if (is_search and explorer.word_index.enabled) explorer.markWordIndexAsComplete();
             const scan_elapsed = cio.nanoTimestamp() - t_scan;
             var dur_buf: [64]u8 = undefined;
             out.p("{s}\xe2\x9c\x93{s} {s}indexed{s}  {s}{s}{s}\n", .{
@@ -2480,6 +2487,7 @@ fn printUsage(out: *Out, s: sty.Style) void {
         \\    {s}status{s}                    index size, store seq, and index state
         \\    {s}symbol{s}  <name>            where a symbol is defined (all matches; --body for source)
         \\    {s}callers{s}  <name>           every call site of a symbol
+        \\    {s}callpath{s}  <from> <to>     shortest resolved call chain between two symbols
         \\    {s}deps{s}  <path>              dependency graph (--depends-on, --transitive, --max-depth N)
         \\    {s}glob{s}  <pattern>           match indexed paths by glob
         \\    {s}ls{s}  [path]                list a directory's indexed children
@@ -2504,11 +2512,13 @@ fn printUsage(out: *Out, s: sty.Style) void {
         s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,
+        s.cyan, s.reset,
     });
     out.p(
         \\  {s}options:{s}
         \\    {s}--no-telemetry{s}             disable usage telemetry (or set CODEDB_NO_TELEMETRY)
         \\    {s}--config-file <path>{s}       load config overrides from <path> (default: ./.codedbrc)
+        \\    {s}--allow-temp{s}               allow indexing roots under temp directories (sets CODEDB_ALLOW_TEMP)
         \\
         \\  If root is omitted, uses current working directory.
         \\  Data stored in {s}~/.codedb/projects/<hash>/{s}
@@ -2519,6 +2529,7 @@ fn printUsage(out: *Out, s: sty.Style) void {
         \\
     , .{
         s.dim,  s.reset,
+        s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,
         s.dim,  s.reset,
