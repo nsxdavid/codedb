@@ -2246,16 +2246,15 @@ pub const Explorer = struct {
                     .line_end = loc.line_end,
                     .detail = detail,
                 }, score);
-                if (list.items.len >= spec.max_results) break;
             }
-            if (list.items.len >= spec.max_results) break;
         }
 
+        // Collect ALL candidates before sorting — capping during collection
+        // would keep whichever matches hash-map iteration order surfaced
+        // first, not the best-scored ones. The cap applies after the sort.
         var ol_iter = self.outlines.iterator();
         while (ol_iter.next()) |entry| {
-            if (list.items.len >= spec.max_results) break;
             for (entry.value_ptr.symbols.items) |sym| {
-                if (list.items.len >= spec.max_results) break;
                 const score = symbolMatchScore(spec, sym.name) orelse continue;
                 if (spec.kind) |k| if (sym.kind != k) continue;
                 if (Dedup.contains(list.items, entry.key_ptr.*, sym.line_start)) continue;
@@ -2272,7 +2271,14 @@ pub const Explorer = struct {
             }
         };
         std.mem.sort(ScoredSymbolResult, list.items, {}, SortCtx.lessThan);
-        if (list.items.len > spec.max_results) list.shrinkRetainingCapacity(spec.max_results);
+        if (list.items.len > spec.max_results) {
+            for (list.items[spec.max_results..]) |r| {
+                allocator.free(r.path);
+                allocator.free(r.symbol.name);
+                if (r.symbol.detail) |d| allocator.free(d);
+            }
+            list.shrinkRetainingCapacity(spec.max_results);
+        }
         return list.toOwnedSlice(allocator);
     }
 
@@ -3595,10 +3601,22 @@ pub const Explorer = struct {
 
         var steps: std.ArrayList(CallPathStep) = .empty;
         errdefer steps.deinit(allocator);
+        errdefer {
+            for (steps.items) |s| {
+                allocator.free(s.path);
+                allocator.free(s.name);
+            }
+        }
+        // Dupe into the caller's allocator: cg.node_path/node_name live in the
+        // call graph, which any indexFile/removeFile invalidates after the
+        // shared lock here is released. Borrowed slices would dangle.
         for (path) |nid| {
+            const step_path = try allocator.dupe(u8, cg.node_path[nid]);
+            errdefer allocator.free(step_path);
+            const step_name = try allocator.dupe(u8, cg.node_name[nid]);
             try steps.append(allocator, .{
-                .path = cg.node_path[nid],
-                .name = cg.node_name[nid],
+                .path = step_path,
+                .name = step_name,
                 .line = cg.node_line[nid],
             });
         }

@@ -2073,7 +2073,13 @@ fn handleCallpath(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out
         w.print("no call path from '{s}' to '{s}' within {d} hops\n", .{ from_name, to_name, max_hops }) catch {};
         return;
     };
-    defer alloc.free(path);
+    defer {
+        for (path) |step| {
+            alloc.free(step.path);
+            alloc.free(step.name);
+        }
+        alloc.free(path);
+    }
 
     const w = cio.listWriter(out, alloc);
     w.print("call path ({d} hops): {s} → {s}\n", .{ path.len - 1, from_name, to_name }) catch {};
