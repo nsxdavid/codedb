@@ -56,6 +56,27 @@ fn isNativeWindowsTempRoot(path: []const u8) bool {
     return false;
 }
 
+fn isNativeWindowsSystemRoot(path: []const u8) bool {
+    if (path.len < 2 or path[1] != ':' or !std.ascii.isAlphabetic(path[0])) return false;
+    if (path.len == 2) return true;
+    if (!isPathSep(path[2])) return false;
+    if (path.len == 3) return true;
+
+    var idx: usize = 3;
+    if (matchPathSegment(path, &idx, "Windows")) return true;
+
+    idx = 3;
+    if (matchPathSegment(path, &idx, "Program Files")) return true;
+
+    idx = 3;
+    if (matchPathSegment(path, &idx, "Program Files (x86)")) return true;
+
+    idx = 3;
+    if (matchPathSegment(path, &idx, "ProgramData")) return true;
+
+    return false;
+}
+
 /// Temp-root indexing is an opt-in escape hatch for CI / SWE-bench harnesses
 /// that clone throwaway checkouts under /tmp. Off by default (footgun guard,
 /// #80/#346). Enabled by CODEDB_ALLOW_TEMP=1; the `--allow-temp` CLI flag sets
@@ -68,6 +89,7 @@ pub fn tempIndexingAllowed() bool {
 pub fn isIndexableRoot(path: []const u8) bool {
     if (path.len == 0) return false;
     if (std.mem.eql(u8, path, "/")) return false;
+    if (isNativeWindowsSystemRoot(path)) return false;
     // /tmp and /private/tmp are refused by default (footgun guard) but allowed
     // when temp indexing is opted in (#538) — CI/SWE-bench harnesses clone into /tmp.
     if (!tempIndexingAllowed()) {
@@ -145,4 +167,19 @@ test "issue-538: native Windows temp roots are denied" {
     try testing.expect(!isIndexableRoot("C:/Users/dev/AppData/Local/Temp/repo"));
     try testing.expect(!isIndexableRoot("C:\\Windows\\Temp\\repo"));
     try testing.expect(isIndexableRoot("C:\\Users\\dev\\projects\\repo"));
+}
+
+test "windows system and drive roots are denied" {
+    try testing.expect(!isIndexableRoot("C:"));
+    try testing.expect(!isIndexableRoot("C:\\"));
+    try testing.expect(!isIndexableRoot("D:/"));
+    try testing.expect(!isIndexableRoot("C:\\Windows"));
+    try testing.expect(!isIndexableRoot("C:\\Windows\\System32"));
+    try testing.expect(!isIndexableRoot("c:/windows/temp/repo"));
+    try testing.expect(!isIndexableRoot("C:\\Program Files"));
+    try testing.expect(!isIndexableRoot("C:\\Program Files\\Git"));
+    try testing.expect(!isIndexableRoot("C:\\Program Files (x86)\\App"));
+    try testing.expect(!isIndexableRoot("C:\\ProgramData\\Vendor"));
+    try testing.expect(isIndexableRoot("C:\\Users\\dev\\projects\\repo"));
+    try testing.expect(isIndexableRoot("D:\\work\\repo"));
 }
