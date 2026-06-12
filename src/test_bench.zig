@@ -32,7 +32,7 @@ test "bench: fuzzyScore throughput" {
     const elapsed: u64 = @intCast(cio.nanoTimestamp() - t0);
     const total_calls = iterations * queries.len;
     const per_call_ns = elapsed / total_calls;
-    std.debug.print("\n  fuzzyScore: {d} calls in {d}ms ({d}ns/call)\n", .{
+    if (cio.posixGetenv("CODEDB_BENCH_VERBOSE") != null) std.debug.print("\n  fuzzyScore: {d} calls in {d}ms ({d}ns/call)\n", .{
         total_calls,
         elapsed / std.time.ns_per_ms,
         per_call_ns,
@@ -63,7 +63,7 @@ test "bench: detectLanguage + isDocLanguage" {
     }
 
     const elapsed: u64 = @intCast(cio.nanoTimestamp() - t0);
-    std.debug.print("\n  detectLanguage+isDocLanguage: {d} calls in {d}ms ({d}ns/call, {d} docs)\n", .{
+    if (cio.posixGetenv("CODEDB_BENCH_VERBOSE") != null) std.debug.print("\n  detectLanguage+isDocLanguage: {d} calls in {d}ms ({d}ns/call, {d} docs)\n", .{
         iterations,
         elapsed / std.time.ns_per_ms,
         elapsed / iterations,

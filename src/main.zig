@@ -99,14 +99,21 @@ const Out = struct {
 /// fallible work into mainImpl which runs after we've already had a chance
 /// to surface usage / --version output via the fast path.
 pub fn main(init: std.process.Init.Minimal) void {
-    cio.setProcessArgs(init.args.vector);
-    if (handleFastPath(init.args.vector)) return;
+    // Linux/macOS hand over a C-string argv directly. Windows hands over the
+    // command line as WTF-16, so materialize it once as a WTF-8 C-string argv
+    // and the rest of the (posix-shaped) program is unchanged.
+    const argv: []const [*:0]const u8 = if (builtin.os.tag == .windows)
+        (cio.windowsArgv(init.args) catch &.{})
+    else
+        init.args.vector;
+    cio.setProcessArgs(argv);
+    if (handleFastPath(argv)) return;
     mainTrampoline() catch |err| {
         // Surface the failure on stderr so users see something even if the
         // worker thread crashes during startup.
         var buf: [256]u8 = undefined;
         if (std.fmt.bufPrint(&buf, "codedb: fatal startup error: {s}\n", .{@errorName(err)})) |msg| {
-            _ = std.c.write(2, msg.ptr, msg.len);
+            cio.writeFd(2, msg);
         } else |_| {}
         std.process.exit(1);
     };
@@ -124,15 +131,12 @@ fn mainTrampoline() !void {
 /// further down the stack can't take out plain `codedb` / `--help` /
 /// `--version` invocations.
 fn handleFastPath(argv: []const [*:0]const u8) bool {
-    const stdout_fd: c_int = 1;
-    const stderr_fd: c_int = 2;
-
     if (argv.len < 2) {
         const msg =
             "codedb  code intelligence server\n\n" ++
             "  usage: codedb [root] <command> [args...]\n\n" ++
             "  run `codedb --help` for the full command list.\n";
-        _ = std.c.write(stderr_fd, msg.ptr, msg.len);
+        cio.writeFd(2, msg);
         std.process.exit(1);
     }
 
@@ -142,7 +146,7 @@ fn handleFastPath(argv: []const [*:0]const u8) bool {
         const out = std.fmt.bufPrint(&buf, "codedb {s}\n", .{release_info.semver}) catch {
             std.process.exit(0);
         };
-        _ = std.c.write(stdout_fd, out.ptr, out.len);
+        cio.writeFd(1, out);
         std.process.exit(0);
     }
 
@@ -160,9 +164,20 @@ fn mainInner() void {
 /// without exiting the daemon process. Returns a u8 exit code; the caller
 /// is responsible for flushing `out`. Covers: tree, outline, find, search,
 /// word, read, hot. Unknown commands return 1.
+/// Print the usage error for an arity-zero command invoked with extra
+/// positional args. Returns true when extra args were present (caller exits 1).
+fn rejectExtraArgs(out: *Out, s: sty.Style, args: []const []const u8, cmd_args_start: usize, cmd_name: []const u8) bool {
+    if (!hasExtraCliArgs(args, cmd_args_start)) return false;
+    out.p("{s}\xe2\x9c\x97{s} unexpected extra argument: {s}{s}{s}  (usage: codedb [root] {s}{s}{s})\n", .{
+        s.red, s.reset, s.bold, args[cmd_args_start], s.reset, s.cyan, cmd_name, s.reset,
+    });
+    return true;
+}
+
 fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store: *Store, root: []const u8, cmd: []const u8, args: []const []const u8, cmd_args_start: usize, out: *Out, s: sty.Style) u8 {
     const use_color = s.reset.len != 0;
     if (std.mem.eql(u8, cmd, "tree")) {
+        if (rejectExtraArgs(out, s, args, cmd_args_start, "tree")) return 1;
         const t0 = cio.nanoTimestamp();
         const tree = explorer.getTree(allocator, use_color) catch return 1;
         defer allocator.free(tree);
@@ -284,7 +299,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
                 return 1;
             }
         else
-            explorer.searchContent(query, allocator, sa.max_results) catch return 1;
+            explorer.searchContentAuto(query, allocator, sa.max_results) catch return 1;
         defer {
             for (results) |r| {
                 allocator.free(r.path);
@@ -316,7 +331,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
             for (results) |r| {
                 if (paths_only) {
                     out.p("  {s}{s}{s}:{s}{d}{s}\n", .{
-                        s.cyan, r.path, s.reset,
+                        s.cyan, r.path,     s.reset,
                         s.dim,  r.line_num, s.reset,
                     });
                 } else {
@@ -476,11 +491,11 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
             const unbounded = end == std.math.maxInt(u32);
             if (unbounded) {
                 out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  L{d}-EOF  {s}{s}{s}\n", .{
-                    s.green,                       s.reset,
-                    s.bold,                        path,
-                    s.reset,                       s.langColor(@tagName(lang)),
-                    @tagName(lang),                s.reset,
-                    start,                         sty.durationColor(s, elapsed),
+                    s.green,                               s.reset,
+                    s.bold,                                path,
+                    s.reset,                               s.langColor(@tagName(lang)),
+                    @tagName(lang),                        s.reset,
+                    start,                                 sty.durationColor(s, elapsed),
                     sty.formatDuration(&dur_buf, elapsed), s.reset,
                 });
             } else {
@@ -512,6 +527,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
             }
         }
     } else if (std.mem.eql(u8, cmd, "hot")) {
+        if (rejectExtraArgs(out, s, args, cmd_args_start, "hot")) return 1;
         const t0 = cio.nanoTimestamp();
         const hot = explorer.getHotFiles(store, allocator, 10) catch return 1;
         defer {
@@ -535,6 +551,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
     } else if (std.mem.eql(u8, cmd, "status")) {
         // #528 item 1: read-only CLI status mirroring codedb_status, so
         // `codedb status` works without going through the MCP surface.
+        if (rejectExtraArgs(out, s, args, cmd_args_start, "status")) return 1;
         const t0 = cio.nanoTimestamp();
         store.mu.lock();
         const file_count = store.files.count();
@@ -569,7 +586,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
         // reach the same warm tools the MCP surface exposes.
         var nav: std.ArrayList(u8) = .empty;
         defer nav.deinit(allocator);
-        if (mcp_server.runCliTool(io, allocator, explorer, root, cmd, args, cmd_args_start, &nav)) |code| {
+        if (mcp_server.runCliTool(io, allocator, explorer, store, root, cmd, args, cmd_args_start, &nav)) |code| {
             out.p("{s}", .{nav.items});
             return code;
         }
@@ -598,14 +615,85 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
 //       blob = argv[1..] NUL-joined, e.g. "/proj\0find\0foo"
 //   response (daemon→client): [u8 exit_code][u32 out_len][out_bytes]
 const cli_blob_max: u32 = 64 * 1024;
+const cli_response_max: u32 = 16 * 1024 * 1024;
+const cli_response_too_large = "error: daemon response too large\n";
+
+fn cliResponseLenAllowed(out_len: u32) bool {
+    return out_len <= cli_response_max;
+}
+
+test "cli response length cap rejects oversized frames" {
+    try std.testing.expect(cliResponseLenAllowed(0));
+    try std.testing.expect(cliResponseLenAllowed(cli_response_max));
+    try std.testing.expect(!cliResponseLenAllowed(cli_response_max + 1));
+}
+
+const win = std.os.windows;
+const INVALID_HANDLE_VALUE = win.INVALID_HANDLE_VALUE;
+const GENERIC_READ: u32 = 0x80000000;
+const GENERIC_WRITE: u32 = 0x40000000;
+const OPEN_EXISTING: u32 = 3;
+const OPEN_ALWAYS: u32 = 4;
+const PIPE_ACCESS_DUPLEX: u32 = 0x00000003;
+const PIPE_TYPE_BYTE: u32 = 0x00000000;
+const PIPE_READMODE_BYTE: u32 = 0x00000000;
+const PIPE_WAIT: u32 = 0x00000000;
+const PIPE_UNLIMITED_INSTANCES: u32 = 255;
+const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x00080000;
+const SECURITY_SQOS_PRESENT: u32 = 0x00100000;
+const SECURITY_IDENTIFICATION: u32 = 0x00010000;
+const SDDL_REVISION_1: u32 = 1;
+
+extern "kernel32" fn CreateNamedPipeA(
+    lpName: [*:0]const u8,
+    dwOpenMode: u32,
+    dwPipeMode: u32,
+    nMaxInstances: u32,
+    nOutBufferSize: u32,
+    nInBufferSize: u32,
+    nDefaultTimeOut: u32,
+    lpSecurityAttributes: ?*anyopaque,
+) callconv(.winapi) win.HANDLE;
+extern "kernel32" fn ConnectNamedPipe(hNamedPipe: win.HANDLE, lpOverlapped: ?*anyopaque) callconv(.winapi) win.BOOL;
+extern "kernel32" fn DisconnectNamedPipe(hNamedPipe: win.HANDLE) callconv(.winapi) win.BOOL;
+extern "kernel32" fn CreateFileA(
+    lpFileName: [*:0]const u8,
+    dwDesiredAccess: u32,
+    dwShareMode: u32,
+    lpSecurityAttributes: ?*anyopaque,
+    dwCreationDisposition: u32,
+    dwFlagsAndAttributes: u32,
+    hTemplateFile: ?win.HANDLE,
+) callconv(.winapi) win.HANDLE;
+extern "kernel32" fn ReadFile(hFile: win.HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: ?*anyopaque) callconv(.winapi) win.BOOL;
+extern "kernel32" fn WriteFile(hFile: win.HANDLE, lpBuffer: [*]const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *u32, lpOverlapped: ?*anyopaque) callconv(.winapi) win.BOOL;
+extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorA(
+    sddl: [*:0]const u8,
+    revision: u32,
+    sd: *?*anyopaque,
+    sd_size: ?*u32,
+) callconv(.winapi) win.BOOL;
 
 /// Build the per-project socket path into `buf`. Stays well under sun_path
 /// (104 bytes on macOS / 108 on Linux): "/tmp/codedb-<uid>-<hash16>.sock" is
 /// at most ~40 bytes. Returns null only if formatting somehow overflows `buf`.
 fn cliSocketPath(buf: []u8, abs_root: []const u8) ?[]const u8 {
-    const uid = std.c.getuid();
+    const uid = cio.userId();
     const hash = std.hash.Wyhash.hash(0xc0de, abs_root);
     return std.fmt.bufPrint(buf, "/tmp/codedb-{d}-{x:0>16}.sock", .{ uid, hash }) catch null;
+}
+
+fn cliPipeName(buf: []u8, abs_root: []const u8) ?[:0]const u8 {
+    const hash = std.hash.Wyhash.hash(0xc0de, abs_root);
+    // Windows' behavior-equivalent endpoint is a per-project named pipe. It is
+    // process-independent like the Unix socket path, but lives in the NT pipe
+    // namespace instead of the filesystem. Hash the username in like the uid in
+    // cliSocketPath so two users sharing a machine and project path get
+    // distinct endpoints (the owner-only DACL would refuse the cross-user
+    // connection anyway; distinct names keep both daemons usable).
+    const user_hash = std.hash.Wyhash.hash(0xc0de, cio.posixGetenv("USERNAME") orelse "");
+    return std.fmt.bufPrintZ(buf, "\\\\.\\pipe\\codedb-{x:0>16}-{x:0>16}", .{ hash, user_hash }) catch null;
 }
 
 /// Fill a sockaddr.un for `path` (which must be NUL-terminatable into sun_path).
@@ -622,61 +710,132 @@ fn cliFillSockaddr(path: []const u8) ?struct { addr: std.c.sockaddr.un, len: std
     return .{ .addr = addr, .len = len };
 }
 
-/// Read exactly `buf.len` bytes from a blocking fd, looping over short reads.
-/// Returns false on EOF-before-full or a hard error (EINTR is retried).
-fn cliReadFull(fd: c_int, buf: []u8) bool {
+/// One CLI proxy connection. Each platform has exactly one transport: a Unix
+/// domain socket fd on POSIX, a named-pipe HANDLE on Windows. Everything above
+/// cliReadFull/cliWriteFull (framing, serve, respond, proxy) is shared.
+const CliConn = if (builtin.os.tag == .windows) win.HANDLE else c_int;
+
+/// One blocking read from the connection. Returns the byte count (0 = EOF),
+/// null on a hard error. EINTR is retried here so callers never see it.
+fn connRead(conn: CliConn, buf: []u8) ?usize {
+    if (builtin.os.tag == .windows) {
+        var got: u32 = 0;
+        const want: u32 = @intCast(@min(buf.len, std.math.maxInt(u32)));
+        if (ReadFile(conn, buf.ptr, want, &got, null) == .FALSE) return null;
+        return got;
+    }
+    while (true) {
+        const n = std.c.read(conn, buf.ptr, buf.len);
+        if (n >= 0) return @intCast(n);
+        if (std.c.errno(n) != .INTR) return null;
+    }
+}
+
+/// One blocking write to the connection. Returns the byte count written,
+/// null on a hard error. EINTR is retried here so callers never see it.
+fn connWrite(conn: CliConn, data: []const u8) ?usize {
+    if (builtin.os.tag == .windows) {
+        var wrote: u32 = 0;
+        const want: u32 = @intCast(@min(data.len, std.math.maxInt(u32)));
+        if (WriteFile(conn, data.ptr, want, &wrote, null) == .FALSE) return null;
+        return wrote;
+    }
+    while (true) {
+        const n = std.c.write(conn, data.ptr, data.len);
+        if (n >= 0) return @intCast(n);
+        if (std.c.errno(n) != .INTR) return null;
+    }
+}
+
+/// Read exactly `buf.len` bytes from a blocking connection, looping over short
+/// reads. Returns false on EOF-before-full or a hard error (EINTR is retried).
+fn cliReadFull(conn: CliConn, buf: []u8) bool {
     var off: usize = 0;
     while (off < buf.len) {
-        const n = std.c.read(fd, buf.ptr + off, buf.len - off);
-        if (n > 0) {
-            off += @intCast(n);
-            continue;
-        }
+        const n = connRead(conn, buf[off..]) orelse return false;
         if (n == 0) return false; // peer closed early
-        if (std.c.errno(n) == .INTR) continue;
-        return false;
+        off += n;
     }
     return true;
 }
 
-/// Write all of `data` to a blocking fd, looping over short/partial writes.
-/// Returns false on a hard error (EINTR is retried).
-fn cliWriteFull(fd: c_int, data: []const u8) bool {
+/// Write all of `data` to a blocking connection, looping over short/partial
+/// writes. Returns false on a hard error (EINTR is retried).
+fn cliWriteFull(conn: CliConn, data: []const u8) bool {
     var off: usize = 0;
     while (off < data.len) {
-        const n = std.c.write(fd, data.ptr + off, data.len - off);
-        if (n > 0) {
-            off += @intCast(n);
-            continue;
-        }
-        if (n < 0 and std.c.errno(n) == .INTR) continue;
-        return false;
+        const n = connWrite(conn, data[off..]) orelse return false;
+        if (n == 0) return false;
+        off += n;
     }
     return true;
 }
+
+/// The read-only query commands — single source of truth (#578 grew from
+/// three hand-maintained copies drifting: cliIsQueryCmd, isCommand, and the
+/// runQuery dispatch chain in mainImpl). isCommand appends the non-query
+/// commands; the dispatch chain calls cliIsQueryCmd directly.
+const cli_query_cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "callpath", "deps", "glob", "ls", "file", "context", "changes" };
 
 /// True for the read-only query commands the daemon will serve / the client
 /// will proxy. Everything else (serve, mcp, snapshot, index, ...) is handled
 /// only by the cold path.
 fn cliIsQueryCmd(cmd: []const u8) bool {
-    const cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "symbol", "callers", "deps", "glob", "ls", "file", "context" };
-    for (cmds) |c| {
+    for (cli_query_cmds) |c| {
         if (std.mem.eql(u8, cmd, c)) return true;
     }
     return false;
 }
 
-/// Daemon side. Bind a per-project Unix socket and serve framed query requests
-/// against the warm `explorer`/`store`. Runs on its own detached thread so it
-/// never blocks the daemon's primary loop. Connections are handled sequentially
-/// (CLI calls are infrequent and runQuery already tolerates concurrent reads
-/// from the watcher). On a fatal bind failure it logs and returns — the daemon
-/// keeps working and clients simply fall back to the cold path.
-/// Daemon side. Bind a per-project Unix socket and serve framed query requests
-/// against the warm `explorer`/`store`. Runs on its own detached thread so it
-/// never blocks the daemon's primary loop. Connections are handled sequentially
-/// (CLI calls are infrequent and runQuery already tolerates concurrent reads
-/// from the watcher).
+const DaemonLock = if (builtin.os.tag == .windows) win.HANDLE else c_int;
+
+/// #592: per-project cli-daemon spawn lock. Open-or-create
+/// `<data_dir>/cli-daemon.lock` and take an exclusive non-blocking lock.
+/// Returns the lock handle/fd on success — callers keep it open for the process
+/// lifetime (the OS releases it on exit, so crashes never leave a stale lock).
+/// Returns null when another process holds the lock or the file can't be
+/// opened.
+pub fn daemonLockTryAcquire(data_dir: []const u8) ?DaemonLock {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&buf, "{s}/cli-daemon.lock", .{data_dir}) catch return null;
+    if (builtin.os.tag == .windows) {
+        const handle = CreateFileA(p.ptr, GENERIC_READ | GENERIC_WRITE, 0, null, OPEN_ALWAYS, 0, null);
+        if (handle == INVALID_HANDLE_VALUE) return null;
+        return handle;
+    }
+    const fd = std.c.open(p.ptr, .{ .ACCMODE = .RDWR, .CREAT = true }, @as(c_uint, 0o600));
+    if (fd < 0) return null;
+    if (std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB) != 0) {
+        _ = std.c.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+pub fn daemonLockRelease(lock: DaemonLock) void {
+    if (builtin.os.tag == .windows) {
+        win.CloseHandle(lock);
+        return;
+    }
+    _ = std.c.flock(lock, std.c.LOCK.UN);
+    _ = std.c.close(lock);
+}
+
+/// Probe whether the spawn lock is free without keeping it: used by the CLI
+/// auto-spawn path so racing cold calls don't fork duplicate daemons.
+pub fn daemonLockAvailable(data_dir: []const u8) bool {
+    const lock = daemonLockTryAcquire(data_dir) orelse return false;
+    daemonLockRelease(lock);
+    return true;
+}
+
+/// Daemon side. Bind the per-project endpoint (Unix socket on POSIX, named
+/// pipe on Windows) and serve framed query requests against the warm
+/// `explorer`/`store`. Runs on its own detached thread so it never blocks the
+/// daemon's primary loop. Connections are handled sequentially (CLI calls are
+/// infrequent and runQuery already tolerates concurrent reads from the
+/// watcher). On a fatal bind failure it logs and returns — the daemon keeps
+/// working and clients simply fall back to the cold path.
 ///
 /// `last_activity_ms` is bumped to the current ms timestamp at the start of
 /// every accepted connection so a time-based idle watchdog (cli-daemon) can
@@ -686,6 +845,63 @@ fn cliIsQueryCmd(cmd: []const u8) bool {
 /// long-lived serve/mcp daemons pass a `shutdown` flag they never watch, so for
 /// them a bind failure simply disables the proxy (clients fall back to cold).
 fn cliDaemonListen(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store: *Store, abs_root: []const u8, last_activity_ms: *std.atomic.Value(i64), shutdown: *std.atomic.Value(bool)) void {
+    if (builtin.os.tag == .windows) {
+        var name_buf: [256]u8 = undefined;
+        const pipe_name = cliPipeName(&name_buf, abs_root) orelse {
+            shutdown.store(true, .release);
+            return;
+        };
+
+        // Owner-only protected DACL — parity with the chmod 0600 on the Unix
+        // socket path. Fail closed: no proxy beats a default-DACL pipe that
+        // other local users could open.
+        var sd: ?*anyopaque = null;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorA("D:P(A;;GA;;;OW)", SDDL_REVISION_1, &sd, null) == .FALSE) {
+            shutdown.store(true, .release);
+            return;
+        }
+        defer _ = LocalFree(sd);
+        var sa_pipe: win.SECURITY_ATTRIBUTES = .{
+            .nLength = @sizeOf(win.SECURITY_ATTRIBUTES),
+            .lpSecurityDescriptor = sd,
+            .bInheritHandle = .FALSE,
+        };
+
+        while (!shutdown.load(.acquire)) {
+            // FILE_FLAG_FIRST_PIPE_INSTANCE: creating the name only succeeds
+            // when no instance exists, so a daemon that lost the race to a
+            // live daemon — or to a squatter — exits instead of serving
+            // alongside it (clients then fall back to the cold path).
+            const pipe = CreateNamedPipeA(
+                pipe_name.ptr,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                cli_blob_max + 5,
+                cli_blob_max + 5,
+                0,
+                &sa_pipe,
+            );
+            if (pipe == INVALID_HANDLE_VALUE) {
+                // Another live daemon owns the per-project pipe, or the pipe
+                // namespace is unavailable. Signal cli-daemon startup to exit;
+                // serve/mcp callers ignore this flag and simply lose the proxy.
+                shutdown.store(true, .release);
+                return;
+            }
+            const connected = ConnectNamedPipe(pipe, null) != .FALSE or win.GetLastError() == .PIPE_CONNECTED;
+            if (!connected) {
+                win.CloseHandle(pipe);
+                continue;
+            }
+            last_activity_ms.store(cio.milliTimestamp(), .release);
+            cliServeConn(io, allocator, explorer, store, abs_root, pipe);
+            _ = DisconnectNamedPipe(pipe);
+            win.CloseHandle(pipe);
+        }
+        return;
+    }
+
     var path_buf: [128]u8 = undefined;
     const sock_path = cliSocketPath(&path_buf, abs_root) orelse {
         std.log.warn("cli-proxy: could not build socket path", .{});
@@ -769,7 +985,7 @@ fn cliDaemonListen(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer
 
 /// Handle one client connection: read the framed request, run the query into a
 /// sink buffer via runQuery, and write the framed response.
-fn cliServeConn(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store: *Store, abs_root: []const u8, conn: c_int) void {
+fn cliServeConn(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store: *Store, abs_root: []const u8, conn: CliConn) void {
     // Header: [u8 color][u32 blob_len]
     var hdr: [5]u8 = undefined;
     if (!cliReadFull(conn, &hdr)) return;
@@ -820,12 +1036,15 @@ fn cliServeConn(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, s
 }
 
 /// Write the framed response [u8 code][u32 out_len][out_bytes] to `conn`.
-fn cliRespond(conn: c_int, code: u8, out_bytes: []const u8) void {
+fn cliRespond(conn: CliConn, code: u8, out_bytes: []const u8) void {
+    const response_too_large = out_bytes.len > @as(usize, cli_response_max);
+    const bounded_code: u8 = if (response_too_large) 1 else code;
+    const bounded_bytes: []const u8 = if (response_too_large) cli_response_too_large else out_bytes;
     var hdr: [5]u8 = undefined;
-    hdr[0] = code;
-    std.mem.writeInt(u32, hdr[1..5], @intCast(out_bytes.len), .little);
+    hdr[0] = bounded_code;
+    std.mem.writeInt(u32, hdr[1..5], @intCast(bounded_bytes.len), .little);
     if (!cliWriteFull(conn, &hdr)) return;
-    if (out_bytes.len > 0) _ = cliWriteFull(conn, out_bytes);
+    if (bounded_bytes.len > 0) _ = cliWriteFull(conn, bounded_bytes);
 }
 
 /// Client side. If a daemon is listening for this project, proxy the command to
@@ -837,16 +1056,8 @@ fn cliTryProxy(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8, a
     _ = io;
     if (args.len < 2) return null;
 
-    var path_buf: [128]u8 = undefined;
-    const sock_path = cliSocketPath(&path_buf, abs_root) orelse return null;
-    const sa = cliFillSockaddr(sock_path) orelse return null;
-
-    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
-    if (fd < 0) return null;
-    defer _ = std.c.close(fd);
-
-    var sa_mut = sa;
-    if (std.c.connect(fd, @ptrCast(&sa_mut.addr), sa_mut.len) != 0) return null;
+    const conn = cliConnect(abs_root) orelse return null;
+    defer cliCloseConn(conn);
 
     // Build the NUL-joined blob from args[1..].
     var blob: std.ArrayList(u8) = .empty;
@@ -861,22 +1072,58 @@ fn cliTryProxy(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8, a
     var hdr: [5]u8 = undefined;
     hdr[0] = if (color) 1 else 0;
     std.mem.writeInt(u32, hdr[1..5], @intCast(blob.items.len), .little);
-    if (!cliWriteFull(fd, &hdr)) return null;
-    if (!cliWriteFull(fd, blob.items)) return null;
+    if (!cliWriteFull(conn, &hdr)) return null;
+    if (!cliWriteFull(conn, blob.items)) return null;
 
     // Response header: [u8 code][u32 out_len]
     var resp_hdr: [5]u8 = undefined;
-    if (!cliReadFull(fd, &resp_hdr)) return null;
+    if (!cliReadFull(conn, &resp_hdr)) return null;
     const code = resp_hdr[0];
     const out_len = std.mem.readInt(u32, resp_hdr[1..5], .little);
+    if (!cliResponseLenAllowed(out_len)) return null;
 
     if (out_len > 0) {
         const out_bytes = allocator.alloc(u8, out_len) catch return null;
         defer allocator.free(out_bytes);
-        if (!cliReadFull(fd, out_bytes)) return null;
+        if (!cliReadFull(conn, out_bytes)) return null;
         cio.File.stdout().writeAll(out_bytes) catch {};
     }
     return code;
+}
+
+/// Connect to the per-project daemon endpoint, or null if no daemon is
+/// reachable (caller falls back to the cold in-process path).
+fn cliConnect(abs_root: []const u8) ?CliConn {
+    if (builtin.os.tag == .windows) {
+        var name_buf: [256]u8 = undefined;
+        const pipe_name = cliPipeName(&name_buf, abs_root) orelse return null;
+        // SECURITY_IDENTIFICATION caps the impersonation level the pipe server
+        // gets from this connection: it may query the client's identity but
+        // cannot impersonate the client's token, so a rogue process squatting
+        // on the pipe name cannot act with this client's privileges.
+        const pipe = CreateFileA(pipe_name.ptr, GENERIC_READ | GENERIC_WRITE, 0, null, OPEN_EXISTING, SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, null);
+        if (pipe == INVALID_HANDLE_VALUE) return null;
+        return pipe;
+    }
+    var path_buf: [128]u8 = undefined;
+    const sock_path = cliSocketPath(&path_buf, abs_root) orelse return null;
+    const sa = cliFillSockaddr(sock_path) orelse return null;
+    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return null;
+    var sa_mut = sa;
+    if (std.c.connect(fd, @ptrCast(&sa_mut.addr), sa_mut.len) != 0) {
+        _ = std.c.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+fn cliCloseConn(conn: CliConn) void {
+    if (builtin.os.tag == .windows) {
+        win.CloseHandle(conn);
+        return;
+    }
+    _ = std.c.close(conn);
 }
 fn mainImpl() !void {
     // Use c_allocator (libc malloc) — better page reclamation than GPA
@@ -924,6 +1171,13 @@ fn mainImpl() !void {
                 // instead of only honoring it after `mcp`. Telemetry.init also
                 // honors CODEDB_NO_TELEMETRY.
                 no_telemetry = true;
+                continue;
+            } else if (std.mem.eql(u8, a, "--allow-temp")) {
+                // #538: opt-in to indexing temp roots (/tmp, /private/tmp). Sets
+                // CODEDB_ALLOW_TEMP so root_policy.tempIndexingAllowed (and any
+                // daemon this CLI spawns) honors it; the env var alone works too —
+                // the flag just flips it. Lets SWE-bench/CI harnesses index /tmp.
+                cio.posixSetenv("CODEDB_ALLOW_TEMP", "1");
                 continue;
             }
             try filtered.append(allocator, a);
@@ -994,12 +1248,13 @@ fn mainImpl() !void {
             }
             if (!isValidMcpFlag(a)) {
                 out.p("{s}\xe2\x9c\x97{s} unknown flag for {s}mcp{s}: {s}{s}{s}\n  valid: {s}--no-telemetry{s}, {s}--help{s}, {s}--config-file=<path>{s}\n", .{
-                    s.red,  s.reset,
-                    s.bold, s.reset,
-                    s.bold, a,      s.reset,
-                    s.bold, s.reset,
-                    s.bold, s.reset,
-                    s.bold, s.reset,
+                    s.red,   s.reset,
+                    s.bold,  s.reset,
+                    s.bold,  a,
+                    s.reset, s.bold,
+                    s.reset, s.bold,
+                    s.reset, s.bold,
+                    s.reset,
                 });
                 out.exitWithFlush(1);
             }
@@ -1056,12 +1311,55 @@ fn mainImpl() !void {
         out.exitWithFlush(1);
     }
 
+    // #553: `status` must be a cheap, fast-exiting metadata query. It previously
+    // fell through to the full index bootstrap below (snapshot mmap, or — with no
+    // snapshot — a complete re-index + multi-GB snapshot rewrite) and, being in
+    // cliIsQueryCmd, also auto-spawned a warm cli-daemon. Backgrounded as a
+    // SessionStart warmup (`codedb . status &`), each call left a multi-GB
+    // resident orphan that stacked until the machine OOM'd. Report from on-disk
+    // metadata only — no Explorer load, no daemon spawn — and exit immediately.
+    if (std.mem.eql(u8, cmd, "status")) {
+        const t0 = cio.nanoTimestamp();
+        const data_dir = getDataDir(io, allocator, abs_root) catch {
+            out.p("{s}\xe2\x9c\x97{s} cannot resolve data dir for {s}{s}{s}\n", .{
+                s.red, s.reset, s.bold, abs_root, s.reset,
+            });
+            out.exitWithFlush(1);
+        };
+        defer allocator.free(data_dir);
+        const meta = index_mod.readStatusMeta(io, data_dir, allocator);
+        const elapsed = cio.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        out.p("{s}\xe2\x9c\x93{s} {s}codedb {s}{s}  {s}{s}{s}\n", .{
+            s.green,                               s.reset,
+            s.bold,                                release_info.semver,
+            s.reset,                               sty.durationColor(s, elapsed),
+            sty.formatDuration(&dur_buf, elapsed), s.reset,
+        });
+        out.p("  {s}root{s}      {s}{s}{s}\n", .{ s.dim, s.reset, s.cyan, root, s.reset });
+        if (meta.indexed) {
+            out.p("  {s}files{s}     {s}{d}{s} indexed\n", .{ s.dim, s.reset, s.bold, meta.file_count, s.reset });
+            if (meta.git_head) |h| {
+                out.p("  {s}head{s}      {s}{s}{s}\n", .{ s.dim, s.reset, s.cyan, h[0..12], s.reset });
+            }
+        } else {
+            out.p("  {s}files{s}     {s}not indexed{s}  \xe2\x80\x94 run `codedb {s} index`\n", .{ s.dim, s.reset, s.bold, s.reset, root });
+        }
+        out.p("  {s}data{s}      {s}{s}{s}\n", .{ s.dim, s.reset, s.dim, data_dir, s.reset });
+        out.exitWithFlush(0);
+    }
+
     // Thin-client fast path: if a warm daemon (codedb <root> serve / mcp) is
     // already listening for this project, proxy read-only query commands to it
     // and skip the per-invocation snapshot reload entirely. Falls through to
     // the cold in-process path below when no daemon answers. Must run before
     // getDataDir + the load section so the proxied call pays none of that cost.
-    if (cliIsQueryCmd(cmd)) {
+    // CODEDB_NO_CLI_DAEMON disables the thin client ENTIRELY — proxy and
+    // auto-spawn — so benchmarks/tests pin the in-process path. It previously
+    // gated only the spawn, so a pre-existing daemon still answered queries
+    // despite the variable (observed while profiling #564: a stray cli-daemon
+    // served 'search' in 944µs with the variable set).
+    if (cliIsQueryCmd(cmd) and cio.posixGetenv("CODEDB_NO_CLI_DAEMON") == null) {
         if (cliTryProxy(io, allocator, abs_root, args, use_color)) |code| {
             out.flush();
             std.process.exit(code);
@@ -1070,20 +1368,37 @@ fn mainImpl() !void {
         // is warm; this call still falls through to the cold path below. The
         // daemon is the SAME binary (resolved via the self-exe path) run as
         // `codedb <abs_root> cli-daemon`, with stdio redirected to /dev/null and
-        // no waitpid (fire-and-forget). Gated by CODEDB_NO_CLI_DAEMON and skipped
-        // for an empty root. cli-daemon is not a query command, so the spawned
-        // process won't recurse into this path.
-        if (cio.posixGetenv("CODEDB_NO_CLI_DAEMON") == null and abs_root.len > 0) {
-            if (std.process.executablePathAlloc(io, allocator)) |self_exe| {
-                defer allocator.free(self_exe);
-                const daemon_argv = [_][]const u8{ self_exe, abs_root, "cli-daemon" };
-                cio.spawnDetached(allocator, &daemon_argv);
-            } else |_| {}
+        // no waitpid (fire-and-forget). Skipped for an empty root. cli-daemon is
+        // not a query command, so the spawned process won't recurse into this path.
+        // #592: also skipped while another daemon holds the per-project spawn
+        // lock — concurrent cold calls otherwise fork a daemon EACH, every
+        // duplicate rescans the index, and the stampede leaves orphans churning
+        // CPU. Losers of this probe simply cold-serve their one call.
+        if (abs_root.len > 0) {
+            const probe_dir = getDataDir(io, allocator, abs_root) catch null;
+            defer if (probe_dir) |d| allocator.free(d);
+            const lock_free = if (probe_dir) |d| daemonLockAvailable(d) else true;
+            if (lock_free) {
+                if (std.process.executablePathAlloc(io, allocator)) |self_exe| {
+                    defer allocator.free(self_exe);
+                    const daemon_argv = [_][]const u8{ self_exe, abs_root, "cli-daemon" };
+                    cio.spawnDetached(allocator, &daemon_argv);
+                } else |_| {}
+            }
         }
     }
 
     const data_dir = try getDataDir(io, allocator, abs_root);
     defer allocator.free(data_dir);
+
+    // #592: exactly one cli-daemon per project. Take the per-project flock
+    // BEFORE the expensive load below so a duplicate exits without paying a
+    // full rescan (or stealing the winner's socket via the stale-path unlink
+    // in cliDaemonListen). The fd is held for the process lifetime; the
+    // kernel drops the lock on any exit, so a crash never leaves it stale.
+    if (std.mem.eql(u8, cmd, "cli-daemon")) {
+        if (daemonLockTryAcquire(data_dir) == null) return;
+    }
 
     // Load user config (.codedbrc). Resolution: --config-file=<path>, then
     // $CWD/.codedbrc, then <binary_dir>/.codedbrc. Silently falls back to
@@ -1134,14 +1449,25 @@ fn mainImpl() !void {
         // The word index powers codedb_word and BM25 ranked search. It must be
         // built + persisted for `index` (so a later `mcp` can load it) and for
         // `mcp` itself (so ranked/NL search works in the running server).
+        // #547: `search` needs it too — Tier 0 recall is the word index. The
+        // snapshot path loads it from disk below; the cold-scan path builds it
+        // during the scan, so cold `search` isn't blind to identifier terms.
         const needs_word_index = std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine") or
-            std.mem.eql(u8, cmd, "index") or std.mem.eql(u8, cmd, "mcp");
+            std.mem.eql(u8, cmd, "index") or std.mem.eql(u8, cmd, "mcp") or std.mem.eql(u8, cmd, "search");
         if (snapshot_loaded) {
             if (std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "bench-engine") or std.mem.eql(u8, cmd, "cli-daemon")) {
                 // The cli-daemon serves proxied `search`/`callers`; warm the
                 // trigram up front (mmap-backed — cheap RSS) so it doesn't scan
                 // all content per query. Matches the serve/mcp daemon.
                 loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
+            }
+            if (std.mem.eql(u8, cmd, "search")) {
+                // #547: searchContent's Tier 0 recall is the word inverted index,
+                // not the trigram. Without it, `search` is blind to identifier
+                // terms that `word` surfaces (long / low-frequency names). Cheap
+                // mmap load, mirroring the trigram load above; `word`/`mcp`
+                // already load it, `search` did not.
+                loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
             }
             if (std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine") or std.mem.eql(u8, cmd, "cli-daemon")) {
                 loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
@@ -1191,8 +1517,19 @@ fn mainImpl() !void {
             // For search: single-pass scan + trigram build (no re-reading files).
             // For other commands: outline-only scan, trigrams from disk or rebuild.
             const is_search = std.mem.eql(u8, cmd, "search");
+            // #546: a multi-word query ranks via BM25, which rebuilds the word index
+            // from in-memory outlines/contents — the trigram-only fast scan commits
+            // neither, so the first-ever cold multi-word search ranked over an empty
+            // index and returned nothing. Route it through the full single-pass scan
+            // (outlines + contents + trigrams); single-token and --regex searches
+            // keep the trigram-only fast path.
+            const search_skips_outlines = blk: {
+                if (!is_search) break :blk true;
+                const sa = parseSearchArgs(args, cmd_args_start) catch break :blk true;
+                break :blk sa.use_regex or std.mem.indexOfScalar(u8, sa.query, ' ') == null;
+            };
             if (is_search and !heads_match) {
-                const tmp_tri = try watcher.initialScanWithTrigrams(io, &store, &explorer, root, allocator, std.heap.c_allocator, true);
+                const tmp_tri = try watcher.initialScanWithTrigrams(io, &store, &explorer, root, allocator, std.heap.c_allocator, search_skips_outlines);
                 if (tmp_tri) |tri| {
                     tri.writeToDisk(io, data_dir, git_head) catch {};
                     tri.deinit();
@@ -1207,6 +1544,10 @@ fn mainImpl() !void {
             } else {
                 try watcher.initialScan(io, &store, &explorer, root, allocator, true);
             }
+            // The scan just indexed every file with the word index enabled, so
+            // cold `search` has complete Tier-0 recall (non-search commands are
+            // marked in their persist branch below).
+            if (is_search and explorer.word_index.enabled) explorer.markWordIndexAsComplete();
             const scan_elapsed = cio.nanoTimestamp() - t_scan;
             var dur_buf: [64]u8 = undefined;
             out.p("{s}\xe2\x9c\x93{s} {s}indexed{s}  {s}{s}{s}\n", .{
@@ -1301,13 +1642,7 @@ fn mainImpl() !void {
             }
         } // end else (no snapshot)
     }
-
-    if (std.mem.eql(u8, cmd, "tree") or std.mem.eql(u8, cmd, "outline") or std.mem.eql(u8, cmd, "find") or
-        std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "read") or
-        std.mem.eql(u8, cmd, "hot") or std.mem.eql(u8, cmd, "symbol") or std.mem.eql(u8, cmd, "callers") or
-        std.mem.eql(u8, cmd, "deps") or std.mem.eql(u8, cmd, "glob") or std.mem.eql(u8, cmd, "ls") or
-        std.mem.eql(u8, cmd, "file") or std.mem.eql(u8, cmd, "context") or
-        std.mem.eql(u8, cmd, "status"))
+    if (cliIsQueryCmd(cmd))
     {
         const code = runQuery(io, allocator, &explorer, &store, abs_root, cmd, args, cmd_args_start, &out, s);
         out.flush();
@@ -1341,7 +1676,10 @@ fn mainImpl() !void {
         } else if (std.mem.eql(u8, op, "search") or std.mem.eql(u8, op, "search-fmt")) {
             const warm = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
             defer {
-                for (warm) |r| { allocator.free(r.path); allocator.free(r.line_text); }
+                for (warm) |r| {
+                    allocator.free(r.path);
+                    allocator.free(r.line_text);
+                }
                 allocator.free(warm);
             }
         }
@@ -1381,13 +1719,19 @@ fn mainImpl() !void {
             } else if (std.mem.eql(u8, op, "search")) {
                 const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
                 hits_seen = r.len;
-                for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                for (r) |item| {
+                    allocator.free(item.path);
+                    allocator.free(item.line_text);
+                }
                 allocator.free(r);
             } else if (std.mem.eql(u8, op, "search-fmt")) {
                 const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
                 hits_seen = r.len;
                 defer {
-                    for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                    for (r) |item| {
+                        allocator.free(item.path);
+                        allocator.free(item.line_text);
+                    }
                     allocator.free(r);
                 }
                 var scratch: std.ArrayList(u8) = .empty;
@@ -1405,7 +1749,10 @@ fn mainImpl() !void {
                 const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
                 hits_seen = r.len;
                 defer {
-                    for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                    for (r) |item| {
+                        allocator.free(item.path);
+                        allocator.free(item.line_text);
+                    }
                     allocator.free(r);
                 }
                 var seen = std.StringHashMap(void).init(allocator);
@@ -1522,12 +1869,14 @@ fn mainImpl() !void {
         // racing the detached listener thread against freed explorer/store.
         const idle_exit = cliIdleWatchdog(&shutdown, &last_activity_ms, idle_ms);
         shutdown.store(true, .release);
-        // If WE owned the socket (exited on idle, not a bind-race loss), unlink
-        // it on the way out. The listener thread's own `defer unlink` never runs
-        // because std.process.exit kills it mid-accept; do it here so we don't
-        // leave a stale node behind. On a bind-race loss the socket belongs to
-        // the winning daemon, so idle_exit is false and we leave it alone.
-        if (idle_exit) {
+        // POSIX only: if WE owned the socket (exited on idle, not a bind-race
+        // loss), unlink it on the way out. The listener thread's own `defer
+        // unlink` never runs because std.process.exit kills it mid-accept; do
+        // it here so we don't leave a stale node behind. On a bind-race loss
+        // the socket belongs to the winning daemon, so idle_exit is false and
+        // we leave it alone. A Windows named pipe is a kernel object with no
+        // filesystem node — it vanishes with the process, nothing to clean up.
+        if (builtin.os.tag != .windows and idle_exit) {
             var sock_buf: [128]u8 = undefined;
             if (cliSocketPath(&sock_buf, abs_root)) |sock_path| {
                 var sock_z_buf: [128]u8 = undefined;
@@ -1684,6 +2033,10 @@ fn mainImpl() !void {
         out.p("{s}\xe2\x9c\x97{s} unknown command: {s}{s}{s}\n", .{
             s.red, s.reset, s.bold, cmd, s.reset,
         });
+        // #578: flush before exit — std.process.exit skips buffered output, so
+        // the 'unknown command' line was silently lost (observed as exit 1
+        // with no output at all).
+        out.flush();
         std.process.exit(1);
     }
 }
@@ -1747,6 +2100,13 @@ pub fn parsePositional(args: []const []const u8) ParsedPositional {
 pub const LineRange = struct { start: u32, end: u32 };
 
 pub const LineRangeError = error{ MissingDash, BadStart, BadEnd, ZeroLine, Reversed };
+
+/// True when positional args remain after the command name. Used by arity-zero
+/// CLI commands (tree/hot/status) so typos like `codedb tree typo` exit 1
+/// instead of silently ignoring the extra token. See issue #528 (item 13).
+pub fn hasExtraCliArgs(args: []const []const u8, cmd_args_start: usize) bool {
+    return args.len > cmd_args_start;
+}
 
 /// Parse a `FROM-TO` line-range spec (the argument to `read -L`). `TO` may be
 /// `$` or `end` for end-of-file. Rejects malformed, non-numeric, zero-based,
@@ -1862,7 +2222,9 @@ pub fn isValidMcpFlag(arg: []const u8) bool {
 }
 
 fn isCommand(arg: []const u8) bool {
-    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "deps", "glob", "ls", "file", "context", "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
+    // cli_query_cmds is the shared query-command table (see its doc); only the
+    // non-query commands are listed here.
+    const commands = cli_query_cmds ++ [_][]const u8{ "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
     for (commands) |c| {
         if (std.mem.eql(u8, arg, c)) return true;
     }
@@ -1931,7 +2293,7 @@ fn loadBestSnapshot(
 
 fn getDataDir(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8) ![]u8 {
     const hash = std.hash.Wyhash.hash(0, abs_root);
-    const home_env = cio.posixGetenv("HOME") orelse {
+    const home_env = cio.userHome() orelse {
         return std.fmt.allocPrint(allocator, "{s}/.codedb", .{abs_root});
     };
     const home = try allocator.dupe(u8, home_env);
@@ -1971,7 +2333,11 @@ fn loadWordIndexFromDiskIfPresent(
 ) void {
     if (!explorer.wordIndexCanLoadFromDisk()) return;
 
+    // Each disable below logs WHY at debug level: a silent fallback here means
+    // the next query pays a full heap rebuild with no breadcrumb, which reads
+    // as an unexplained RSS/latency spike when profiling.
     const header = WordIndex.readDiskHeader(io, data_dir, allocator) catch null orelse {
+        std.log.debug("word.index disk load skipped: no readable header", .{});
         explorer.disableWordIndexDiskLoad();
         return;
     };
@@ -1980,6 +2346,7 @@ fn loadWordIndexFromDiskIfPresent(
     const current_count = @as(u32, @intCast(explorer.outlines.count()));
     explorer.mu.unlockShared();
     if (header.file_count != current_count) {
+        std.log.debug("word.index disk load skipped: file_count {d} != indexed {d}", .{ header.file_count, current_count });
         explorer.disableWordIndexDiskLoad();
         return;
     }
@@ -1990,6 +2357,7 @@ fn loadWordIndexFromDiskIfPresent(
         break :blk std.mem.eql(u8, &current_git_head.?, &header.git_head.?);
     };
     if (!heads_match) {
+        std.log.debug("word.index disk load skipped: git head mismatch", .{});
         explorer.disableWordIndexDiskLoad();
         return;
     }
@@ -1997,6 +2365,7 @@ fn loadWordIndexFromDiskIfPresent(
     if (WordIndex.mmapFromDisk(io, data_dir, allocator) orelse WordIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
         explorer.replaceWordIndex(loaded);
     } else {
+        std.log.debug("word.index disk load skipped: mmap and heap read both failed", .{});
         explorer.disableWordIndexDiskLoad();
     }
 }
@@ -2150,6 +2519,7 @@ fn printUsage(out: *Out, s: sty.Style) void {
         \\    {s}status{s}                    index size, store seq, and index state
         \\    {s}symbol{s}  <name>            where a symbol is defined (all matches; --body for source)
         \\    {s}callers{s}  <name>           every call site of a symbol
+        \\    {s}callpath{s}  <from> <to>     shortest resolved call chain between two symbols
         \\    {s}deps{s}  <path>              dependency graph (--depends-on, --transitive, --max-depth N)
         \\    {s}glob{s}  <pattern>           match indexed paths by glob
         \\    {s}ls{s}  [path]                list a directory's indexed children
@@ -2174,11 +2544,13 @@ fn printUsage(out: *Out, s: sty.Style) void {
         s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,
+        s.cyan, s.reset,
     });
     out.p(
         \\  {s}options:{s}
         \\    {s}--no-telemetry{s}             disable usage telemetry (or set CODEDB_NO_TELEMETRY)
         \\    {s}--config-file <path>{s}       load config overrides from <path> (default: ./.codedbrc)
+        \\    {s}--allow-temp{s}               allow indexing roots under temp directories (sets CODEDB_ALLOW_TEMP)
         \\
         \\  If root is omitted, uses current working directory.
         \\  Data stored in {s}~/.codedb/projects/<hash>/{s}
@@ -2189,6 +2561,7 @@ fn printUsage(out: *Out, s: sty.Style) void {
         \\
     , .{
         s.dim,  s.reset,
+        s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,
         s.dim,  s.reset,
@@ -2392,6 +2765,12 @@ fn watcherDeferredLoop(ctx: *mcp_server.DeferredScan) void {
 
 fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
     const mcp = @import("mcp.zig");
+    if (builtin.os.tag == .windows) {
+        while (!shutdown.load(.acquire)) {
+            cio.sleepMs(mcp.dead_client_poll_ms);
+        }
+        return;
+    }
     const stdin = cio.File.stdin();
     while (!shutdown.load(.acquire)) {
         // Quick liveness check: poll stdin for POLLHUP (client disconnected).

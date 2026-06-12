@@ -17,6 +17,20 @@ const git_mod = @import("git.zig");
 const AgentRegistry = @import("agent.zig").AgentRegistry;
 const edit_mod = @import("edit.zig");
 
+/// Shared snapshot round-trip recipe for the load-path coverage tests
+/// (issue-537/539 family): write `exp`'s snapshot as `snap_name` inside `tmp`,
+/// then load it into the caller-owned `exp2`/`store`. Returns loadSnapshot's
+/// success flag.
+fn snapshotRoundTrip(exp: *Explorer, tmp: *testing.TmpDir, snap_name: []const u8, exp2: *Explorer, store: *Store, load_alloc: std.mem.Allocator) !bool {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ dir_path, snap_name });
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, exp, dir_path, snap_path, testing.allocator);
+    return snapshot_mod.loadSnapshot(io, snap_path, exp2, store, load_alloc);
+}
+
 
 test "issue-35: edits immediately update explorer and snapshot output" {
     var tmp = testing.tmpDir(.{});
@@ -260,6 +274,34 @@ test "snapshot: restored outlines borrow strings (round-trip intact + clean dein
     try testing.expect(saw_beta);
 }
 
+// Pins the cio.mapFileRead / cio.unmapFileRead pair the snapshot loader leans
+// on. On POSIX this is a real mmap; on Windows it is a page-aligned heap buffer
+// read eagerly, so unmap must free with the exact size and alignment that map
+// allocated — testing.allocator flags any mismatch or leak. Also checks the
+// page alignment adoptContentSection's signature requires, and that the
+// mapping survives the source file being closed (the loader closes the
+// snapshot file while borrowed slices into the section stay live).
+test "snapshot: mapFileRead round-trips through unmapFileRead (size, alignment, content)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = "snapshot-section-bytes-0123456789";
+    {
+        var file = try tmp.dir.createFile(io, "mapped.bin", .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, payload);
+    }
+
+    const mapped = blk: {
+        var file = try tmp.dir.openFile(io, "mapped.bin", .{});
+        defer file.close(io);
+        break :blk try cio.mapFileRead(io, testing.allocator, file, payload.len);
+    };
+    try testing.expect(std.mem.isAligned(@intFromPtr(mapped.ptr), std.heap.page_size_min));
+    try testing.expectEqualStrings(payload, mapped);
+    cio.unmapFileRead(testing.allocator, mapped);
+}
+
 // Call-graph centrality (the ranking boost) is persisted in a snapshot section
 // and restored on load, so the first ranked search skips the lazy rebuild. This
 // pins: (1) the value round-trips exactly, and (2) restore happens at load time
@@ -399,6 +441,55 @@ test "issue-220: snapshot fast load restores outlines and lazily rebuilds word i
     try testing.expect(exp2.wordIndexNeedsPersist());
 }
 
+test "issue-537: snapshot-restored files stay searchable when trigram index is non-empty" {
+    // Emulates the engram-reported "structurally blind" search (#537). The real
+    // root cause is a load-path coverage gap, not ranking: a file restored from a
+    // snapshot lands in outlines+contents but (pre-fix) is registered in NEITHER
+    // trigram_index NOR skip_trigram_files, so Explorer.searchContent finds it in
+    // no tier. The bug only surfaces once the trigram index is non-empty (some
+    // other file indexed after load), because that rules out the Tier 5 full
+    // scan — exactly the daemon's state (hot files in trigram + cold restored
+    // files everywhere else).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // Path does not exist on disk in the temp dir below, so load restores it
+    // (freshness finds nothing newer) rather than re-indexing it into trigram.
+    try exp.indexFile("cold_pkg/buried.zig",
+        \\pub const FRESHNESS_PARALLEL_THRESHOLD_UNIQUE: usize = 256;
+        \\pub fn buriedHelper() void {}
+        \\
+    );
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const aa2 = arena2.allocator();
+    var exp2 = Explorer.init(aa2, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const loaded = try snapshotRoundTrip(&exp, &tmp, "cold.codedb", &exp2, &store, aa2);
+    try testing.expect(loaded);
+    try testing.expect(exp2.outlines.get("cold_pkg/buried.zig") != null);
+
+    // Make the trigram index non-empty so Tier 5 (full outline scan) is ruled
+    // out — the condition under which restored files vanish from search.
+    try exp2.indexFile("hot_pkg/active.zig", "pub fn activeFn() void {}\n");
+
+    // Query a MID-TOKEN substring ("RESHNESS" inside FRESHNESS_…): the word index
+    // (Tier 0, rebuilt by the #539 fix) matches only whole tokens, so this can be
+    // surfaced ONLY by the Tier 3 skip_trigram content scan — isolating the #537
+    // fix. Without the skip_trigram_files registration the restored file is in no
+    // tier and this returns nothing.
+    const results = try exp2.searchContent("RESHNESS", aa2, 10);
+    try testing.expect(results.len >= 1);
+    try testing.expect(std.mem.eql(u8, results[0].path, "cold_pkg/buried.zig"));
+}
+
 test "snapshot: parallel freshness load re-indexes changed files, restores the rest" {
     // Forces loadSnapshotFast's multi-worker freshness path with a fixture larger
     // than FRESHNESS_PARALLEL_THRESHOLD: files edited after the snapshot must come
@@ -454,8 +545,17 @@ test "snapshot: parallel freshness load re-indexes changed files, restores the r
 
     // Changed files carry fresh content (changed branch); the rest keep snapshot
     // content (restored branch) — verified directly via the content cache.
+    // Flaked once under full-suite parallelism (2026-06-10, missing content with
+    // all outlines present; 0/25 repro in isolation) — on failure, dump which
+    // file and what state survived so the next occurrence localizes the branch.
     for (0..total) |i| {
-        const cached = exp2.contents.get(abs_paths[i]) orelse return error.MissingContent;
+        const cached = exp2.contents.get(abs_paths[i]) orelse {
+            std.debug.print(
+                "MissingContent: i={d} changed={} outline_present={} contents_cached={d}/{d}\n",
+                .{ i, is_changed[i], exp2.outlines.contains(abs_paths[i]), exp2.contents.len(), total },
+            );
+            return error.MissingContent;
+        };
         const want = if (is_changed[i])
             try std.fmt.allocPrint(aa, "pub fn newfn_{d}() void {{}}\n", .{i})
         else
@@ -1017,4 +1117,247 @@ test "issue-528: codedb_edit applies via a per-session agent id (not the first/_
     const content = try tmp.dir.readFileAlloc(io, "per-session-edit.zig", testing.allocator, .limited(64 * 1024));
     defer testing.allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "baz") != null);
+}
+
+test "issue-537b: snapshot-restored files resolve call edges (symbol_index divergence)" {
+    // commitParsedFileOwnedOutline rebuilds symbol_index (explore.zig:872), but the
+    // snapshot-load path (insertRestoredFile) did not. resolveCallees reads
+    // symbol_index with NO fallback (it assumes "rebuilt on every commit", see the
+    // #524 perf note), so after a load every call edge into a restored file silently
+    // vanished. Same load-path coverage class as issue-537.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // Paths absent from the temp dir below => load restores them (not re-index).
+    try exp.indexFile("util_537b.zig", "pub fn uniqueCalleeXyz() void {}\n");
+    try exp.indexFile("main_537b.zig",
+        \\pub fn caller537b() void {
+        \\    uniqueCalleeXyz();
+        \\}
+        \\
+    );
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const aa2 = arena2.allocator();
+    var exp2 = Explorer.init(aa2, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const loaded = try snapshotRoundTrip(&exp, &tmp, "callgraph.codedb", &exp2, &store, aa2);
+    try testing.expect(loaded);
+    try testing.expect(exp2.outlines.get("main_537b.zig") != null);
+
+    // The edge caller537b -> uniqueCalleeXyz must resolve after load.
+    const callees = try exp2.resolveCallees("main_537b.zig", 1, 3, aa2, 10);
+    try testing.expect(callees.len >= 1);
+    try testing.expect(std.mem.eql(u8, callees[0].name, "uniqueCalleeXyz"));
+}
+
+test "issue-539: search recall includes snapshot-restored files (parity with word index)" {
+    // #539: codedb_search returned a tiny candidate set and omitted files the
+    // word index clearly contained ("2 results" vs "2658 word hits"). Same root
+    // cause as #537 — restored files were in no search tier. This asserts the
+    // RECALL fix: a term living only in RESTORED files is surfaced by
+    // searchContent, which now rebuilds the complete word index (the #539 fix) and
+    // finds them via Tier 0 — matching searchWord's recall. (Tier-3 substring
+    // recall for restored files is covered separately by issue-537.)
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // Paths absent from the temp dir => restored on load (not re-indexed).
+    try exp.indexFile("recall539/alpha.zig", "pub fn a() void {\n    const payload539 = 1;\n    _ = payload539;\n}\n");
+    try exp.indexFile("recall539/beta.zig", "pub fn b() void {\n    const payload539 = 2;\n    _ = payload539;\n}\n");
+    try exp.indexFile("recall539/gamma.zig", "pub fn c() void {\n    const payload539 = 3;\n    _ = payload539;\n}\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const aa2 = arena2.allocator();
+    var exp2 = Explorer.init(aa2, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const loaded = try snapshotRoundTrip(&exp, &tmp, "recall.codedb", &exp2, &store, aa2);
+    try testing.expect(loaded);
+
+    // Trigram non-empty (a hot file WITHOUT the term) so Tier 5 is ruled out —
+    // recall must come from Tier 3 scanning the restored files.
+    try exp2.indexFile("recall539/hot.zig", "pub fn hot() void {}\n");
+
+    // search must surface a restored file (was 0 results pre-fix).
+    const sres = try exp2.searchContent("payload539", aa2, 20);
+    try testing.expect(sres.len >= 1);
+    var found_restored = false;
+    for (sres) |r| {
+        if (std.mem.startsWith(u8, r.path, "recall539/") and !std.mem.eql(u8, r.path, "recall539/hot.zig")) {
+            found_restored = true;
+        }
+    }
+    try testing.expect(found_restored);
+
+    // Parity check: the word index (rebuilt lazily by searchWord) finds it too.
+    const whits = try exp2.searchWord("payload539", aa2);
+    try testing.expect(whits.len >= 1);
+}
+
+test "issue-539b: search recall ranks a relevant restored file above quota without rebuilding word index" {
+    // #539 quota residual: even with restored files Tier-3-searchable, a MORE
+    // relevant cold file was crowded out of a small max_results by less-relevant
+    // hot files. Plain search must not rebuild the full word index on every CLI
+    // invocation when a fast snapshot load leaves it incomplete; instead it
+    // reserves quota for restored skip-trigram files so reranking can still surface
+    // the canonical file without a full-repo rebuild.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // COLD canonical file (restored): term appears 3x => most relevant.
+    try exp.indexFile("recallpkg/canonical.zig",
+        \\pub fn canonical() void {
+        \\    const x1 = recallterm539;
+        \\    const x2 = recallterm539;
+        \\    const x3 = recallterm539;
+        \\    _ = .{ x1, x2, x3 };
+        \\}
+        \\
+    );
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const aa2 = arena2.allocator();
+    var exp2 = Explorer.init(aa2, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = try snapshotRoundTrip(&exp, &tmp, "recallq.codedb", &exp2, &store, aa2);
+
+    // HOT files (trigram) with the term ONCE each — quota pressure at max_results=2.
+    try exp2.indexFile("h_a.zig", "pub fn a() void { const y = recallterm539; _ = y; }\n");
+    try exp2.indexFile("h_b.zig", "pub fn b() void { const y = recallterm539; _ = y; }\n");
+    try exp2.indexFile("h_c.zig", "pub fn c() void { const y = recallterm539; _ = y; }\n");
+
+    // The most-relevant (cold, 3 hits) file must make a 2-slot result set.
+    const res = try exp2.searchContent("recallterm539", aa2, 2);
+    try testing.expect(!exp2.wordIndexIsComplete());
+    var found_canonical = false;
+    for (res) |r| if (std.mem.eql(u8, r.path, "recallpkg/canonical.zig")) {
+        found_canonical = true;
+    };
+    try testing.expect(found_canonical);
+}
+
+
+test "issue-564: snapshot fast-load defers the symbol index until first symbol use" {
+    // Pre-#564 the fast-load eagerly rebuilt the global symbol index for every
+    // restored file (~symbols-per-file map inserts and their heap) even though
+    // plain content search never reads it. The load now defers it; the first
+    // symbol/caller/callpath use builds it from outlines and answers the same.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try exp.indexFile("util_564.zig", "pub fn uniqueSym564() void {}\n");
+    try exp.indexFile("main_564.zig", "pub fn caller564() void {\n    uniqueSym564();\n}\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/lazy564.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const aa2 = arena2.allocator();
+    var exp2 = Explorer.init(aa2, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, aa2));
+
+    // The fast-load must NOT have materialized the symbol index — the deferral
+    // is the point: one-shot search pays neither the inserts nor their heap.
+    try testing.expectEqual(@as(usize, 0), exp2.symbol_index.count());
+
+    // First symbol use builds it on demand and answers correctly.
+    const results = try exp2.findAllSymbols("uniqueSym564", aa2);
+    try testing.expect(results.len >= 1);
+    try testing.expect(std.mem.eql(u8, results[0].path, "util_564.zig"));
+    try testing.expect(exp2.symbol_index.count() > 0);
+}
+
+// ─── audit (2026-06-09): latent-issue sweep — snapshot fast-restore ───
+// src/snapshot.zig:729 — OUTLINE_STATE import read cap (4096) was narrower than the
+// write cap (65535); a >4096-byte import silently disabled fast-restore (borrow path).
+test "audit: long import specifier round-trips on fast-restore (borrow path preserved)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exp = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    const long_imp = "a" ** 5000; // > 4096 (old read cap), <= 65535 (write cap)
+    const src = "package main\nimport \"" ++ long_imp ++ "\"\nfunc mainFn() {}\n";
+    try exp.indexFile("probe/main.go", src);
+    const pre = exp.outlines.get("probe/main.go") orelse return error.MissingOutline;
+    try testing.expect(pre.imports.items.len == 1);
+    try testing.expect(pre.imports.items[0].len == 5000);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = path_buf[0..try tmp.dir.realPathFile(io, ".", &path_buf)];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/probe.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, testing.allocator));
+    const outline = exp2.outlines.get("probe/main.go") orelse return error.MissingOutline;
+    // borrows_strings is the only discriminator: false on main (re-parse fallback), true after fix
+    try testing.expect(outline.borrows_strings);
+}
+
+test "p0: writeSnapshot tolerates over-long symbol names (u16 length overflow)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // An identifier longer than u16 max (65535) — minified/generated files produce
+    // these, and the old code paniced casting the length to u16 in writeSnapshot.
+    const long = try aa.alloc(u8, 70000);
+    @memset(long, 'a');
+    const content = try std.fmt.allocPrint(aa, "pub const {s} = 1;\n", .{long});
+    try exp.indexFile("src/min.zig", content);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = pb[0..try tmp.dir.realPathFile(io, ".", &pb)];
+    const snap = try std.fmt.allocPrint(testing.allocator, "{s}/min.codedb", .{dir});
+    defer testing.allocator.free(snap);
+
+    // Pre-fix: this paniced ("integer does not fit in destination type").
+    try snapshot_mod.writeSnapshot(io, &exp, dir, snap, testing.allocator);
+
+    // And the truncated record must round-trip back without crashing.
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap, &exp2, &store, testing.allocator));
+    try testing.expectEqual(@as(usize, 1), exp2.outlines.count());
 }

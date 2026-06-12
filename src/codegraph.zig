@@ -67,7 +67,29 @@ pub fn extractCallees(allocator: std.mem.Allocator, body: []const u8) ![][]const
 
     var i: usize = 0;
     while (i < body.len) : (i += 1) {
-        if (body[i] != '(') continue;
+        const c = body[i];
+        // Skip line comments, block comments, and string/char literals so an identifier
+        // mentioned only inside one is not mistaken for a call site (#548 family).
+        if (c == '/' and i + 1 < body.len and body[i + 1] == '/') {
+            i += 2;
+            while (i < body.len and body[i] != '\n') i += 1;
+            continue;
+        }
+        if (c == '/' and i + 1 < body.len and body[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < body.len and !(body[i] == '*' and body[i + 1] == '/')) i += 1;
+            i += 1; // land on '/' of '*/'; the loop's i += 1 then moves past it
+            continue;
+        }
+        if (c == '"' or c == '\'') {
+            i += 1;
+            while (i < body.len and body[i] != c) {
+                if (body[i] == '\\') i += 1; // skip an escaped char
+                i += 1;
+            }
+            continue;
+        }
+        if (c != '(') continue;
         // Skip spaces/tabs between the identifier and the '('.
         var end = i;
         while (end > 0 and (body[end - 1] == ' ' or body[end - 1] == '\t')) end -= 1;
@@ -121,4 +143,168 @@ pub fn inDegreeCentrality(allocator: std.mem.Allocator, edges: []const Edge, n_n
         if (e.to < n_nodes) c[e.to] += e.weight;
     }
     return c;
+}
+
+/// Iterative PageRank over a directed call graph. `damping` is typically 0.85;
+/// `iterations` is usually 20–50. Dangling nodes (no outgoing edges) leak rank
+/// uniformly. Returns per-node scores (caller frees).
+pub fn pageRank(
+    allocator: std.mem.Allocator,
+    edges: []const Edge,
+    n_nodes: usize,
+    damping: f32,
+    iterations: usize,
+) ![]f32 {
+    if (n_nodes == 0) return try allocator.alloc(f32, 0);
+
+    const rank = try allocator.alloc(f32, n_nodes);
+    errdefer allocator.free(rank);
+    const scratch = try allocator.alloc(f32, n_nodes);
+    defer allocator.free(scratch);
+
+    const init: f32 = 1.0 / @as(f32, @floatFromInt(n_nodes));
+    @memset(rank, init);
+
+    const out_weight = try allocator.alloc(f32, n_nodes);
+    defer allocator.free(out_weight);
+    @memset(out_weight, 0);
+    // Only edges with valid destinations propagate rank below, so out_weight
+    // must count exactly those — otherwise valid targets under-receive.
+    for (edges) |e| {
+        if (e.from < n_nodes and e.to < n_nodes) out_weight[e.from] += e.weight;
+    }
+
+    const leak: f32 = (1.0 - damping) / @as(f32, @floatFromInt(n_nodes));
+
+    for (0..iterations) |_| {
+        @memset(scratch, leak);
+
+        var dangling: f32 = 0;
+        for (0..n_nodes) |i| {
+            if (out_weight[i] == 0) dangling += rank[i];
+        }
+        if (dangling > 0) {
+            const share = damping * dangling / @as(f32, @floatFromInt(n_nodes));
+            for (scratch) |*s| s.* += share;
+        }
+
+        for (edges) |e| {
+            if (e.from >= n_nodes or e.to >= n_nodes) continue;
+            const ow = out_weight[e.from];
+            if (ow > 0) scratch[e.to] += damping * rank[e.from] * (e.weight / ow);
+        }
+
+        @memcpy(rank, scratch);
+    }
+
+    return rank;
+}
+
+/// Build a forward adjacency list (caller owns returned slice and inner lists).
+pub fn buildAdjacency(
+    allocator: std.mem.Allocator,
+    edges: []const Edge,
+    n_nodes: usize,
+) ![]std.ArrayList(NodeId) {
+    const adj = try allocator.alloc(std.ArrayList(NodeId), n_nodes);
+    errdefer {
+        for (adj) |*list| list.deinit(allocator);
+        allocator.free(adj);
+    }
+    for (adj) |*list| list.* = .empty;
+    for (edges) |e| {
+        if (e.from < n_nodes and e.to < n_nodes) {
+            try adj[e.from].append(allocator, e.to);
+        }
+    }
+    return adj;
+}
+
+pub fn freeAdjacency(allocator: std.mem.Allocator, adj: []std.ArrayList(NodeId)) void {
+    for (adj) |*list| list.deinit(allocator);
+    allocator.free(adj);
+}
+
+/// Shortest call chain from any `from_ids` node to any node in `to_ids`.
+/// Returns owned node-id path (inclusive) or null when unreachable within
+/// `max_hops` (default unlimited when max_hops == 0).
+pub fn shortestCallPath(
+    allocator: std.mem.Allocator,
+    adj: []const std.ArrayList(NodeId),
+    n_nodes: usize,
+    from_ids: []const NodeId,
+    to_ids: []const NodeId,
+    max_hops: usize,
+) !?[]NodeId {
+    if (n_nodes == 0 or from_ids.len == 0 or to_ids.len == 0) return null;
+
+    var to_set = std.AutoHashMap(NodeId, void).init(allocator);
+    defer to_set.deinit();
+    for (to_ids) |id| {
+        if (id < n_nodes) try to_set.put(id, {});
+    }
+    if (to_set.count() == 0) return null;
+
+    for (from_ids) |id| {
+        if (id < n_nodes and to_set.contains(id)) {
+            const path = try allocator.alloc(NodeId, 1);
+            path[0] = id;
+            return path;
+        }
+    }
+
+    var queue: std.ArrayList(NodeId) = .empty;
+    defer queue.deinit(allocator);
+    var visited = std.AutoHashMap(NodeId, void).init(allocator);
+    defer visited.deinit();
+    const parent = try allocator.alloc(?NodeId, n_nodes);
+    defer allocator.free(parent);
+    @memset(parent, null);
+
+    for (from_ids) |id| {
+        if (id >= n_nodes) continue;
+        try queue.append(allocator, id);
+        try visited.put(id, {});
+    }
+
+    var head: usize = 0;
+    var depth: usize = 0;
+    var level_end = queue.items.len;
+
+    while (head < queue.items.len) {
+        if (head == level_end) {
+            depth += 1;
+            if (max_hops > 0 and depth > max_hops) return null;
+            level_end = queue.items.len;
+        }
+
+        const cur = queue.items[head];
+        head += 1;
+
+        if (depth > 0 and to_set.contains(cur)) {
+            var len: usize = 0;
+            var n: ?NodeId = cur;
+            while (n) |v| : (n = parent[v]) len += 1;
+
+            const path = try allocator.alloc(NodeId, len);
+            var idx = len;
+            n = cur;
+            while (n) |v| {
+                idx -= 1;
+                path[idx] = v;
+                n = parent[v];
+            }
+            return path;
+        }
+
+        if (cur >= adj.len) continue;
+        for (adj[cur].items) |next| {
+            if (next >= n_nodes or visited.contains(next)) continue;
+            try visited.put(next, {});
+            parent[next] = cur;
+            try queue.append(allocator, next);
+        }
+    }
+
+    return null;
 }

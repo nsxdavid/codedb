@@ -208,12 +208,13 @@ const ProjectCtx = struct {
 
 fn getProjectDataDir(allocator: std.mem.Allocator, project_path: []const u8) ?[]u8 {
     const hash = std.hash.Wyhash.hash(0, project_path);
-    const home = cio.posixGetenv("HOME") orelse {
+    const home = cio.userHome() orelse {
         return std.fmt.allocPrint(allocator, "{s}/.codedb", .{project_path}) catch null;
     };
 
     return std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}", .{ home, hash }) catch null;
 }
+
 
 fn loadProjectTrigramFromDiskIfPresent(io: std.Io, explorer: *Explorer, project_path: []const u8, allocator: std.mem.Allocator) void {
     explorer.mu.lockShared();
@@ -427,7 +428,7 @@ const ProjectCache = struct {
             const hash = std.hash.Wyhash.hash(0, p);
             var central_buf: [std.fs.max_path_bytes]u8 = undefined;
             const loaded_central = blk: {
-                const home = cio.posixGetenv("HOME") orelse break :blk false;
+                const home = cio.userHome() orelse break :blk false;
                 const central = std.fmt.bufPrint(&central_buf, "{s}/.codedb/projects/{x}/codedb.snapshot", .{ home, hash }) catch break :blk false;
                 break :blk snapshot_mod.loadSnapshot(io, central, &new_entry.explorer, &new_entry.store, self.alloc);
             };
@@ -543,7 +544,7 @@ pub const BenchContext = struct {
         dispatch(io, alloc, tool, args, &out, store, explorer, agents, &self.cache, null, 1);
         const elapsed = cio.nanoTimestamp() - t0;
 
-        const is_error = std.mem.startsWith(u8, out.items, "error:");
+        const is_error = toolOutputIsError(out.items);
         telem.recordToolCall(name, elapsed, is_error, out.items.len);
 
         var summary: std.ArrayList(u8) = .empty;
@@ -594,6 +595,7 @@ pub const Tool = enum {
     codedb_search,
     codedb_word,
     codedb_callers,
+    codedb_callpath,
     codedb_hot,
     codedb_deps,
     codedb_read,
@@ -617,11 +619,12 @@ pub const tools_list =
     \\{"tools":[
     \\{"name":"codedb_tree","description":"Whole-repo file tree with per-file language, line counts, and symbol counts. Use to orient in an unfamiliar project.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_outline","description":"Symbol outline of one file: functions, structs, enums, imports, consts with line numbers. 4-15x smaller than reading the raw file. Run before codedb_read to find the lines you actually need. Pass skeleton=true for a signature view — each symbol's declaration line with its body elided as '{ … N lines }', so a 2,000-line file collapses to ~one line per symbol.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"compact":{"type":"boolean","description":"Condensed format without detail comments (default: false)"},"skeleton":{"type":"boolean","description":"Signature view: each symbol's declaration line with its body elided as '{ … N lines }'. Lossless at the API surface; codedb_read the range to expand a body (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
-    \\{"name":"codedb_symbol","description":"Find where a named symbol is defined across the index. Returns file, line, and kind. Pass body=true for source. Pick this over codedb_search when you have an exact identifier.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name to search for (exact match)"},"body":{"type":"boolean","description":"Include source body for each symbol (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
-    \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Scope with path_glob to filter by language.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Page size (default: 20, raise to 50 for broad surveys)"},"offset":{"type":"integer","description":"Pagination offset into the ranked results (default: 0). When more results exist, the response ends with a 'more results ... offset=N' line; pass that offset to get the next page."},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"paths_only":{"type":"boolean","description":"Return path:line per result without the matching line text — ~50% fewer tokens per call, useful for broad surveys or for budget-conscious agents (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig', 'src/**/*.zig', or '**/*.{yaml,yml}'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
+    \\{"name":"codedb_symbol","description":"Find symbol definitions across the index — exact name, prefix, glob pattern, fuzzy match, or kind filter. Returns file, line, kind, and score. Pass format=json for structured output.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Exact symbol name"},"prefix":{"type":"string","description":"Prefix match (e.g. parse_)"},"pattern":{"type":"string","description":"Glob pattern on symbol name (e.g. *Manager)"},"kind":{"type":"string","description":"Filter by kind: function, struct, interface, class, method, enum"},"fuzzy":{"type":"boolean","description":"Fuzzy/typo-tolerant match when name is set (default: false)"},"body":{"type":"boolean","description":"Include source body for each symbol (default: false)"},"max_results":{"type":"integer","description":"Max results (default: 50, cap 200)"},"format":{"type":"string","description":"Set to json for structured JSON output"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
+    \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Pass format=json for structured output with search provenance meta.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Page size (default: 20, raise to 50 for broad surveys)"},"offset":{"type":"integer","description":"Pagination offset into the ranked results (default: 0). When more results exist, the response ends with a 'more results ... offset=N' line; pass that offset to get the next page."},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"paths_only":{"type":"boolean","description":"Return path:line per result without the matching line text — ~50% fewer tokens per call, useful for broad surveys or for budget-conscious agents (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig', 'src/**/*.zig', or '**/*.{yaml,yml}'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"format":{"type":"string","description":"Set to json for structured JSON output with provenance meta"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
     \\{"name":"codedb_word","description":"Exact-identifier lookup via inverted index — every occurrence of one word, O(1). Use for single identifiers; use codedb_search for substrings or phrases.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
     \\{"name":"codedb_callers","description":"Find every call site of a named symbol — fuses word-index occurrences with outline scope info. One round-trip vs codedb_word + codedb_outline-per-file. Returns {path, line, snippet, scope_name, scope_kind, scope_lines}. Excludes the symbol's own definition site.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (exact identifier match)"},"max_results":{"type":"integer","description":"Maximum call sites to return (default: 30, raise for hot symbols)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
-    \\{"name":"codedb_context","description":"Task-shaped composer: pass a natural-language task; returns ONE tight block (keywords used + symbol definitions + ranked files + top file:line snippets). Replaces 3-5 sequential search/word/symbol calls — use for first-touch orientation on a new task. For narrow follow-ups stick with codedb_search/codedb_symbol.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars). Include candidate identifiers (camelCase / snake_case) or \"quoted strings\" so the composer can extract keywords."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["task"]}},
+    \\{"name":"codedb_callpath","description":"Shortest resolved call chain between two symbols via the local call graph (A→…→B). Use after codedb_callers when you need how execution reaches a callee. Returns each hop as path:name@line.","inputSchema":{"type":"object","properties":{"from":{"type":"string","description":"Source symbol name (exact identifier)"},"to":{"type":"string","description":"Target symbol name (exact identifier)"},"max_hops":{"type":"integer","description":"Max call hops to search (default: 12)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["from","to"]}},
+    \\{"name":"codedb_context","description":"Task-shaped composer: pass a natural-language task; returns ONE tight block (keywords used + symbol definitions + ranked files + top file:line snippets). Replaces 3-5 sequential search/word/symbol calls — use for first-touch orientation on a new task. For narrow follow-ups stick with codedb_search/codedb_symbol.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars). Include candidate identifiers (camelCase / snake_case) or \"quoted strings\" so the composer can extract keywords."},"max_tokens":{"type":"integer","description":"Approximate response token budget (~4 chars/token, min 256). Sections are packed by value — files, symbol definitions, callers, calls, snippets — and omitted ones leave a one-line marker."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["task"]}},
     \\{"name":"codedb_diagnostics","description":"Fetch the latest linter diagnostics for a file, produced off the edit path (ruff/biome/etc.) after a recent codedb_edit. Call right after an edit to surface real errors the change may have introduced (undefined names, type/lint issues) on top of codedb's built-in checks. Returns 'no diagnostics available yet' when none are cached or external linters are disabled.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to fetch diagnostics for"}},"required":["path"]}},
     \\{"name":"codedb_hot","description":"Most recently modified files in the project, newest first.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_deps","description":"Dependency graph: who imports a file (default) or what a file imports (direction=depends_on). Set transitive=true for the full BFS blast radius.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"},"direction":{"type":"string","enum":["imported_by","depends_on"],"description":"imported_by (default): who imports this file. depends_on: what this file imports."},"transitive":{"type":"boolean","description":"Follow dependency chain transitively (default: false)"},"max_depth":{"type":"integer","description":"Max traversal depth for transitive queries (default: unlimited)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
@@ -635,7 +638,7 @@ pub const tools_list =
     \\{"name":"codedb_projects","description":"List every locally indexed project on this machine: path, data-dir hash, snapshot presence.","inputSchema":{"type":"object","properties":{},"required":[]}},
     \\{"name":"codedb_index","description":"Index a local FOLDER (not a file). Builds outlines, trigrams, word index, and writes codedb.snapshot. After indexing, query it via the project= param on any other tool.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the FOLDER (not a file) to index, e.g. /Users/you/myproject"}},"required":["path"]}},
     \\{"name":"codedb_find","description":"Fuzzy FILE-NAME search ONLY — typo-tolerant subsequence match against indexed file paths. NOT a content/symbol search: 'rerank' will NOT find files containing rerankSignalScore unless the filename itself contains 'rerank'. For symbol lookups use codedb_word/codedb_symbol; for content use codedb_search.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Fuzzy filename query (e.g. 'authmidlware' for auth_middleware.go, 'test_auth', 'main.zig'). Matched against path basenames, not file contents."},"max_results":{"type":"integer","description":"Maximum results to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
-    \\{"name":"codedb_query","description":"Composable pipeline — chain ops where each step feeds the next. Ops: find, search, filter, deps, outline, read, sort, limit. Replaces multi-call workflows with one request.","inputSchema":{"type":"object","properties":{"pipeline":{"type":"array","items":{"type":"object"},"description":"Array of pipeline steps. Each step has 'op' (find/search/filter/deps/outline/read/sort/limit) and op-specific params. Steps execute in order, each filtering/transforming the file set from the previous step. deps op: {\"op\":\"deps\",\"direction\":\"imported_by|depends_on\",\"transitive\":true,\"max_depth\":3}"},"project":{"type":"string","description":"Optional absolute path to a different project"}},"required":["pipeline"]}},
+    \\{"name":"codedb_query","description":"Composable pipeline — chain ops where each step feeds the next. Ops: find, search, filter, deps, outline, read, sort, limit. Replaces multi-call workflows with one request.","inputSchema":{"type":"object","properties":{"pipeline":{"type":"array","items":{"type":"object"},"description":"Array of pipeline steps. Each step has 'op' (find/search/filter/deps/outline/read/sort/limit) and op-specific params. Steps execute in order, each filtering/transforming the file set from the previous step. deps op: {\"op\":\"deps\",\"direction\":\"imported_by|depends_on\",\"transitive\":true,\"max_depth\":3}; filter op: {\"op\":\"filter\",\"glob\":\"src/**\"} or {\"op\":\"filter\",\"ext\":\".zig\"} ('pattern' aliases 'glob'; bare patterns auto-promote to '**/<pattern>')"},"project":{"type":"string","description":"Optional absolute path to a different project"}},"required":["pipeline"]}},
     \\{"name":"codedb_glob","description":"Match indexed paths against a glob: * (no /), ** (across /), ? (one char), {a,b} alternatives. Sorted lexicographically. Use when you know the path shape; codedb_find for fuzzy names.","inputSchema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. 'src/**/*.zig', '**/*.{yaml,yml}', 'tests/test_*.py')"},"max_results":{"type":"integer","description":"Maximum results to return (default: 200)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["pattern"]}},
     \\{"name":"codedb_ls","description":"List immediate children of a directory: dirs first (alphabetical), then files with language and line/symbol counts. Drill down level-by-level when codedb_tree is too verbose.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Directory prefix relative to project root. Omit or pass empty string for root."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}}
     \\]}
@@ -757,7 +760,6 @@ pub fn buildAugmentedToolsList(alloc: std.mem.Allocator) ![]u8 {
     const augmented_in_arena = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
     return try alloc.dupe(u8, augmented_in_arena);
 }
-
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
@@ -1166,7 +1168,7 @@ fn handleCall(
     dispatch(io, alloc, tool, args, &out, store, explorer, agents, cache, deferred_scan, edit_agent_id);
     const elapsed = cio.nanoTimestamp() - t0;
 
-    const is_error = std.mem.startsWith(u8, out.items, "error:");
+    const is_error = toolOutputIsError(out.items);
     telem.recordToolCall(name, elapsed, is_error, out.items.len);
 
     if (std.mem.eql(u8, name, "codedb_search") or std.mem.eql(u8, name, "codedb_find") or std.mem.eql(u8, name, "codedb_word")) {
@@ -1355,6 +1357,7 @@ fn dispatch(
         .codedb_search => handleSearch(alloc, args, out, ctx.explorer),
         .codedb_word => handleWord(alloc, args, out, ctx.explorer),
         .codedb_callers => handleCallers(alloc, args, out, ctx.explorer),
+        .codedb_callpath => handleCallpath(alloc, args, out, ctx.explorer),
         .codedb_hot => handleHot(alloc, args, out, ctx.store, ctx.explorer),
         .codedb_deps => handleDeps(alloc, args, out, ctx.explorer),
         .codedb_read => handleRead(io, alloc, args, out, ctx.explorer),
@@ -1397,7 +1400,7 @@ fn appendScanProgressHint(alloc: std.mem.Allocator, out: *std.ArrayList(u8), too
 
 fn toolDependsOnScannedIndex(tool: Tool) bool {
     return switch (tool) {
-        .codedb_search, .codedb_word, .codedb_callers, .codedb_outline, .codedb_symbol, .codedb_find, .codedb_glob, .codedb_tree, .codedb_ls, .codedb_deps => true,
+        .codedb_search, .codedb_word, .codedb_callers, .codedb_callpath, .codedb_outline, .codedb_symbol, .codedb_find, .codedb_glob, .codedb_tree, .codedb_ls, .codedb_deps => true,
         else => false,
     };
 }
@@ -1438,39 +1441,122 @@ fn handleOutline(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
 }
 
 fn handleSymbol(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
-    const name = getStr(args, "name") orelse {
-        out.appendSlice(alloc, "error: missing 'name' argument") catch {};
-        appendBundleArgKeysDiagnostic(alloc, out, args);
-        return;
-    };
+    const name = getStr(args, "name");
+    const prefix = getStr(args, "prefix");
+    const pattern = getStr(args, "pattern");
+    const kind_str = getStr(args, "kind");
+    const fuzzy = getBool(args, "fuzzy");
     const include_body = getBool(args, "body");
-    if (!include_body) {
-        const rendered = explorer.renderSymbols(name, alloc, out) catch {
-            out.appendSlice(alloc, "error: search failed") catch {};
-            return;
-        };
-        if (!rendered) {
-            out.appendSlice(alloc, "no results for: ") catch {};
-            out.appendSlice(alloc, name) catch {};
+    const json_fmt = wantsJsonFormat(args);
+
+    if (name == null and prefix == null and pattern == null and kind_str == null) {
+        if (json_fmt) {
+            writeJsonToolError(out, alloc, "codedb_symbol", "missing_query", "need name, prefix, pattern, or kind");
+        } else {
+            out.appendSlice(alloc, "error: need name, prefix, pattern, or kind") catch {};
+            appendBundleArgKeysDiagnostic(alloc, out, args);
         }
         return;
     }
-    const results = explorer.findAllSymbols(name, alloc) catch {
-        out.appendSlice(alloc, "error: search failed") catch {};
+
+    // #573: an explicitly empty name is a usage error, not a lookup for ""
+    // (which rendered as 'no results for: '). Mirrors codedb_callers.
+    if (name != null and name.?.len == 0) {
+        if (json_fmt) {
+            writeJsonToolError(out, alloc, "codedb_symbol", "empty_name", "empty name — pass a non-empty symbol name");
+        } else {
+            out.appendSlice(alloc, "error: empty name — pass a non-empty symbol name") catch {};
+        }
+        return;
+    }
+
+    const kind = if (kind_str) |k| Explorer.parseSymbolKind(k) else null;
+    if (kind_str != null and kind == null) {
+        if (json_fmt) {
+            writeJsonToolError(out, alloc, "codedb_symbol", "invalid_kind", "unknown symbol kind");
+        } else {
+            out.appendSlice(alloc, "error: unknown symbol kind") catch {};
+        }
+        return;
+    }
+
+    const max_results: usize = if (getInt(args, "max_results")) |n| @intCast(@max(1, @min(n, 200))) else 50;
+    const spec = Explorer.SymbolSearchSpec{
+        .name = name,
+        .prefix = prefix,
+        .pattern = pattern,
+        .kind = kind,
+        .fuzzy = fuzzy,
+        .max_results = max_results,
+    };
+
+    const results = explorer.searchSymbols(spec, alloc) catch {
+        if (json_fmt) {
+            writeJsonToolError(out, alloc, "codedb_symbol", "search_failed", "symbol search failed");
+        } else {
+            out.appendSlice(alloc, "error: search failed") catch {};
+        }
         return;
     };
-    defer alloc.free(results);
+    defer {
+        for (results) |r| {
+            alloc.free(r.path);
+            alloc.free(r.symbol.name);
+            if (r.symbol.detail) |d| alloc.free(d);
+        }
+        alloc.free(results);
+    }
+
+    if (json_fmt) {
+        out.appendSlice(alloc, "{\"ok\":true,\"tool\":\"codedb_symbol\",") catch {};
+        appendJsonKeyNum(out, alloc, "count", results.len);
+        out.appendSlice(alloc, ",\"meta\":{\"index\":\"symbol_index+outline\",\"match_mode\":") catch {};
+        appendJsonStr(out, alloc, symbolMatchModeLabel(spec));
+        out.append(alloc, '}') catch {};
+        out.appendSlice(alloc, ",\"results\":[") catch {};
+        for (results, 0..) |r, i| {
+            if (i > 0) out.append(alloc, ',') catch {};
+            out.appendSlice(alloc, "{\"path\":") catch {};
+            appendJsonStr(out, alloc, r.path);
+            out.append(alloc, ',') catch {};
+            appendJsonKeyNum(out, alloc, "line", r.symbol.line_start);
+            out.appendSlice(alloc, ",\"kind\":") catch {};
+            appendJsonStr(out, alloc, @tagName(r.symbol.kind));
+            out.appendSlice(alloc, ",\"name\":") catch {};
+            appendJsonStr(out, alloc, r.symbol.name);
+            out.append(alloc, ',') catch {};
+            appendJsonKeyNum(out, alloc, "score", r.score);
+            out.appendSlice(alloc, ",\"confidence\":\"indexed\"") catch {};
+            if (include_body) {
+                if (explorer.getSymbolBody(r.path, r.symbol.line_start, r.symbol.line_end, alloc) catch null) |b| {
+                    defer alloc.free(b);
+                    out.append(alloc, ',') catch {};
+                    appendJsonKeyStr(out, alloc, "body", b);
+                }
+            }
+            out.append(alloc, '}') catch {};
+        }
+        out.appendSlice(alloc, "]}") catch {};
+        return;
+    }
 
     if (results.len == 0) {
-        out.appendSlice(alloc, "no results for: ") catch {};
-        out.appendSlice(alloc, name) catch {};
+        out.appendSlice(alloc, "no results") catch {};
+        if (name) |n| {
+            out.appendSlice(alloc, " for: ") catch {};
+            out.appendSlice(alloc, n) catch {};
+        }
         return;
     }
 
     const w = cio.listWriter(out, alloc);
-    w.print("{d} results for '{s}':\n", .{ results.len, name }) catch {};
+    if (name) |n| {
+        w.print("{d} results for '{s}':\n", .{ results.len, n }) catch {};
+    } else {
+        w.print("{d} symbol results:\n", .{results.len}) catch {};
+    }
     for (results) |r| {
-        w.print("  {s}:{d} ({s})", .{ r.path, r.symbol.line_start, @tagName(r.symbol.kind) }) catch {};
+        w.print("  {s}:{d} ({s}) {s}", .{ r.path, r.symbol.line_start, @tagName(r.symbol.kind), r.symbol.name }) catch {};
         if (r.symbol.detail) |d| w.print("  // {s}", .{d}) catch {};
         w.writeAll("\n") catch {};
         if (include_body) {
@@ -1485,15 +1571,23 @@ fn handleSymbol(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
 
 fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const query = getStr(args, "query") orelse {
-        out.appendSlice(alloc, "error: missing 'query' argument") catch {};
-        appendBundleArgKeysDiagnostic(alloc, out, args);
+        if (wantsJsonFormat(args)) {
+            writeJsonToolError(out, alloc, "codedb_search", "missing_query", "missing 'query' argument");
+        } else {
+            out.appendSlice(alloc, "error: missing 'query' argument") catch {};
+            appendBundleArgKeysDiagnostic(alloc, out, args);
+        }
         return;
     };
     // Bug 7: validate args explicitly. Pre-fix: empty query / non-positive
     // max_results all returned "0 results" and the agent thought the search
     // ran with nothing matching, when really the call was malformed.
     if (query.len == 0) {
-        out.appendSlice(alloc, "error: empty query — pass a non-empty 'query' string") catch {};
+        if (wantsJsonFormat(args)) {
+            writeJsonToolError(out, alloc, "codedb_search", "missing_query", "empty query — pass a non-empty 'query' string");
+        } else {
+            out.appendSlice(alloc, "error: empty query — pass a non-empty 'query' string") catch {};
+        }
         return;
     }
     if (getInt(args, "max_results")) |n| {
@@ -1526,6 +1620,11 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         break :blk g;
     } else null;
 
+    const json_fmt = wantsJsonFormat(args);
+    if (json_fmt and scope) {
+        writeJsonToolError(out, alloc, "codedb_search", "unsupported", "format=json does not support scope=true yet");
+        return;
+    }
     if (scope and is_regex) {
         const results = explorer.searchContentRegexWithScope(query, alloc, max_results) catch |e| {
             out.appendSlice(alloc, if (e == error.InvalidRegex) "error: invalid regex" else "error: scoped regex search failed") catch {};
@@ -1630,7 +1729,12 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         }
     } else if (is_regex) {
         const results = explorer.searchContentRegex(query, alloc, max_results) catch |e| {
-            out.appendSlice(alloc, if (e == error.InvalidRegex) "error: invalid regex" else "error: regex search failed") catch {};
+            const invalid = e == error.InvalidRegex;
+            if (json_fmt) {
+                writeJsonToolError(out, alloc, "codedb_search", if (invalid) "invalid_regex" else "search_failed", if (invalid) "invalid regex" else "regex search failed");
+            } else {
+                out.appendSlice(alloc, if (invalid) "error: invalid regex" else "error: regex search failed") catch {};
+            }
             return;
         };
         defer {
@@ -1648,6 +1752,10 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             if (path_glob) |g| if (!globMatch(g, r.path)) continue;
             if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
             visible_total += 1;
+        }
+        if (json_fmt) {
+            writeSearchResultsJson(out, alloc, explorer, query, results, 0, false, paths_only, path_glob, compact);
+            return;
         }
 
         const w = cio.listWriter(out, alloc);
@@ -1679,7 +1787,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, visible_total - shown }) catch {};
         }
     } else {
-        if (path_glob == null and !compact) {
+        if (path_glob == null and !compact and !json_fmt) {
             const rendered = explorer.renderPlainSearch(query, alloc, out, max_results, paths_only) catch {
                 out.appendSlice(alloc, "error: search failed") catch {};
                 return;
@@ -1687,22 +1795,52 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             if (rendered) return;
         }
 
-        // Multi-word queries express natural-language / conceptual intent —
-        // rank them by BM25 (relevance) instead of raw substring order, which
-        // returns nothing for a phrase. Single-token queries keep literal
-        // substring matching so exact-identifier lookups still work.
-        const multiword = std.mem.indexOfScalar(u8, query, ' ') != null;
+        // Query-shape-aware routing lives in Explorer.searchContentAuto so the CLI
+        // (`runQuery`) and this MCP handler rank identically (#546): a multi-word
+        // query goes to BM25 + centrality, a single token keeps literal substring
+        // matching so exact-identifier lookups still work.
         // Over-fetch by `offset` (+1) so we can page into a stable window and
-        // detect whether more results exist beyond this page. BM25 ranking is
+        // detect whether more results exist beyond this page. Ranking is
         // deterministic per query, so the offset is a stable, stateless cursor.
-        const fetch_count = @min(offset_n + max_results + 1, 100000);
-        const fetched = (if (multiword)
-            explorer.searchContentRanked(query, alloc, fetch_count)
-        else
-            explorer.searchContent(query, alloc, fetch_count)) catch {
-            out.appendSlice(alloc, "error: search failed") catch {};
+        const want_count = @min(offset_n + max_results + 1, 100000);
+        var fetch_count = want_count;
+        var fetched = explorer.searchContentAuto(query, alloc, fetch_count) catch {
+            if (json_fmt) {
+                writeJsonToolError(out, alloc, "codedb_search", "search_failed", "search failed");
+            } else {
+                out.appendSlice(alloc, "error: search failed") catch {};
+            }
             return;
         };
+        // #560: path_glob filters AFTER ranking, so a window of global results
+        // can hold zero in-glob hits while deeper ranks match — the page must
+        // be filled from the glob-filtered sequence, not the global one.
+        // Escalate the fetch window until the in-glob set fills the page or
+        // the index is exhausted.
+        if (path_glob) |g| {
+            while (true) {
+                var in_glob: usize = 0;
+                for (fetched) |r| {
+                    if (globMatch(g, r.path)) in_glob += 1;
+                }
+                const exhausted = fetched.len < fetch_count;
+                if (in_glob >= want_count or exhausted or fetch_count >= 100000) break;
+                fetch_count = @min(fetch_count * 4, 100000);
+                for (fetched) |r| {
+                    alloc.free(r.line_text);
+                    alloc.free(r.path);
+                }
+                alloc.free(fetched);
+                fetched = explorer.searchContentAuto(query, alloc, fetch_count) catch {
+                    if (json_fmt) {
+                        writeJsonToolError(out, alloc, "codedb_search", "search_failed", "search failed");
+                    } else {
+                        out.appendSlice(alloc, "error: search failed") catch {};
+                    }
+                    return;
+                };
+            }
+        }
         defer {
             for (fetched) |r| {
                 alloc.free(r.line_text);
@@ -1710,10 +1848,24 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             }
             alloc.free(fetched);
         }
-        const page_lo = @min(offset_n, fetched.len);
-        const page_hi = @min(offset_n + max_results, fetched.len);
-        const results = fetched[page_lo..page_hi];
-        const has_more = fetched.len > page_hi;
+        // Page over the glob-filtered view so offset/max_results address
+        // in-glob results rather than global ranks.
+        var glob_view: std.ArrayList(explore_mod.SearchResult) = .empty;
+        defer glob_view.deinit(alloc);
+        if (path_glob) |g| {
+            for (fetched) |r| {
+                if (globMatch(g, r.path)) glob_view.append(alloc, r) catch {};
+            }
+        }
+        const page_src: []const explore_mod.SearchResult = if (path_glob != null) glob_view.items else fetched;
+        const page_lo = @min(offset_n, page_src.len);
+        const page_hi = @min(offset_n + max_results, page_src.len);
+        const results = page_src[page_lo..page_hi];
+        const has_more = page_src.len > page_hi;
+        if (json_fmt) {
+            writeSearchResultsJson(out, alloc, explorer, query, results, page_lo, has_more, paths_only, path_glob, compact);
+            return;
+        }
 
         // Issue #422: header reflects post-filter count; "truncated" footer
         // only fires for per-file-cap, not for glob/compact filtering.
@@ -1859,9 +2011,16 @@ fn handleCallers(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
         alloc.free(results);
     }
 
-    var shown: usize = 0;
-    for (results) |r| {
-        if (!langHasCallSites(explore_mod.detectLanguage(r.path))) continue;
+    // #573: single filter pass — the header count and the printed entries come
+    // from the same accumulation, so a predicate edit cannot desync them (the
+    // previous count loop + print loop duplicated four predicates verbatim).
+    var kept: std.ArrayList(usize) = .empty;
+    defer kept.deinit(alloc);
+    for (results, 0..) |r, r_idx| {
+        const lang = explore_mod.detectLanguage(r.path);
+        if (!langHasCallSites(lang)) continue;
+        // #562: a full-line comment mention is documentation, not a call site.
+        if (explore_mod.isCommentOrBlank(r.line_text, lang)) continue;
         var is_def = false;
         for (defs) |d| {
             if (r.line_num == d.symbol.line_start and std.mem.eql(u8, r.path, d.path)) {
@@ -1871,22 +2030,13 @@ fn handleCallers(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
         }
         if (is_def) continue;
         if (!hasWholeWordMatch(r.line_text, name)) continue;
-        shown += 1;
+        kept.append(alloc, r_idx) catch {};
     }
 
     const w = cio.listWriter(out, alloc);
-    w.print("{d} call sites for '{s}':\n", .{ shown, name }) catch {};
-    for (results) |r| {
-        if (!langHasCallSites(explore_mod.detectLanguage(r.path))) continue;
-        var is_def = false;
-        for (defs) |d| {
-            if (r.line_num == d.symbol.line_start and std.mem.eql(u8, r.path, d.path)) {
-                is_def = true;
-                break;
-            }
-        }
-        if (is_def) continue;
-        if (!hasWholeWordMatch(r.line_text, name)) continue;
+    w.print("{d} call sites for '{s}':\n", .{ kept.items.len, name }) catch {};
+    for (kept.items) |kept_idx| {
+        const r = results[kept_idx];
         if (r.scope_name) |sn| {
             w.print("  {s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
                 r.path, r.line_num, r.line_text, sn, @tagName(r.scope_kind.?), r.scope_start, r.scope_end,
@@ -1895,6 +2045,50 @@ fn handleCallers(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
             w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
         }
     }
+}
+
+fn handleCallpath(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const from_name = getStr(args, "from") orelse {
+        out.appendSlice(alloc, "error: missing 'from' argument") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
+        return;
+    };
+    const to_name = getStr(args, "to") orelse {
+        out.appendSlice(alloc, "error: missing 'to' argument") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
+        return;
+    };
+    if (from_name.len == 0 or to_name.len == 0) {
+        out.appendSlice(alloc, "error: 'from' and 'to' must be non-empty symbol names") catch {};
+        return;
+    }
+    const max_hops: usize = if (getInt(args, "max_hops")) |n| @intCast(@max(1, @min(n, 64))) else 12;
+
+    const steps = explorer.findCallPath(from_name, to_name, alloc, max_hops) catch {
+        out.appendSlice(alloc, "error: callpath search failed") catch {};
+        return;
+    };
+    const path = steps orelse {
+        const w = cio.listWriter(out, alloc);
+        w.print("no call path from '{s}' to '{s}' within {d} hops\n", .{ from_name, to_name, max_hops }) catch {};
+        return;
+    };
+    defer {
+        for (path) |step| {
+            alloc.free(step.path);
+            alloc.free(step.name);
+        }
+        alloc.free(path);
+    }
+
+    const w = cio.listWriter(out, alloc);
+    w.print("call path ({d} hops): {s} → {s}\n", .{ path.len - 1, from_name, to_name }) catch {};
+    for (path, 0..) |step, i| {
+        if (i > 0) w.print("  → ", .{}) catch {};
+        w.print("{s}:{s}@L{d}", .{ step.path, step.name, step.line }) catch {};
+        if (i + 1 < path.len) w.print("\n", .{}) catch {};
+    }
+    w.print("\n", .{}) catch {};
 }
 
 fn isIdentChar(c: u8) bool {
@@ -2026,6 +2220,59 @@ fn extractContextCandidates(task: []const u8, alloc: std.mem.Allocator, out: *st
     }
 }
 
+// #570: fallback for tasks with no identifier-shaped token. Plain words
+// (≥4 chars, glue/generic words dropped) sorted longest-first — longer words
+// are more specific ("ranking" beats "fix") — capped like the identifier pass.
+fn extractContextFallbackWords(task: []const u8, alloc: std.mem.Allocator, out: *std.ArrayList([]const u8)) void {
+    const stop = [_][]const u8{
+        "that",   "this",   "with",    "from",    "into",      "when",   "where",
+        "what",   "which",  "then",    "them",    "they",      "have",   "will",
+        "should", "would",  "could",   "make",    "makes",     "using",  "used",
+        "does",   "like",   "also",    "than",    "each",      "more",   "most",
+        "some",   "such",   "very",    "just",    "been",      "being",  "about",
+        "after",  "before", "while",   "there",   "their",     "other",  "only",
+        "over",   "under",  "between", "improve", "implement", "ensure", "change",
+        "update",
+    };
+    var words: std.ArrayList([]const u8) = .empty;
+    defer words.deinit(alloc);
+    var seen = std.StringHashMap(void).init(alloc);
+    defer seen.deinit();
+    var i: usize = 0;
+    while (i < task.len) {
+        if (isContextIdentStart(task[i])) {
+            const start = i;
+            while (i < task.len and isContextIdentCont(task[i])) : (i += 1) {}
+            const tok = task[start..i];
+            if (tok.len >= 4 and tok.len <= 64 and !seen.contains(tok)) {
+                var is_stop = false;
+                for (stop) |s| {
+                    if (std.ascii.eqlIgnoreCase(tok, s)) {
+                        is_stop = true;
+                        break;
+                    }
+                }
+                if (!is_stop) {
+                    seen.put(tok, {}) catch {};
+                    words.append(alloc, tok) catch {};
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    std.sort.block([]const u8, words.items, {}, struct {
+        pub fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            if (a.len != b.len) return a.len > b.len;
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    for (words.items) |w| {
+        out.append(alloc, w) catch {};
+        if (out.items.len >= CONTEXT_MAX_CANDIDATES) return;
+    }
+}
+
 fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer, project_root: []const u8) void {
     const task = getStr(args, "task") orelse {
         out.appendSlice(alloc, "error: missing 'task' argument") catch {};
@@ -2036,6 +2283,29 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
         out.appendSlice(alloc, "error: task must be 3-1024 chars") catch {};
         return;
     }
+
+    const max_tokens: ?u32 = if (getInt(args, "max_tokens")) |n| @intCast(@max(256, @min(n, 1_000_000))) else null;
+
+    // Arena: every transient string in this handler lives here, no per-result
+    // free bookkeeping. Released at function exit.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const A = arena.allocator();
+
+    // #531 pick 5 — two-step packing: step 1 renders every section into its
+    // own arena buffer; step 2 admits sections by VALUE order under the byte
+    // budget (max_tokens × 4, the ~4-chars-per-token estimate) and emits the
+    // admitted ones in DOCUMENT order, leaving a one-line marker per omitted
+    // section. Without max_tokens everything is admitted, so the output is
+    // unchanged.
+    var sec_reader: std.ArrayList(u8) = .empty;
+    var sec_head: std.ArrayList(u8) = .empty;
+    var sec_syms_rich: std.ArrayList(u8) = .empty;
+    var sec_syms_lean: std.ArrayList(u8) = .empty;
+    var sec_callers: std.ArrayList(u8) = .empty;
+    var sec_calls: std.ArrayList(u8) = .empty;
+    var sec_files: std.ArrayList(u8) = .empty;
+    var sec_sites: std.ArrayList(u8) = .empty;
 
     // reader.md prepend (experimental): if .codedb/reader.md exists and its
     // declared source_hash matches the current source files, prepend its body
@@ -2057,16 +2327,15 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
         var reader_state = reader_md.load(io, alloc, project_root) catch null;
         if (reader_state) |*r| {
             defer r.free(alloc);
+            const wr = cio.listWriter(&sec_reader, A);
             switch (r.state) {
                 .ready => {
                     if (r.body) |b| {
-                        out.appendSlice(alloc, "<!-- reader.md (hash-verified): -->\n") catch {};
-                        out.appendSlice(alloc, b) catch {};
-                        out.appendSlice(alloc, "\n<!-- end reader.md -->\n\n") catch {};
+                        wr.print("<!-- reader.md (hash-verified): -->\n{s}\n<!-- end reader.md -->\n\n", .{b}) catch {};
                     }
                 },
                 .stale => {
-                    out.appendSlice(alloc, "<!-- reader.md is stale (source_hash drifted). Regenerate by writing a new .codedb/reader.md with current source_hash. -->\n\n") catch {};
+                    wr.print("<!-- reader.md is stale (source_hash drifted). Regenerate by writing a new .codedb/reader.md with current source_hash. -->\n\n", .{}) catch {};
                 },
                 .malformed, .missing => {
                     // Silent — reader.md is optional.
@@ -2074,15 +2343,18 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
             }
         }
     }
-    // Arena: every transient string in this handler lives here, no per-result
-    // free bookkeeping. Released at function exit.
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const A = arena.allocator();
 
     var candidates: std.ArrayList([]const u8) = .empty;
     extractContextCandidates(task, A, &candidates);
     if (candidates.items.len == 0) {
+        // #570: all-lowercase tasks ("fix search ranking") carry no
+        // identifier-shaped token. Fall back to the task's plain words so the
+        // composer orients instead of dead-ending — natural language is the
+        // documented input shape.
+        extractContextFallbackWords(task, A, &candidates);
+    }
+    if (candidates.items.len == 0) {
+        out.appendSlice(alloc, sec_reader.items) catch {};
         out.appendSlice(alloc, "no candidate identifiers found in task — include symbol names (camelCase or snake_case) or \"quoted strings\" so the composer can extract keywords") catch {};
         return;
     }
@@ -2163,19 +2435,26 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
     }.lt);
     const top_n = @min(ranked.items.len, CONTEXT_TOP_FILES);
 
-    const w = cio.listWriter(out, alloc);
-    w.print("# Task\n{s}\n\n## Keywords used\n", .{task}) catch {};
-    for (candidates.items) |k| w.print("- {s}\n", .{k}) catch {};
+    {
+        const wh = cio.listWriter(&sec_head, A);
+        wh.print("# Task\n{s}\n\n## Keywords used\n", .{task}) catch {};
+        for (candidates.items) |k| wh.print("- {s}\n", .{k}) catch {};
+    }
 
     if (sym_refs.items.len > 0) {
-        w.print("\n## Symbol definitions\n", .{}) catch {};
+        const wsr = cio.listWriter(&sec_syms_rich, A);
+        const wsl = cio.listWriter(&sec_syms_lean, A);
+        wsr.print("\n## Symbol definitions\n", .{}) catch {};
+        wsl.print("\n## Symbol definitions\n", .{}) catch {};
         // Enhancement (closes T1 flask variance gap): when there are ≤3
         // symbol definitions, inline each symbol's FULL body (capped at 40
         // lines) so the agent doesn't need a follow-up `codedb_read`. For wider
-        // result sets this would bloat the response, so cap at 3.
+        // result sets this would bloat the response, so cap at 3. The lean
+        // variant (def lines only) is the budget fallback.
         const inline_bodies = sym_refs.items.len <= 3;
         for (sym_refs.items) |sr| {
-            w.print("- {s} ({s}) — {s}:{d}\n", .{ sr.kw, sr.kind, sr.path, sr.line }) catch {};
+            wsr.print("- {s} ({s}) — {s}:{d}\n", .{ sr.kw, sr.kind, sr.path, sr.line }) catch {};
+            wsl.print("- {s} ({s}) — {s}:{d}\n", .{ sr.kw, sr.kind, sr.path, sr.line }) catch {};
             if (inline_bodies) {
                 if (explorer.getContent(sr.path, A) catch null) |content| {
                     var cur_line: u32 = 1;
@@ -2189,7 +2468,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                         if (content[i] == '\n') {
                             if (line_start) |ls| {
                                 const line_end = i;
-                                w.print("       {d:>5} | {s}\n", .{ cur_line, content[ls..line_end] }) catch {};
+                                wsr.print("       {d:>5} | {s}\n", .{ cur_line, content[ls..line_end] }) catch {};
                                 captured += 1;
                             }
                             cur_line += 1;
@@ -2202,21 +2481,13 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     }
                     if (line_start) |ls| {
                         if (captured < max_lines) {
-                            w.print("       {d:>5} | {s}\n", .{ cur_line, content[ls..] }) catch {};
+                            wsr.print("       {d:>5} | {s}\n", .{ cur_line, content[ls..] }) catch {};
                         }
                     }
                 }
             }
         }
 
-        // Callers section (closes the T1 flask agent-mean gap):
-        // For each ≤3 symbol_definitions, surface up to 2 non-definition,
-        // non-test call sites with their enclosing scope. The whole point of
-        // this section is to pre-resolve "where is this called from" so the
-        // agent doesn't need codedb_callers / outline / read follow-ups.
-        // Examples this targets directly:
-        //   T1 flask: before_request → preprocess_request in app.py
-        //   T2 regex: Builder::build → meta::Regex::new in regex.rs
         // Callers section (closes the T1 flask agent-mean gap):
         // For each ≤3 symbol_definitions, surface up to 2 non-definition,
         // non-test, non-import call sites with their enclosing scope. The
@@ -2226,6 +2497,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
         //   T1 flask: before_request → preprocess_request in app.py
         //   T2 regex: Builder::build → meta::Regex::new in regex.rs
         if (inline_bodies) {
+            const wc = cio.listWriter(&sec_callers, A);
             var any_callers = false;
             var seen_caller = std.StringHashMap(void).init(A);
             var total_shown: u32 = 0;
@@ -2262,15 +2534,15 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     if (seen_caller.contains(dedup_key)) continue;
                     seen_caller.put(dedup_key, {}) catch {};
                     if (!any_callers) {
-                        w.print("\n## Callers (top non-test, non-import usages of these symbols)\n", .{}) catch {};
+                        wc.print("\n## Callers (top non-test, non-import usages of these symbols)\n", .{}) catch {};
                         any_callers = true;
                     }
                     if (r.scope_name) |sn| {
-                        w.print("- {s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
+                        wc.print("- {s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
                             r.path, r.line_num, r.line_text, sn, @tagName(r.scope_kind.?), r.scope_start, r.scope_end,
                         }) catch {};
                     } else {
-                        w.print("- {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+                        wc.print("- {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
                     }
                     shown_for_sym += 1;
                     total_shown += 1;
@@ -2284,6 +2556,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
         // the Callers section above so the agent sees both who calls a symbol and
         // what it calls, without a follow-up codedb_outline/read on the callees.
         if (inline_bodies) {
+            const wcal = cio.listWriter(&sec_calls, A);
             var any_callees = false;
             var done_sym = std.StringHashMap(void).init(A);
             for (sym_refs.items) |sr| {
@@ -2293,74 +2566,136 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                 const callees = explorer.resolveCallees(sr.path, sr.line, sr.line_end, A, 6) catch continue;
                 if (callees.len == 0) continue;
                 if (!any_callees) {
-                    w.print("\n## Calls (graph-resolved callees of these symbols)\n", .{}) catch {};
+                    wcal.print("\n## Calls (graph-resolved callees of these symbols)\n", .{}) catch {};
                     any_callees = true;
                 }
-                w.print("- {s} ({s}) calls:\n", .{ sr.kw, sr.kind }) catch {};
+                wcal.print("- {s} ({s}) calls:\n", .{ sr.kw, sr.kind }) catch {};
                 for (callees) |c| {
-                    w.print("    \xe2\x86\x92 {s} ({s})  {s}:{d}\n", .{ c.name, @tagName(c.kind), c.path, c.line }) catch {};
+                    wcal.print("    \xe2\x86\x92 {s} ({s})  {s}:{d}\n", .{ c.name, @tagName(c.kind), c.path, c.line }) catch {};
                 }
             }
         }
     }
 
-    if (top_n == 0) {
-        out.appendSlice(alloc, "\n(no content matches — try codedb_search or codedb_word for narrower queries)\n") catch {};
-        return;
-    }
-    w.print("\n## Most-relevant files\n", .{}) catch {};
-    for (ranked.items[0..top_n]) |f| {
-        w.print("- {s}  ({d} matches)\n", .{ f.path, f.hits }) catch {};
-    }
-    w.print("\n## Top sites (with ±2 lines of context)\n", .{}) catch {};
-    explorer.mu.lockShared();
-    defer explorer.mu.unlockShared();
-    for (ranked.items[0..top_n]) |f| {
-        // Fetch full file content once per file, then slice ±2 lines around
-        // each hit. Indexed cache hits common files in ~µs; arena owns the
-        // dupe so we don't leak.
-        const file_content: ?[]const u8 = blk: {
-            const got = explorer.getContent(f.path, A) catch break :blk null;
-            break :blk got;
-        };
-        for (f.top) |h| {
-            if (file_content) |content| {
-                // Find the start/end byte offsets of [line-2 .. line+2].
-                const want_start: u32 = if (h.line > 2) h.line - 2 else 1;
-                const want_end: u32 = h.line + 2;
-                var cur_line: u32 = 1;
-                var i: usize = 0;
-                var captured_start: ?usize = null;
-                var captured_end: ?usize = null;
-                if (cur_line == want_start) captured_start = 0;
-                while (i < content.len) : (i += 1) {
-                    if (content[i] == '\n') {
-                        cur_line += 1;
-                        if (cur_line == want_start and captured_start == null) {
-                            captured_start = i + 1;
-                        }
-                        if (cur_line > want_end) {
-                            captured_end = i;
-                            break;
+    if (top_n > 0) {
+        const wf = cio.listWriter(&sec_files, A);
+        wf.print("\n## Most-relevant files\n", .{}) catch {};
+        for (ranked.items[0..top_n]) |f| {
+            wf.print("- {s}  ({d} matches)\n", .{ f.path, f.hits }) catch {};
+        }
+        const wts = cio.listWriter(&sec_sites, A);
+        wts.print("\n## Top sites (with ±2 lines of context)\n", .{}) catch {};
+        explorer.mu.lockShared();
+        defer explorer.mu.unlockShared();
+        for (ranked.items[0..top_n]) |f| {
+            // Fetch full file content once per file, then slice ±2 lines around
+            // each hit. Indexed cache hits common files in ~µs; arena owns the
+            // dupe so we don't leak.
+            const file_content: ?[]const u8 = blk: {
+                const got = explorer.getContent(f.path, A) catch break :blk null;
+                break :blk got;
+            };
+            for (f.top) |h| {
+                if (file_content) |content| {
+                    // Find the start/end byte offsets of [line-2 .. line+2].
+                    const want_start: u32 = if (h.line > 2) h.line - 2 else 1;
+                    const want_end: u32 = h.line + 2;
+                    var cur_line: u32 = 1;
+                    var i: usize = 0;
+                    var captured_start: ?usize = null;
+                    var captured_end: ?usize = null;
+                    if (cur_line == want_start) captured_start = 0;
+                    while (i < content.len) : (i += 1) {
+                        if (content[i] == '\n') {
+                            cur_line += 1;
+                            if (cur_line == want_start and captured_start == null) {
+                                captured_start = i + 1;
+                            }
+                            if (cur_line > want_end) {
+                                captured_end = i;
+                                break;
+                            }
                         }
                     }
+                    if (captured_end == null) captured_end = content.len;
+                    if (captured_start) |start_off| {
+                        const end_off = captured_end.?;
+                        const slice = content[start_off..end_off];
+                        // Cap per-snippet length to keep output bounded.
+                        const cap = @min(slice.len, 480);
+                        wts.print("\n{s}:{d}\n```\n{s}\n```\n", .{ f.path, h.line, slice[0..cap] }) catch {};
+                        continue;
+                    }
                 }
-                if (captured_end == null) captured_end = content.len;
-                if (captured_start) |start_off| {
-                    const end_off = captured_end.?;
-                    const slice = content[start_off..end_off];
-                    // Cap per-snippet length to keep output bounded.
-                    const cap = @min(slice.len, 480);
-                    w.print("\n{s}:{d}\n```\n{s}\n```\n", .{ f.path, h.line, slice[0..cap] }) catch {};
-                    continue;
-                }
+                // Fallback: single-line hit when we couldn't expand.
+                wts.print("{s}:{d}  {s}\n", .{ f.path, h.line, h.text }) catch {};
             }
-            // Fallback: single-line hit when we couldn't expand.
-            w.print("{s}:{d}  {s}\n", .{ f.path, h.line, h.text }) catch {};
         }
     }
-}
 
+    // Step 2: admit by value order — head (always), files, symbols
+    // (rich, falling back to lean), reader.md, callers, calls, snippets —
+    // then emit admitted sections in document order.
+    const budget: ?usize = if (max_tokens) |mt| @as(usize, mt) * 4 else null;
+    var spent: usize = sec_head.items.len;
+    const fits = struct {
+        fn f(lim: ?usize, spent_: *usize, cost: usize) bool {
+            const b = lim orelse return true;
+            if (cost == 0) return true;
+            if (spent_.* + cost > b) return false;
+            spent_.* += cost;
+            return true;
+        }
+    }.f;
+    const inc_files = fits(budget, &spent, sec_files.items.len);
+    var syms: []const u8 = &.{};
+    var syms_lean_fallback = false;
+    if (fits(budget, &spent, sec_syms_rich.items.len)) {
+        syms = sec_syms_rich.items;
+    } else if (fits(budget, &spent, sec_syms_lean.items.len)) {
+        syms = sec_syms_lean.items;
+        syms_lean_fallback = true;
+    }
+    const inc_reader = fits(budget, &spent, sec_reader.items.len);
+    const inc_callers = fits(budget, &spent, sec_callers.items.len);
+    const inc_calls = fits(budget, &spent, sec_calls.items.len);
+    const inc_sites = fits(budget, &spent, sec_sites.items.len);
+
+    const w = cio.listWriter(out, alloc);
+    if (inc_reader) out.appendSlice(alloc, sec_reader.items) catch {};
+    out.appendSlice(alloc, sec_head.items) catch {};
+    if (syms.len > 0) {
+        out.appendSlice(alloc, syms) catch {};
+        if (syms_lean_fallback) {
+            w.print("\n[max_tokens: symbol bodies omitted (~{d} tokens) — raise max_tokens or codedb_read the definitions]\n", .{(sec_syms_rich.items.len - sec_syms_lean.items.len) / 4}) catch {};
+        }
+    } else if (sec_syms_rich.items.len > 0) {
+        w.print("\n[max_tokens: omitted Symbol definitions (~{d} tokens)]\n", .{sec_syms_rich.items.len / 4}) catch {};
+    }
+    if (inc_callers) {
+        out.appendSlice(alloc, sec_callers.items) catch {};
+    } else if (sec_callers.items.len > 0) {
+        w.print("\n[max_tokens: omitted Callers (~{d} tokens)]\n", .{sec_callers.items.len / 4}) catch {};
+    }
+    if (inc_calls) {
+        out.appendSlice(alloc, sec_calls.items) catch {};
+    } else if (sec_calls.items.len > 0) {
+        w.print("\n[max_tokens: omitted Calls (~{d} tokens)]\n", .{sec_calls.items.len / 4}) catch {};
+    }
+    if (inc_files) {
+        out.appendSlice(alloc, sec_files.items) catch {};
+    } else if (sec_files.items.len > 0) {
+        w.print("\n[max_tokens: omitted Most-relevant files (~{d} tokens)]\n", .{sec_files.items.len / 4}) catch {};
+    }
+    if (inc_sites) {
+        out.appendSlice(alloc, sec_sites.items) catch {};
+    } else if (sec_sites.items.len > 0) {
+        w.print("\n[max_tokens: omitted Top sites (~{d} tokens)]\n", .{sec_sites.items.len / 4}) catch {};
+    }
+    if (top_n == 0) {
+        out.appendSlice(alloc, "\n(no content matches — try codedb_search or codedb_word for narrower queries)\n") catch {};
+    }
+}
 
 fn handleHot(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
     const limit: usize = if (getInt(args, "limit")) |n| @intCast(@min(@max(1, n), 1000)) else 10;
@@ -2427,6 +2762,7 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
             };
             if (rendered.count == 0) {
                 w.writeAll("  (none)\n") catch {};
+                w.writeAll("(0 files)\n") catch {};
                 if (!rendered.known) appendFuzzyPathSuggestions(alloc, out, explorer, path);
             } else {
                 w.print("({d} files)\n", .{rendered.count}) catch {};
@@ -2455,6 +2791,9 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
     }
     if (results.len == 0) {
         w.writeAll("  (none)\n") catch {};
+        // #568: empty lists must keep the '(N files)' summary so machine
+        // consumers never have to special-case the '(none)' sentinel.
+        w.writeAll("(0 files)\n") catch {};
         // Bug 4: if the path isn't indexed at all, agents read "(none)" as
         // "file exists but no callers" — which is wrong. Append fuzzy
         // suggestions so a typo is recoverable in one shot.
@@ -2479,6 +2818,7 @@ fn handleDepsPathOnly(alloc: std.mem.Allocator, path: []const u8, out: *std.Arra
     };
     if (rendered.count == 0) {
         w.writeAll("  (none)\n") catch {};
+        w.writeAll("(0 files)\n") catch {};
         if (!rendered.known) appendFuzzyPathSuggestions(alloc, out, explorer, path);
     } else {
         w.print("({d} files)\n", .{rendered.count}) catch {};
@@ -2904,7 +3244,6 @@ fn handleSnapshot(alloc: std.mem.Allocator, out: *std.ArrayList(u8), explorer: *
     cache.putAndAppend(alloc, out, seq, snap);
 }
 
-
 /// When a bundled op produces a missing-arg error, append a `received keys`
 /// line listing the keys actually present in the op's args. Helps callers
 /// tell whether codedb dropped a field or the client sent it under the
@@ -2970,11 +3309,19 @@ fn finishQueryWithFailure(
     step_i: usize,
     reason: []const u8,
     step_args: ?*const std.json.ObjectMap,
+    file_set: []const []const u8,
 ) void {
     if (step_args) |sa| {
         appendBundleArgKeysDiagnostic(alloc, out, sa);
     }
     const w = cio.listWriter(out, alloc);
+    // #558: find no longer prints its list eagerly mid-pipeline, so the
+    // partial-results contract (#356) prints the set accumulated before
+    // the failing step here instead.
+    if (file_set.len > 0) {
+        w.print("\n{d} files at failing step:\n", .{file_set.len}) catch {};
+        for (file_set) |p| w.print("  {s}\n", .{p}) catch {};
+    }
     w.print("\n--- partial ---\nfailed_at: {d}\nreason: {s}\n", .{ step_i, reason }) catch {};
 }
 
@@ -3128,7 +3475,7 @@ fn handleBundle(
         // Issue #357 / #423: per-tool handlers already append the
         // `received keys` diagnostic on missing-arg errors, so the bundle
         // wrapper does NOT re-append it. Doing so emits the line twice.
-        if (std.mem.startsWith(u8, sub_out.items, "error:")) {
+        if (toolOutputIsError(sub_out.items)) {
             fail_count += 1;
         } else {
             ok_count += 1;
@@ -3155,9 +3502,7 @@ fn isRemoteRepoChar(c: u8) bool {
 fn isRemoteRepoPart(part: []const u8) bool {
     if (part.len == 0) return false;
     if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
-    for (part) |c| {
-        if (!isRemoteRepoChar(c)) return false;
-    }
+    for (part) |c| if (!isRemoteRepoChar(c)) return false;
     return true;
 }
 
@@ -3528,7 +3873,7 @@ pub fn appendRemoteErrorHint(alloc: std.mem.Allocator, out: *std.ArrayList(u8), 
 // ── Local project tools ─────────────────────────────────────────────────────
 
 fn handleProjects(io: std.Io, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) void {
-    const home = cio.posixGetenv("HOME") orelse {
+    const home = cio.userHome() orelse {
         out.appendSlice(alloc, "error: cannot read HOME") catch {};
         return;
     };
@@ -3854,6 +4199,15 @@ fn handleLs(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std
     defer alloc.free(entries);
 
     if (entries.len == 0) {
+        // #576: an index only knows a directory through files under it, so an
+        // empty listing for a non-empty prefix means the path is not indexed —
+        // not that the directory is empty. The 'error:' prefix also gives the
+        // CLI bridge a non-zero exit via finishCli.
+        if (prefix.len > 0) {
+            const w = cio.listWriter(out, alloc);
+            w.print("error: no indexed files under '{s}' — check the path (codedb_tree shows the layout)", .{prefix}) catch {};
+            return;
+        }
         out.appendSlice(alloc, "no entries") catch {};
         return;
     }
@@ -3887,13 +4241,21 @@ pub fn runCliTool(
     io: std.Io,
     alloc: std.mem.Allocator,
     explorer: *Explorer,
+    store: *Store,
     root: []const u8,
     cmd: []const u8,
     args: []const []const u8,
     cmd_args_start: usize,
     out: *std.ArrayList(u8),
 ) ?u8 {
-    const pos: ?[]const u8 = if (args.len > cmd_args_start) args[cmd_args_start] else null;
+    // First positional. A leading '-'-prefixed arg is NOT silently bound as
+    // the positional — `callers --max-results 3 foo` previously reported call
+    // sites for '--max-results' (#573). Commands here take <name>/<path>
+    // first, so a leading flag falls through to the command's usage error.
+    const pos: ?[]const u8 = if (args.len > cmd_args_start and !std.mem.startsWith(u8, args[cmd_args_start], "-"))
+        args[cmd_args_start]
+    else
+        null;
     const out_start = out.items.len;
 
     var m: std.json.ObjectMap = .empty;
@@ -3915,6 +4277,21 @@ pub fn runCliTool(
         // the heap word index. Keeps the footprint at the MCP level.
         loadProjectTrigramFromDiskIfPresent(io, explorer, root, alloc);
         handleCallers(alloc, &m, out, explorer);
+        return finishCli(out, out_start);
+    } else if (std.mem.eql(u8, cmd, "changes")) {
+        // #578: changes reads the Store ledger (not the Explorer), which is why
+        // the bridge takes `store`. Optional positional = since_seq.
+        if (pos) |p| {
+            const since = std.fmt.parseInt(i64, p, 10) catch return cliUsage(alloc, out, "changes [since_seq]");
+            m.put(alloc, "since", .{ .integer = since }) catch return 1;
+        }
+        handleChanges(alloc, &m, out, store);
+        return finishCli(out, out_start);
+    } else if (std.mem.eql(u8, cmd, "callpath")) {
+        if (args.len < cmd_args_start + 2) return cliUsage(alloc, out, "callpath <from> <to>");
+        m.put(alloc, "from", .{ .string = args[cmd_args_start] }) catch return 1;
+        m.put(alloc, "to", .{ .string = args[cmd_args_start + 1] }) catch return 1;
+        handleCallpath(alloc, &m, out, explorer);
         return finishCli(out, out_start);
     } else if (std.mem.eql(u8, cmd, "deps")) {
         const da = parseDepsArgs(args, cmd_args_start) catch |e| return cliDepsUsage(alloc, out, e);
@@ -3970,7 +4347,7 @@ fn cliUsage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), usage: []const u8
 /// Zero-result paths (e.g. find's "no matches") use non-`error:` wording and
 /// therefore keep exit 0.
 pub fn finishCli(out: *std.ArrayList(u8), start: usize) u8 {
-    return if (std.mem.startsWith(u8, out.items[start..], "error:")) 1 else 0;
+    return if (toolOutputIsError(out.items[start..])) 1 else 0;
 }
 /// Parsed `deps` invocation. `max_depth` stays null unless `--max-depth N` was
 /// given so the handler keeps its own default for transitive walks.
@@ -4136,6 +4513,11 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
 
     var file_set: std.ArrayList([]const u8) = .empty;
     defer file_set.deinit(alloc);
+    // Strings the deps op appends to file_set must outlive the per-file deps_result
+    // (freed each iteration); own them in a scoped arena freed at pipeline end.
+    var deps_arena = std.heap.ArenaAllocator.init(alloc);
+    defer deps_arena.deinit();
+    const deps_alloc = deps_arena.allocator();
     var have_set = false;
     const w = cio.listWriter(out, alloc);
 
@@ -4155,17 +4537,17 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
             // Auto-detect op when 'op' key is missing.
             // query → search, word → word, name → symbol
             if (getStr(step, "query") != null) break :blk "search";
-            if (getStr(step, "word") != null)   break :blk "word";
-            if (getStr(step, "name") != null)   break :blk "symbol";
+            if (getStr(step, "word") != null) break :blk "word";
+            if (getStr(step, "name") != null) break :blk "symbol";
             w.print("error: step {d} missing 'op'\n", .{step_i}) catch {};
-            finishQueryWithFailure(alloc, out, step_i, "missing 'op'", step);
+            finishQueryWithFailure(alloc, out, step_i, "missing 'op'", step, file_set.items);
             return;
         };
 
         if (std.mem.eql(u8, op, "find")) {
             const query = getStr(step, "query") orelse {
                 w.print("error: find needs 'query'\n", .{}) catch {};
-                finishQueryWithFailure(alloc, out, step_i, "find needs 'query'", step);
+                finishQueryWithFailure(alloc, out, step_i, "find needs 'query'", step, file_set.items);
                 return;
             };
             const max: usize = if (getInt(step, "max_results")) |n| @intCast(@max(1, @min(n, 200))) else 50;
@@ -4190,9 +4572,14 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                 w.print("{d} files after find intersect\n", .{file_set.items.len}) catch {};
             } else {
                 file_set.clearRetainingCapacity();
-                w.print("{d} files matched:\n", .{matches.len}) catch {};
+                // #558: print only when find is the last step — otherwise the
+                // listing shows the pre-transform set and downstream
+                // filter/limit are invisible. The pipeline tail prints the
+                // final set instead.
+                const find_is_last = step_i + 1 == pipeline.len;
+                if (find_is_last) w.print("{d} files matched:\n", .{matches.len}) catch {};
                 for (matches) |m| {
-                    w.print("  {s}\n", .{m.path}) catch {};
+                    if (find_is_last) w.print("  {s}\n", .{m.path}) catch {};
                     file_set.append(alloc, m.path) catch {};
                 }
                 have_set = true;
@@ -4200,7 +4587,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
         } else if (std.mem.eql(u8, op, "search")) {
             const query = getStr(step, "query") orelse {
                 w.print("error: search needs 'query'\n", .{}) catch {};
-                finishQueryWithFailure(alloc, out, step_i, "search needs 'query'", step);
+                finishQueryWithFailure(alloc, out, step_i, "search needs 'query'", step, file_set.items);
                 return;
             };
             const max: usize = if (getInt(step, "max_results")) |n| @intCast(@max(1, @min(n, 200))) else 50;
@@ -4264,12 +4651,11 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
             // Accepts optional 'path' for standalone use without a prior seeding step.
             if (!have_set) {
                 if (getStr(step, "path")) |p| {
-                    const duped = alloc.dupe(u8, p) catch {
+                    const duped = deps_alloc.dupe(u8, p) catch {
                         w.print("error: out of memory\n", .{}) catch {};
                         return;
                     };
                     file_set.append(alloc, duped) catch {
-                        alloc.free(duped);
                         w.print("error: out of memory\n", .{}) catch {};
                         return;
                     };
@@ -4331,8 +4717,11 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
 
                 for (deps_result) |dep| {
                     if (!expanded.contains(dep)) {
-                        expanded.put(dep, {}) catch {};
-                        file_set.append(alloc, dep) catch {};
+                        // Own the string in the deps arena so it outlives deps_result
+                        // (freed by the defer above) once stored in file_set / expanded.
+                        const owned = deps_alloc.dupe(u8, dep) catch continue;
+                        expanded.put(owned, {}) catch {};
+                        file_set.append(alloc, owned) catch {};
                     }
                 }
             }
@@ -4345,7 +4734,21 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                 have_set = true;
             }
             const ext = getStr(step, "ext");
-            const glob_pat = getStr(step, "glob");
+            const glob_raw = getStr(step, "glob") orelse getStr(step, "pattern");
+            if (ext == null and glob_raw == null) {
+                w.print("error: filter needs 'glob' (alias 'pattern') or 'ext'\n", .{}) catch {};
+                finishQueryWithFailure(alloc, out, step_i, "filter needs 'glob' (alias 'pattern') or 'ext'", step, file_set.items);
+                return;
+            }
+            // Bare patterns ('*.py') promote to '**/*.py' — same rule as
+            // codedb_search path_glob — so filter matches nested paths (#558).
+            var fpg_buf: [256]u8 = undefined;
+            const glob_pat: ?[]const u8 = if (glob_raw) |g| blk: {
+                if (std.mem.indexOfScalar(u8, g, '/') == null and g.len + 3 < fpg_buf.len) {
+                    break :blk std.fmt.bufPrint(&fpg_buf, "**/{s}", .{g}) catch g;
+                }
+                break :blk g;
+            } else null;
             var wr: usize = 0;
             for (file_set.items) |path| {
                 var keep = true;
@@ -4450,7 +4853,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
         } else if (std.mem.eql(u8, op, "word")) {
             const word = getStr(step, "word") orelse {
                 w.print("error: word needs 'word'\n", .{}) catch {};
-                finishQueryWithFailure(alloc, out, step_i, "word needs 'word'", step);
+                finishQueryWithFailure(alloc, out, step_i, "word needs 'word'", step, file_set.items);
                 return;
             };
             const hits = explorer.searchWord(word, alloc) catch {
@@ -4494,8 +4897,14 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                     w.print("  {s}:{d}\n", .{ hp, h.line_num }) catch {};
                     if (!seen.contains(hp)) {
                         const duped = alloc.dupe(u8, hp) catch continue;
-                        seen.put(duped, {}) catch { alloc.free(duped); continue; };
-                        file_set.append(alloc, duped) catch { alloc.free(duped); continue; };
+                        seen.put(duped, {}) catch {
+                            alloc.free(duped);
+                            continue;
+                        };
+                        file_set.append(alloc, duped) catch {
+                            alloc.free(duped);
+                            continue;
+                        };
                     }
                 }
                 have_set = true;
@@ -4503,7 +4912,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
         } else if (std.mem.eql(u8, op, "symbol")) {
             const name = getStr(step, "name") orelse {
                 w.print("error: symbol needs 'name'\n", .{}) catch {};
-                finishQueryWithFailure(alloc, out, step_i, "symbol needs 'name'", step);
+                finishQueryWithFailure(alloc, out, step_i, "symbol needs 'name'", step, file_set.items);
                 return;
             };
             const results = explorer.findAllSymbols(name, alloc) catch {
@@ -4529,8 +4938,14 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                 for (results) |r| {
                     if (!seen.contains(r.path)) {
                         const duped = alloc.dupe(u8, r.path) catch continue;
-                        seen.put(duped, {}) catch { alloc.free(duped); continue; };
-                        file_set.append(alloc, duped) catch { alloc.free(duped); continue; };
+                        seen.put(duped, {}) catch {
+                            alloc.free(duped);
+                            continue;
+                        };
+                        file_set.append(alloc, duped) catch {
+                            alloc.free(duped);
+                            continue;
+                        };
                     }
                 }
                 have_set = true;
@@ -4544,6 +4959,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
             if (file_set.items.len > n) file_set.items.len = n;
         } else {
             w.print("error: unknown op '{s}'\n", .{op}) catch {};
+            finishQueryWithFailure(alloc, out, step_i, "unknown op", step, file_set.items);
             return;
         }
         // Issue #356-p3: track each successfully-completed step.
@@ -4720,6 +5136,134 @@ fn writeEscaped(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8
 const getStr = mcpj.getStr;
 const getInt = mcpj.getInt;
 pub const getBool = mcpj.getBool;
+
+fn wantsJsonFormat(args: *const std.json.ObjectMap) bool {
+    const fmt = getStr(args, "format") orelse return false;
+    return std.mem.eql(u8, fmt, "json");
+}
+
+fn appendJsonStr(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) void {
+    out.append(alloc, '"') catch return;
+    writeEscaped(alloc, out, s);
+    out.append(alloc, '"') catch return;
+}
+
+fn appendJsonKeyStr(out: *std.ArrayList(u8), alloc: std.mem.Allocator, key: []const u8, value: []const u8) void {
+    appendJsonStr(out, alloc, key);
+    out.append(alloc, ':') catch return;
+    appendJsonStr(out, alloc, value);
+}
+
+fn appendJsonKeyBool(out: *std.ArrayList(u8), alloc: std.mem.Allocator, key: []const u8, value: bool) void {
+    appendJsonStr(out, alloc, key);
+    out.appendSlice(alloc, if (value) ":true" else ":false") catch {};
+}
+
+fn appendJsonKeyNum(out: *std.ArrayList(u8), alloc: std.mem.Allocator, key: []const u8, value: anytype) void {
+    appendJsonStr(out, alloc, key);
+    out.append(alloc, ':') catch return;
+    var buf: [40]u8 = undefined;
+    const s = switch (@typeInfo(@TypeOf(value))) {
+        .float, .comptime_float => std.fmt.bufPrint(&buf, "{d}", .{@as(f64, value)}) catch return,
+        else => std.fmt.bufPrint(&buf, "{d}", .{value}) catch return,
+    };
+    out.appendSlice(alloc, s) catch {};
+}
+
+/// True when a tool handler's output indicates failure: the plain-text
+/// "error:" marker, or the format=json error envelope from writeJsonToolError.
+pub fn toolOutputIsError(out: []const u8) bool {
+    return std.mem.startsWith(u8, out, "error:") or std.mem.startsWith(u8, out, "{\"ok\":false");
+}
+
+fn writeJsonToolError(out: *std.ArrayList(u8), alloc: std.mem.Allocator, tool: []const u8, code: []const u8, message: []const u8) void {
+    out.appendSlice(alloc, "{\"ok\":false,\"tool\":") catch {};
+    appendJsonStr(out, alloc, tool);
+    out.appendSlice(alloc, ",\"error\":{\"code\":") catch {};
+    appendJsonStr(out, alloc, code);
+    out.appendSlice(alloc, ",\"message\":") catch {};
+    appendJsonStr(out, alloc, message);
+    out.appendSlice(alloc, "}}") catch {};
+}
+
+fn appendSearchProvenanceMeta(out: *std.ArrayList(u8), alloc: std.mem.Allocator, explorer: *Explorer) void {
+    const bd = explorer.last_search_breakdown;
+    const skip = explorer.skipTrigramFileCount();
+    const recall_complete = skip == 0 or bd.tier_reached >= 5;
+    out.appendSlice(alloc, "\"meta\":{") catch {};
+    appendJsonKeyStr(out, alloc, "index", "trigram+outline");
+    out.appendSlice(alloc, ",") catch {};
+    appendJsonKeyNum(out, alloc, "tier_reached", bd.tier_reached);
+    out.appendSlice(alloc, ",") catch {};
+    appendJsonKeyNum(out, alloc, "skip_trigram_files", skip);
+    out.appendSlice(alloc, ",") catch {};
+    appendJsonKeyNum(out, alloc, "trigram_cap", @as(usize, 15_000));
+    out.appendSlice(alloc, ",") catch {};
+    appendJsonKeyBool(out, alloc, "recall_complete", recall_complete);
+    out.append(alloc, '}') catch {};
+}
+
+fn searchResultVisible(r: explore_mod.SearchResult, path_glob: ?[]const u8, compact: bool) bool {
+    if (path_glob) |g| if (!globMatch(g, r.path)) return false;
+    if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) return false;
+    return true;
+}
+
+fn writeSearchResultsJson(
+    out: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    explorer: *Explorer,
+    query: []const u8,
+    results: []const explore_mod.SearchResult,
+    offset: usize,
+    has_more: bool,
+    paths_only: bool,
+    path_glob: ?[]const u8,
+    compact: bool,
+) void {
+    var visible: usize = 0;
+    for (results) |r| {
+        if (searchResultVisible(r, path_glob, compact)) visible += 1;
+    }
+
+    out.appendSlice(alloc, "{\"ok\":true,\"tool\":\"codedb_search\",\"query\":") catch {};
+    appendJsonStr(out, alloc, query);
+    out.append(alloc, ',') catch {};
+    appendJsonKeyNum(out, alloc, "count", visible);
+    out.appendSlice(alloc, ",") catch {};
+    appendSearchProvenanceMeta(out, alloc, explorer);
+    if (has_more) {
+        out.appendSlice(alloc, ",\"has_more\":true,") catch {};
+        appendJsonKeyNum(out, alloc, "next_offset", offset + results.len);
+    }
+    out.appendSlice(alloc, ",\"results\":[") catch {};
+    var first = true;
+    for (results) |r| {
+        if (!searchResultVisible(r, path_glob, compact)) continue;
+        if (!first) out.append(alloc, ',') catch {} else first = false;
+        out.appendSlice(alloc, "{\"path\":") catch {};
+        appendJsonStr(out, alloc, r.path);
+        out.append(alloc, ',') catch {};
+        appendJsonKeyNum(out, alloc, "line", r.line_num);
+        if (!paths_only) {
+            out.appendSlice(alloc, ",\"text\":") catch {};
+            appendJsonStr(out, alloc, r.line_text);
+            out.append(alloc, ',') catch {};
+            appendJsonKeyNum(out, alloc, "score", r.score);
+            out.appendSlice(alloc, ",\"confidence\":\"ranked\"") catch {};
+        }
+        out.append(alloc, '}') catch {};
+    }
+    out.appendSlice(alloc, "]}") catch {};
+}
+
+fn symbolMatchModeLabel(spec: Explorer.SymbolSearchSpec) []const u8 {
+    if (spec.fuzzy and spec.name != null) return "fuzzy";
+    if (spec.prefix != null) return "prefix";
+    if (spec.pattern != null) return "pattern";
+    if (spec.kind != null and spec.name == null and spec.prefix == null and spec.pattern == null) return "kind";
+    return "exact";
+}
 const eql = mcpj.eql;
 
 pub fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Value) void {
@@ -5025,6 +5569,12 @@ pub fn mcpGenerateGuidance(
         }
     } else if (eql(tool_name, "codedb_word")) {
         buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_outline on a result file for full context" ++ MCP_RESET) catch {};
+    } else if (eql(tool_name, "codedb_callers")) {
+        buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_callpath from=<caller> to=<callee> for the shortest call chain" ++ MCP_RESET) catch {};
+    } else if (eql(tool_name, "codedb_callpath")) {
+        if (std.mem.startsWith(u8, output, "call path")) {
+            buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_read path=<hop-file> line_start=<line> to expand a hop" ++ MCP_RESET) catch {};
+        }
     } else if (eql(tool_name, "codedb_edit")) {
         buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_changes to verify edits" ++ MCP_RESET) catch {};
     } else if (eql(tool_name, "codedb_hot")) {
@@ -5081,6 +5631,38 @@ test "issue-258: cached project reads use the project root after contents are re
     try testing.expect(std.mem.indexOf(u8, out.items, "const project = \"secondary\";") != null);
 }
 
+/// Point HOME at a `.home` directory inside `tmp` so central-cache tests
+/// (which derive their path from cio.userHome) stay inside the tmp dir.
+const TestHomeGuard = struct {
+    had_prev: bool,
+    prev_len: usize,
+    prev: [std.fs.max_path_bytes]u8,
+
+    fn restore(self: *const TestHomeGuard) void {
+        if (self.had_prev) {
+            cio.posixSetenv("HOME", self.prev[0..self.prev_len]);
+        } else {
+            cio.posixUnsetenv("HOME");
+        }
+    }
+};
+
+fn setTestHome(io_p: std.Io, tmp_dir: std.Io.Dir) !TestHomeGuard {
+    var guard = TestHomeGuard{ .had_prev = false, .prev_len = 0, .prev = undefined };
+    if (cio.posixGetenv("HOME")) |prev| {
+        if (prev.len <= guard.prev.len) {
+            @memcpy(guard.prev[0..prev.len], prev);
+            guard.prev_len = prev.len;
+            guard.had_prev = true;
+        }
+    }
+    try tmp_dir.createDirPath(io_p, ".home");
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home_len = try tmp_dir.realPathFile(io_p, ".home", &home_buf);
+    cio.posixSetenv("HOME", home_buf[0..home_len]);
+    return guard;
+}
+
 test "ProjectCache loads project from central snapshot cache" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -5095,6 +5677,8 @@ test "ProjectCache loads project from central snapshot cache" {
     var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
     const project_path = project_path_buf[0..project_path_len];
+    const home_guard = try setTestHome(io, tmp.dir);
+    defer home_guard.restore();
 
     const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
     defer testing.allocator.free(data_dir);
@@ -5150,6 +5734,8 @@ test "issue-353: explicit default project loads snapshot when default explorer i
     var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
     const project_path = project_path_buf[0..project_path_len];
+    const home_guard = try setTestHome(io, tmp.dir);
+    defer home_guard.restore();
 
     const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
     defer testing.allocator.free(data_dir);
@@ -5194,6 +5780,8 @@ test "issue-353: project cache invalidation reloads newly written snapshots" {
     var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
     const project_path = project_path_buf[0..project_path_len];
+    const home_guard = try setTestHome(io, tmp.dir);
+    defer home_guard.restore();
 
     const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
     defer testing.allocator.free(data_dir);
@@ -5277,4 +5865,147 @@ test "codedb_snapshot cache reuses output until store seq changes" {
     bench_ctx.runDispatch(io, alloc, .codedb_snapshot, args, &third, &store, &explorer, &agents);
     try testing.expect(std.mem.indexOf(u8, third.items, "changed") != null);
     try testing.expect(!std.mem.eql(u8, first.items, third.items));
+}
+
+// ── format=json schema tests ────────────────────────────────────────────────
+// The JSON tool surface is a wire contract: clients parse these responses, so
+// the schema (field names, types, count/results consistency) must not drift
+// silently. Each test runs the REAL dispatch path and then parses the output —
+// a parse failure also catches broken string escaping end-to-end.
+
+const JsonToolHarness = struct {
+    explorer: Explorer,
+    store: Store,
+    agents: AgentRegistry,
+    bench_ctx: BenchContext,
+
+    fn init(alloc: std.mem.Allocator) !JsonToolHarness {
+        var h = JsonToolHarness{
+            .explorer = Explorer.init(alloc, explore_mod.Explorer.DEFAULT_CONTENT_CACHE_CAPACITY),
+            .store = Store.init(alloc),
+            .agents = AgentRegistry.init(alloc),
+            .bench_ctx = BenchContext.init(alloc, ".", explore_mod.Explorer.DEFAULT_CONTENT_CACHE_CAPACITY),
+        };
+        errdefer h.deinit();
+        _ = try h.agents.register("__filesystem__");
+        return h;
+    }
+
+    fn deinit(self: *JsonToolHarness) void {
+        self.bench_ctx.deinit();
+        self.agents.deinit();
+        self.store.deinit();
+        self.explorer.deinit();
+    }
+
+    /// Dispatch `tool` with raw JSON `args_json`, parse the response, return it.
+    fn call(self: *JsonToolHarness, alloc: std.mem.Allocator, tool: Tool, args_json: []const u8) !std.json.Parsed(std.json.Value) {
+        var parsed_args = try std.json.parseFromSlice(std.json.Value, alloc, args_json, .{});
+        defer parsed_args.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        self.bench_ctx.runDispatch(testing.io, alloc, tool, &parsed_args.value.object, &out, &self.store, &self.explorer, &self.agents);
+        return std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
+    }
+};
+
+fn expectJsonNumber(v: std.json.Value) !void {
+    switch (v) {
+        .integer, .float => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "codedb_search format=json: response is valid JSON matching the documented schema" {
+    const alloc = testing.allocator;
+    var h = try JsonToolHarness.init(alloc);
+    defer h.deinit();
+    // JSON-hostile content (quotes, backslashes, tab) so a broken escaper makes
+    // the response unparseable instead of silently corrupt.
+    try h.explorer.indexFile("src/alpha.zig", "pub fn jsonNeedle() void {} // \"quoted\" C:\\path\\ and\ttab\n");
+    try h.explorer.indexFile("src/beta.zig", "const x = jsonNeedle();\n");
+
+    var doc = try h.call(alloc, .codedb_search, "{\"query\":\"jsonNeedle\",\"format\":\"json\"}");
+    defer doc.deinit();
+    const root = doc.value.object;
+
+    try testing.expect(root.get("ok").?.bool);
+    try testing.expectEqualStrings("codedb_search", root.get("tool").?.string);
+    try testing.expectEqualStrings("jsonNeedle", root.get("query").?.string);
+
+    const results = root.get("results").?.array;
+    try testing.expect(results.items.len >= 2);
+    try testing.expectEqual(@as(i64, @intCast(results.items.len)), root.get("count").?.integer);
+    for (results.items) |item| {
+        const obj = item.object;
+        try testing.expect(obj.get("path").?.string.len > 0);
+        try testing.expect(obj.get("line").?.integer >= 1);
+        try testing.expect(obj.get("text").?.string.len > 0);
+        try expectJsonNumber(obj.get("score").?);
+        try testing.expectEqualStrings("ranked", obj.get("confidence").?.string);
+    }
+
+    const meta = root.get("meta").?.object;
+    try testing.expectEqualStrings("trigram+outline", meta.get("index").?.string);
+    try testing.expect(meta.get("tier_reached").?.integer >= 0);
+    try testing.expect(meta.get("skip_trigram_files").?.integer >= 0);
+    try testing.expectEqual(@as(i64, 15_000), meta.get("trigram_cap").?.integer);
+    _ = meta.get("recall_complete").?.bool;
+}
+
+test "codedb_symbol format=json: response is valid JSON matching the documented schema" {
+    const alloc = testing.allocator;
+    var h = try JsonToolHarness.init(alloc);
+    defer h.deinit();
+    try h.explorer.indexFile("src/widget.zig", "pub fn jsonSymbolNeedle() void {} // \"quoted\" C:\\path\\\n");
+
+    var doc = try h.call(alloc, .codedb_symbol, "{\"name\":\"jsonSymbolNeedle\",\"format\":\"json\"}");
+    defer doc.deinit();
+    const root = doc.value.object;
+
+    try testing.expect(root.get("ok").?.bool);
+    try testing.expectEqualStrings("codedb_symbol", root.get("tool").?.string);
+
+    const meta = root.get("meta").?.object;
+    try testing.expectEqualStrings("symbol_index+outline", meta.get("index").?.string);
+    try testing.expectEqualStrings("exact", meta.get("match_mode").?.string);
+
+    const results = root.get("results").?.array;
+    try testing.expect(results.items.len >= 1);
+    try testing.expectEqual(@as(i64, @intCast(results.items.len)), root.get("count").?.integer);
+    for (results.items) |item| {
+        const obj = item.object;
+        try testing.expectEqualStrings("src/widget.zig", obj.get("path").?.string);
+        try testing.expect(obj.get("line").?.integer >= 1);
+        try testing.expect(obj.get("kind").?.string.len > 0);
+        try testing.expectEqualStrings("jsonSymbolNeedle", obj.get("name").?.string);
+        try expectJsonNumber(obj.get("score").?);
+        try testing.expectEqualStrings("indexed", obj.get("confidence").?.string);
+    }
+}
+
+test "codedb_symbol format=json: error envelope has ok=false, tool, code, and message" {
+    const alloc = testing.allocator;
+    var h = try JsonToolHarness.init(alloc);
+    defer h.deinit();
+    try h.explorer.indexFile("src/widget.zig", "pub fn anything() void {}\n");
+
+    // No name/prefix/pattern/kind => missing_query error, still valid JSON.
+    var doc = try h.call(alloc, .codedb_symbol, "{\"format\":\"json\"}");
+    defer doc.deinit();
+    const root = doc.value.object;
+
+    try testing.expect(!root.get("ok").?.bool);
+    try testing.expectEqualStrings("codedb_symbol", root.get("tool").?.string);
+    const err = root.get("error").?.object;
+    try testing.expectEqualStrings("missing_query", err.get("code").?.string);
+    try testing.expect(err.get("message").?.string.len > 0);
+
+    // Same envelope contract for codedb_search with a missing query.
+    var sdoc = try h.call(alloc, .codedb_search, "{\"format\":\"json\"}");
+    defer sdoc.deinit();
+    const sroot = sdoc.value.object;
+    try testing.expect(!sroot.get("ok").?.bool);
+    try testing.expectEqualStrings("codedb_search", sroot.get("tool").?.string);
+    try testing.expectEqualStrings("missing_query", sroot.get("error").?.object.get("code").?.string);
 }

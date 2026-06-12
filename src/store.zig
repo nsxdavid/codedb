@@ -24,6 +24,11 @@ pub const Store = struct {
     io: ?std.Io = null,
     /// Cap per-file version history. Configurable via .codedbrc (#101).
     max_versions: usize = 100,
+    /// Compact the diff data log once it exceeds this and at least half of it
+    /// is orphaned bytes (#597).
+    compact_min: u64 = 16 * 1024 * 1024,
+    /// High-water mark for the next compaction check (exponential back-off).
+    next_compact_check: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{
@@ -80,6 +85,7 @@ pub const Store = struct {
 
         const entry = try self.files.getOrPut(path);
         if (!entry.found_existing) {
+            errdefer self.files.removeByPtr(entry.key_ptr);
             const duped = try self.allocator.dupe(u8, path);
             entry.key_ptr.* = duped;
             entry.value_ptr.* = FileVersions.init(self.allocator, duped);
@@ -90,21 +96,25 @@ pub const Store = struct {
         if (diff) |d| {
             if (self.data_log) |log| {
                 const io = self.io orelse return error.Unexpected;
-                // Advisory lock for cross-process safety
+                // Advisory lock for cross-process safety. If it cannot be
+                // acquired, skip the diff persist rather than write unlocked
+                // (#597) — the version still records with data_offset = null.
                 const locked = blk: {
                     log.lock(io, .exclusive) catch break :blk false;
                     break :blk true;
                 };
-                defer if (locked) log.unlock(io);
+                if (locked) {
+                    defer log.unlock(io);
 
-                // Re-stat to get current end position (another process may have appended)
-                const end_pos = log.length(io) catch return error.Unexpected;
-                self.data_log_pos = end_pos;
+                    // Re-stat to get current end position (another process may have appended)
+                    const end_pos = log.length(io) catch return error.Unexpected;
+                    self.data_log_pos = end_pos;
 
-                data_offset = self.data_log_pos;
-                data_len = @intCast(d.len);
-                try log.writePositionalAll(io, d, self.data_log_pos);
-                self.data_log_pos += d.len;
+                    data_offset = self.data_log_pos;
+                    data_len = @intCast(d.len);
+                    try log.writePositionalAll(io, d, self.data_log_pos);
+                    self.data_log_pos += d.len;
+                }
             }
         }
 
@@ -129,7 +139,79 @@ pub const Store = struct {
             entry.value_ptr.versions.items.len = max_versions;
         }
 
+        self.maybeCompactDataLog();
+
         return next_seq;
+    }
+
+    /// Compact when the data log is past compact_min and at least half of it
+    /// is orphaned diff bytes (versions trimmed by max_versions). Checks back
+    /// off exponentially so the live-bytes scan stays amortized. Caller must
+    /// hold self.mu.
+    fn maybeCompactDataLog(self: *Store) void {
+        if (self.data_log == null) return;
+        if (self.data_log_pos < @max(self.compact_min, self.next_compact_check)) return;
+        if (self.liveDataBytes() * 2 <= self.data_log_pos) {
+            self.compactDataLog() catch {};
+        }
+        self.next_compact_check = self.data_log_pos * 2;
+    }
+
+    fn liveDataBytes(self: *Store) u64 {
+        var total: u64 = 0;
+        var iter = self.files.iterator();
+        while (iter.next()) |entry| {
+            for (entry.value_ptr.versions.items) |v| {
+                if (v.data_offset != null) total += v.data_len;
+            }
+        }
+        return total;
+    }
+
+    /// Rewrite live diff ranges to the front of the data log, update the
+    /// version offsets in place, and truncate the orphaned tail. Ranges are
+    /// processed in ascending offset order so data only ever moves down, and
+    /// each range is buffered whole before its write, so overlap is safe.
+    /// Bailing midway leaves a consistent log (moved versions point at their
+    /// new offsets, unmoved at their old ones; nothing truncated yet).
+    /// Caller must hold self.mu.
+    fn compactDataLog(self: *Store) !void {
+        const log = self.data_log orelse return;
+        const io = self.io orelse return;
+
+        log.lock(io, .exclusive) catch return;
+        defer log.unlock(io);
+
+        var live: std.ArrayList(*Version) = .empty;
+        defer live.deinit(self.allocator);
+        var iter = self.files.iterator();
+        while (iter.next()) |entry| {
+            for (entry.value_ptr.versions.items) |*v| {
+                if (v.data_offset != null) try live.append(self.allocator, v);
+            }
+        }
+        std.mem.sort(*Version, live.items, {}, struct {
+            fn lt(_: void, a: *Version, b: *Version) bool {
+                return a.data_offset.? < b.data_offset.?;
+            }
+        }.lt);
+
+        var write_pos: u64 = 0;
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        for (live.items) |v| {
+            const off = v.data_offset.?;
+            const len: usize = v.data_len;
+            if (off != write_pos) {
+                try buf.resize(self.allocator, len);
+                if (try log.readPositionalAll(io, buf.items, off) != len) return error.Unexpected;
+                try log.writePositionalAll(io, buf.items, write_pos);
+                v.data_offset = write_pos;
+            }
+            write_pos += len;
+        }
+        try log.setLength(io, write_pos);
+        self.data_log_pos = write_pos;
     }
 
     pub fn getLatest(self: *Store, path: []const u8) ?Version {

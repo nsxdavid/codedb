@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cio = @import("cio.zig");
 const testing = std.testing;
 const io = std.testing.io;
@@ -25,11 +26,50 @@ comptime {
     _ = @import("config.zig");
 }
 
+fn zigExe() []const u8 {
+    // Tests should follow the documented pre-merge command: reviewers/CI put
+    // zig on PATH instead of depending on workstation-local tool directories.
+    return "zig";
+}
+
+fn builtCodedbExe() []const u8 {
+    return if (builtin.os.tag == .windows) ".\\zig-out\\bin\\codedb.exe" else "./zig-out/bin/codedb";
+}
+
+/// Save an env var's current value so a test that overrides it can put the
+/// ORIGINAL back, instead of unconditionally unsetting (which would strip e.g.
+/// the runner's HOME/USERPROFILE for every later test in the process).
+const EnvVarGuard = struct {
+    name: []const u8,
+    had_prev: bool,
+    prev_len: usize,
+    prev: [4096]u8,
+
+    fn save(name: []const u8) EnvVarGuard {
+        var g = EnvVarGuard{ .name = name, .had_prev = false, .prev_len = 0, .prev = undefined };
+        if (cio.posixGetenv(name)) |v| {
+            if (v.len <= g.prev.len) {
+                @memcpy(g.prev[0..v.len], v);
+                g.prev_len = v.len;
+                g.had_prev = true;
+            }
+        }
+        return g;
+    }
+
+    fn restore(self: *const EnvVarGuard) void {
+        if (self.had_prev) {
+            cio.posixSetenv(self.name, self.prev[0..self.prev_len]);
+        } else {
+            cio.posixUnsetenv(self.name);
+        }
+    }
+};
 
 fn buildCliForHelpTests() !void {
     const build = try cio.runCapture(.{
         .allocator = testing.allocator,
-        .argv = &.{ "zig", "build" },
+        .argv = &.{ zigExe(), "build", "--global-cache-dir", ".zig-global-cache" },
         .max_output_bytes = 8192,
     });
     defer testing.allocator.free(build.stdout);
@@ -39,6 +79,82 @@ fn buildCliForHelpTests() !void {
     try testing.expect(build.term.Exited == 0);
 }
 
+test "windows cli-daemon auto-spawn proxies next query from unicode root" {
+    // POSIX uses the Unix-socket daemon path. This test exercises the Windows
+    // behavior-equivalent path: detached CreateProcessW startup plus named-pipe
+    // proxying for the next process.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    try buildCliForHelpTests();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "project-unicode-å/src");
+    try tmp.dir.createDirPath(io, ".home");
+
+    {
+        const f = try tmp.dir.createFile(io, "project-unicode-å/src/sample.zig", .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "pub fn sampleSymbolForDaemon() void {}\n");
+    }
+
+    var project_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const project_len = try tmp.dir.realPathFile(io, "project-unicode-å", &project_buf);
+    const project_root = project_buf[0..project_len];
+
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home_len = try tmp.dir.realPathFile(io, ".home", &home_buf);
+    const test_home = home_buf[0..home_len];
+
+    const g_allow = EnvVarGuard.save("CODEDB_ALLOW_TEMP");
+    defer g_allow.restore();
+    const g_idle = EnvVarGuard.save("CODEDB_CLI_DAEMON_IDLE_MS");
+    defer g_idle.restore();
+    const g_home = EnvVarGuard.save("HOME");
+    defer g_home.restore();
+    const g_profile = EnvVarGuard.save("USERPROFILE");
+    defer g_profile.restore();
+    cio.posixSetenv("CODEDB_ALLOW_TEMP", "1");
+    cio.posixSetenv("CODEDB_CLI_DAEMON_IDLE_MS", "750");
+    cio.posixSetenv("HOME", test_home);
+    cio.posixSetenv("USERPROFILE", test_home);
+
+    const cold = try cio.runCapture(.{
+        .allocator = testing.allocator,
+        .argv = &.{ builtCodedbExe(), project_root, "status" },
+        .max_output_bytes = 64 * 1024,
+    });
+    defer testing.allocator.free(cold.stdout);
+    defer testing.allocator.free(cold.stderr);
+    try testing.expect(cold.term == .Exited);
+    try testing.expectEqual(@as(u8, 0), cold.term.Exited);
+
+    var warm_seen = false;
+    var attempts: usize = 0;
+    while (attempts < 20) : (attempts += 1) {
+        cio.sleepMs(150);
+        const warm = try cio.runCapture(.{
+            .allocator = testing.allocator,
+            .argv = &.{ builtCodedbExe(), project_root, "find", "sampleSymbolForDaemon" },
+            .max_output_bytes = 64 * 1024,
+        });
+        defer testing.allocator.free(warm.stdout);
+        defer testing.allocator.free(warm.stderr);
+
+        if (warm.term == .Exited and warm.term.Exited == 0 and
+            std.mem.indexOf(u8, warm.stdout, "src/sample.zig") != null and
+            std.mem.indexOf(u8, warm.stdout, "loaded snapshot") == null)
+        {
+            warm_seen = true;
+            break;
+        }
+    }
+
+    // Let the short-idle detached daemon release files before tmp cleanup on Windows.
+    cio.sleepMs(900);
+    try testing.expect(warm_seen);
+}
 
 test "issue-59: telemetry writes session, tool, and codebase stats ndjson" {
     var tmp = testing.tmpDir(.{});
@@ -79,7 +195,6 @@ test "issue-59: telemetry writes session, tool, and codebase stats ndjson" {
     try testing.expect(std.mem.indexOf(u8, contents, "\"languages\":[\"zig\",\"python\"]") != null);
 }
 
-
 test "issue-60: telemetry disabled path is a no-op" {
     var telem = telemetry_mod.Telemetry.init(io, "/tmp", testing.allocator, true);
     defer telem.deinit();
@@ -91,11 +206,22 @@ test "issue-60: telemetry disabled path is a no-op" {
     try testing.expect(telem.head.load(.monotonic) == 0);
 }
 
-
 test "issue-77: mcp index accepts temporary-directory roots that cause pathological cache growth" {
+    // This regression pins POSIX /private/tmp root-policy behavior. Windows temp
+    // paths do not use that prefix, so native root-policy coverage lives in the
+    // shared root_policy tests instead of this macOS-specific fixture.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     var tmp_name_buf: [128]u8 = undefined;
     const tmp_name = try std.fmt.bufPrint(&tmp_name_buf, "codedb-issue-77-{d}", .{@as(i64, @intCast(@divTrunc(cio.nanoTimestamp(), 1000)))});
-    const tmp_root = try std.fs.path.join(testing.allocator, &.{ "/private/tmp", tmp_name });
+    var win_tmp = if (builtin.os.tag == .windows) testing.tmpDir(.{}) else undefined;
+    defer if (builtin.os.tag == .windows) win_tmp.cleanup();
+    var win_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base_tmp = if (builtin.os.tag == .windows) blk: {
+        const n = try win_tmp.dir.realPathFile(io, ".", &win_root_buf);
+        break :blk win_root_buf[0..n];
+    } else "/private/tmp";
+    const tmp_root = try std.fs.path.join(testing.allocator, &.{ base_tmp, tmp_name });
     defer testing.allocator.free(tmp_root);
 
     std.Io.Dir.cwd().createDirPath(io, tmp_root) catch |err| switch (err) {
@@ -114,7 +240,7 @@ test "issue-77: mcp index accepts temporary-directory roots that cause pathologi
 
     const result = try cio.runCapture(.{
         .allocator = testing.allocator,
-        .argv = &.{ "zig", "build", "run", "--", tmp_root, "snapshot" },
+        .argv = &.{ zigExe(), "build", "--global-cache-dir", ".zig-global-cache", "run", "--", tmp_root, "snapshot" },
         .max_output_bytes = 256 * 1024,
     });
     defer testing.allocator.free(result.stdout);
@@ -122,7 +248,6 @@ test "issue-77: mcp index accepts temporary-directory roots that cause pathologi
 
     try testing.expect(result.term.Exited != 0);
 }
-
 
 test "issue-93: isSensitivePath blocks .env and credentials" {
     try testing.expect(watcher.isSensitivePath(".env"));
@@ -145,7 +270,6 @@ test "issue-93: isSensitivePath blocks .env and credentials" {
     try testing.expect(!watcher.isSensitivePath("package.json"));
 }
 
-
 test "issue-93: isPathSafe blocks traversal" {
     const MCP = @import("mcp.zig");
     try testing.expect(!MCP.isPathSafe("../../../etc/passwd"));
@@ -154,7 +278,6 @@ test "issue-93: isPathSafe blocks traversal" {
     try testing.expect(MCP.isPathSafe("src/main.zig"));
     try testing.expect(MCP.isPathSafe("README.md"));
 }
-
 
 test "auto-update: shouldRunAutoUpdate gates correctly" {
     const day_ms: i64 = 24 * 60 * 60 * 1000;
@@ -177,7 +300,6 @@ test "auto-update: shouldRunAutoUpdate gates correctly" {
     try testing.expect(update_mod.shouldRunAutoUpdate(day_ms * 7, 0, false));
 }
 
-
 test "issue-394: shouldRunAutoUpdate permanently blocked by future-timestamp stamp file" {
     // Reproduces the case where the stamp file contains a timestamp in the
     // future relative to the wall clock — for example, after an NTP clock
@@ -197,7 +319,6 @@ test "issue-394: shouldRunAutoUpdate permanently blocked by future-timestamp sta
 
     try testing.expect(update_mod.shouldRunAutoUpdate(now_ms, future_last_ms, false));
 }
-
 
 test "issue-395: shouldRunAutoUpdate panics on i64 underflow when stamp is corrupt" {
     // Reproduces a panic when ~/.codedb/last_auto_update_check is corrupt
@@ -224,13 +345,12 @@ test "issue-395: shouldRunAutoUpdate panics on i64 underflow when stamp is corru
     try testing.expect(update_mod.shouldRunAutoUpdate(now_ms, last_ms, false));
 }
 
-
 test "issue-150: --help prints usage" {
     try buildCliForHelpTests();
 
     const result = try cio.runCapture(.{
         .allocator = testing.allocator,
-        .argv = &.{ "./zig-out/bin/codedb", "--help" },
+        .argv = &.{ builtCodedbExe(), "--help" },
         .max_output_bytes = 8192,
     });
     defer testing.allocator.free(result.stdout);
@@ -246,13 +366,12 @@ test "issue-150: --help prints usage" {
         std.mem.indexOf(u8, result.stderr, "nuke") != null);
 }
 
-
 test "issue-150: -h prints usage" {
     try buildCliForHelpTests();
 
     const result = try cio.runCapture(.{
         .allocator = testing.allocator,
-        .argv = &.{ "./zig-out/bin/codedb", "-h" },
+        .argv = &.{ builtCodedbExe(), "-h" },
         .max_output_bytes = 8192,
     });
     defer testing.allocator.free(result.stdout);
@@ -263,7 +382,6 @@ test "issue-150: -h prints usage" {
     try testing.expect(std.mem.indexOf(u8, result.stdout, "usage:") != null or
         std.mem.indexOf(u8, result.stderr, "usage:") != null);
 }
-
 
 test "update: compareVersions orders semantic versions" {
     try testing.expect(try update_mod.compareVersions("0.2.55", "0.2.56") == .lt);
@@ -281,7 +399,6 @@ test "update: compareVersionsForUpdate allows superseded release train typo" {
     try testing.expect(!try update_mod.targetSupersedesCurrent("0.2.5823", "0.2.5824"));
 }
 
-
 test "update: checksumForBinary parses release manifest" {
     const manifest =
         \\7be38140d090b2e23723c8cde02be150171c818daa16b18c520b44cc1e078add  codedb-darwin-arm64
@@ -296,7 +413,6 @@ test "update: checksumForBinary parses release manifest" {
     try testing.expect(update_mod.checksumForBinary(manifest, "codedb-linux-x86_64") == null);
 }
 
-
 test "update: asset names match published release naming" {
     try testing.expectEqualStrings("codedb-darwin-arm64", update_mod.assetNameForTarget(.macos, .aarch64).?);
     try testing.expectEqualStrings("codedb-darwin-x86_64", update_mod.assetNameForTarget(.macos, .x86_64).?);
@@ -304,7 +420,6 @@ test "update: asset names match published release naming" {
     try testing.expectEqualStrings("codedb-linux-x86_64", update_mod.assetNameForTarget(.linux, .x86_64).?);
     try testing.expect(update_mod.assetNameForTarget(.windows, .x86_64) == null);
 }
-
 
 test "nuke: commandTargetsBinary only matches the current install path" {
     try testing.expect(nuke_mod.commandTargetsBinary(
@@ -320,7 +435,6 @@ test "nuke: commandTargetsBinary only matches the current install path" {
         "/tmp/codedb-test/bin/codedb",
     ));
 }
-
 
 test "nuke: removeJsonMcpServerEntry drops only codedb integration" {
     const input =
@@ -342,7 +456,6 @@ test "nuke: removeJsonMcpServerEntry drops only codedb integration" {
     try testing.expect(std.mem.indexOf(u8, output, "\"theme\"") != null);
 }
 
-
 test "nuke: removeJsonMcpServerEntry removes empty mcpServers object" {
     const input =
         \\{
@@ -361,7 +474,6 @@ test "nuke: removeJsonMcpServerEntry removes empty mcpServers object" {
     try testing.expect(std.mem.indexOf(u8, output, "\"mcpServers\"") == null);
     try testing.expect(std.mem.indexOf(u8, output, "\"theme\"") != null);
 }
-
 
 test "nuke: removeCodexMcpServerBlock removes codedb block only" {
     const input =
@@ -384,7 +496,6 @@ test "nuke: removeCodexMcpServerBlock removes codedb block only" {
     try testing.expect(std.mem.indexOf(u8, output, "command = \"other\"") != null);
 }
 
-
 test "nuke: removeCodexMcpServerBlock matches indented header with inline comment" {
     const input =
         \\  [mcp_servers.codedb] # local override
@@ -403,7 +514,6 @@ test "nuke: removeCodexMcpServerBlock matches indented header with inline commen
     try testing.expect(std.mem.indexOf(u8, output, "codedb") == null);
     try testing.expect(std.mem.indexOf(u8, output, "[mcp_servers.other]") != null);
 }
-
 
 test "nuke: deregisterJsonIntegrationFile handles configs larger than 64 KiB" {
     var tmp = testing.tmpDir(.{});
@@ -439,20 +549,22 @@ test "nuke: deregisterJsonIntegrationFile handles configs larger than 64 KiB" {
     try testing.expect(std.mem.indexOf(u8, rewritten, "\"padding\"") != null);
 }
 
-
 test "issue-148: dead MCP clients are polled every second" {
     const mcp = @import("mcp.zig");
     try testing.expectEqual(@as(u64, 1000), mcp.dead_client_poll_ms);
 }
 
-
 test "issue-148: POLLHUP detects closed pipe" {
+    // This test asserts the POSIX pipe/poll primitive directly. Windows uses
+    // handle-based pipes for equivalent disconnect detection, so the shared MCP
+    // behavior stays covered by transport-level tests instead.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     // Verify the polling infrastructure works for pipe-based transports
     const pipe = try cio.makePipe();
-    defer _ = std.c.close(pipe[0]);
+    defer cio.closeFd(pipe[0]);
 
     // Close write end — simulates client disconnect
-    _ = std.c.close(pipe[1]);
+    cio.closeFd(pipe[1]);
 
     // Poll should detect POLLHUP on the read end
     var fds = [_]std.posix.pollfd{.{
@@ -465,7 +577,6 @@ test "issue-148: POLLHUP detects closed pipe" {
     try testing.expect(n > 0);
     try testing.expect((fds[0].revents & std.posix.POLL.HUP) != 0);
 }
-
 
 test "issue-148: idle watchdog exits on shutdown signal" {
     // The watchdog should check shutdown every ~1s (not 30s)
@@ -500,7 +611,6 @@ test "issue-148: idle watchdog exits on shutdown signal" {
     }
 }
 
-
 test "issue-278: MCP tracks activity without using it as a transport timeout" {
     const mcp = @import("mcp.zig");
 
@@ -515,7 +625,6 @@ test "issue-278: MCP tracks activity without using it as a transport timeout" {
     const now = cio.milliTimestamp();
     try testing.expect(now - last < 1_000);
 }
-
 
 test "issue-278: MCP session may remain idle longer than old timeout" {
     const mcp = @import("mcp.zig");
@@ -535,11 +644,13 @@ test "issue-278: MCP session may remain idle longer than old timeout" {
     try testing.expect(now - last > old_idle_timeout_ms);
 }
 
-
 test "issue-148: open pipe does not trigger HUP" {
+    // POSIX poll reports HUP on file descriptors; Windows named/anonymous pipes
+    // expose the same client-lifetime signal through HANDLE operations instead.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const pipe = try cio.makePipe();
-    defer _ = std.c.close(pipe[0]);
-    defer _ = std.c.close(pipe[1]);
+    defer cio.closeFd(pipe[0]);
+    defer cio.closeFd(pipe[1]);
 
     var poll_fds = [_]std.posix.pollfd{.{
         .fd = pipe[0],
@@ -551,11 +662,15 @@ test "issue-148: open pipe does not trigger HUP" {
     try testing.expectEqual(@as(usize, 0), result);
 }
 
-
 test "issue-148: codedb mcp exits when stdin is closed" {
+    // This integration test depends on POSIX stdin pipe EOF through zig build
+    // run. Windows uses handle/named-pipe disconnect semantics for equivalent
+    // MCP shutdown behavior, covered by the transport tests.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     // Integration test: spawn codedb mcp, close stdin, verify it exits
     var child = std.process.spawn(io, .{
-        .argv = &.{ "zig", "build", "run", "--", "--mcp" },
+        .argv = &.{ zigExe(), "build", "--global-cache-dir", ".zig-global-cache", "run", "--", "--mcp" },
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .ignore,
@@ -597,14 +712,12 @@ test "issue-148: codedb mcp exits when stdin is closed" {
     try testing.expect(elapsed < 5_000);
 }
 
-
 test "issue-249: nuke.removeJsonMcpServerEntry returns null when key absent" {
     // Verifies removeJsonMcpServerEntry does not signal a write when key is absent,
     // which ensures the non-atomic rewriteConfigFile path is never triggered unnecessarily.
     const result = try nuke_mod.removeJsonMcpServerEntry(testing.allocator, "{\"other\":1}", "codedb");
     try testing.expect(result == null);
 }
-
 
 test "issue-207: ScanState round-trips through atomic" {
     const initial = mcp_mod.getScanState();
@@ -623,14 +736,12 @@ test "issue-207: ScanState round-trips through atomic" {
     try testing.expectEqual(mcp_mod.ScanState.ready, mcp_mod.getScanState());
 }
 
-
 test "issue-207: ScanState.name covers all states" {
     try testing.expectEqualStrings("loading_snapshot", mcp_mod.ScanState.loading_snapshot.name());
     try testing.expectEqualStrings("walking", mcp_mod.ScanState.walking.name());
     try testing.expectEqualStrings("indexing", mcp_mod.ScanState.indexing.name());
     try testing.expectEqualStrings("ready", mcp_mod.ScanState.ready.name());
 }
-
 
 test "issue-346: root_policy rejects dangerous ambient cwd roots" {
     try testing.expect(!root_policy.isIndexableRoot("/"));
@@ -641,7 +752,6 @@ test "issue-346: root_policy rejects dangerous ambient cwd roots" {
     try testing.expect(!root_policy.isIndexableRoot("/opt"));
     try testing.expect(!root_policy.isIndexableRoot("/opt/homebrew"));
 }
-
 
 test "issue-357: bundle preserves nested 'arguments' for codedb_outline" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
@@ -677,7 +787,6 @@ test "issue-357: bundle preserves nested 'arguments' for codedb_outline" {
     try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "src/lib.zig") != null);
 }
-
 
 test "issue-357: bundle surfaces received keys when an op is missing required path" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
@@ -716,7 +825,6 @@ test "issue-357: bundle surfaces received keys when an op is missing required pa
     try testing.expect(std.mem.indexOf(u8, out.items, "file_path") != null);
 }
 
-
 test "issue-423: bundle emits 'received keys' exactly once per failing op" {
     // Regression: handler (handleSearch etc) appends the diagnostic, AND the
     // bundle dispatch loop also appends it — caller saw the line twice in a
@@ -753,7 +861,6 @@ test "issue-423: bundle emits 'received keys' exactly once per failing op" {
     }
     try testing.expectEqual(@as(usize, 1), count);
 }
-
 
 test "issue-367: openDataLog truncates orphan bytes from prior session" {
     var tmp_dir = testing.tmpDir(.{});
@@ -796,7 +903,6 @@ test "issue-367: openDataLog truncates orphan bytes from prior session" {
     try testing.expectEqualStrings(diff, buf[0..diff.len]);
 }
 
-
 test "issue-367-dx: tty summary surfaces received keys on missing-arg error" {
     const args_json =
         \\{"file_path":"src/main.zig","weird_key":"x"}
@@ -821,7 +927,6 @@ test "issue-367-dx: tty summary surfaces received keys on missing-arg error" {
     try testing.expect(std.mem.indexOf(u8, summary.items, "received") != null);
     try testing.expect(std.mem.indexOf(u8, summary.items, "file_path") != null);
 }
-
 
 test "issue-bug2: tool calls during scan-in-progress hint at scan state" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
@@ -852,7 +957,6 @@ test "issue-bug2: tool calls during scan-in-progress hint at scan state" {
     try testing.expect(std.mem.indexOf(u8, out.items, "0 results") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "scan still in progress") != null);
 }
-
 
 test "issue-378: search waits briefly for scan to reach ready instead of returning empty" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
@@ -894,7 +998,6 @@ test "issue-378: search waits briefly for scan to reach ready instead of returni
     try testing.expect(std.mem.indexOf(u8, out.items, "scan still in progress") == null);
 }
 
-
 test "issue-bug5: codedb_read returns binary stub instead of dumping bytes" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -925,8 +1028,7 @@ test "issue-bug5: codedb_read returns binary stub instead of dumping bytes" {
     var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, dir_path, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer bench_ctx.deinit();
 
-    const args_json = try std.fmt.allocPrint(testing.allocator,
-        "{{\"path\":\"{s}\"}}", .{bin_rel});
+    const args_json = try std.fmt.allocPrint(testing.allocator, "{{\"path\":\"{s}\"}}", .{bin_rel});
     defer testing.allocator.free(args_json);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
     defer parsed.deinit();
@@ -938,7 +1040,6 @@ test "issue-bug5: codedb_read returns binary stub instead of dumping bytes" {
     try testing.expect(std.mem.indexOf(u8, out.items, "binary file") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, &[_]u8{0}) == null);
 }
-
 
 test "issue-bug6: codedb_read errors when line_start > line_end" {
     var tmp_dir = testing.tmpDir(.{});
@@ -969,8 +1070,7 @@ test "issue-bug6: codedb_read errors when line_start > line_end" {
     var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, dir_path, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer bench_ctx.deinit();
 
-    const args_json = try std.fmt.allocPrint(testing.allocator,
-        "{{\"path\":\"{s}\",\"line_start\":100,\"line_end\":10}}", .{rel});
+    const args_json = try std.fmt.allocPrint(testing.allocator, "{{\"path\":\"{s}\",\"line_start\":100,\"line_end\":10}}", .{rel});
     defer testing.allocator.free(args_json);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
     defer parsed.deinit();
@@ -982,7 +1082,6 @@ test "issue-bug6: codedb_read errors when line_start > line_end" {
     try testing.expect(std.mem.startsWith(u8, out.items, "error:"));
     try testing.expect(std.mem.indexOf(u8, out.items, "line_start") != null);
 }
-
 
 test "issue-bug7: codedb_search rejects empty query" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
@@ -1008,7 +1107,6 @@ test "issue-bug7: codedb_search rejects empty query" {
     try testing.expect(std.mem.indexOf(u8, out.items, "empty") != null);
 }
 
-
 test "issue-bug7: codedb_search rejects negative max_results" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -1033,7 +1131,6 @@ test "issue-bug7: codedb_search rejects negative max_results" {
     try testing.expect(std.mem.indexOf(u8, out.items, "max_results") != null);
 }
 
-
 test "issue-bug11: codedb_bundle marks isError when all ops fail" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -1056,7 +1153,6 @@ test "issue-bug11: codedb_bundle marks isError when all ops fail" {
 
     try testing.expect(std.mem.startsWith(u8, out.items, "error:"));
 }
-
 
 test "issue-386: telemetry recordToolCall preserves UTF-8 codepoint boundaries" {
     var tmp = testing.tmpDir(.{});
@@ -1093,7 +1189,6 @@ test "issue-386: telemetry recordToolCall preserves UTF-8 codepoint boundaries" 
     try testing.expect(std.unicode.utf8ValidateSlice(recorded));
 }
 
-
 test "issue-387: appendId preserves JSON-RPC numeric and number_string ids" {
     // JSON-RPC ids are typed as String|Number|Null. The MCP server must echo
     // the id verbatim so the client can correlate the reply with its request.
@@ -1126,7 +1221,6 @@ test "issue-387: appendId preserves JSON-RPC numeric and number_string ids" {
     }
 }
 
-
 test "issue-406: root_policy blocks /private/etc (macOS realpath of /etc)" {
     // /etc is in the system_prefixes deny list, but on macOS /etc is a symlink
     // to /private/etc. Callers feed isIndexableRoot a path resolved by
@@ -1137,7 +1231,6 @@ test "issue-406: root_policy blocks /private/etc (macOS realpath of /etc)" {
     try testing.expect(!root_policy.isIndexableRoot("/private/etc"));
     try testing.expect(!root_policy.isIndexableRoot("/private/etc/ssh"));
 }
-
 
 test "issue-407: root_policy blocks /var and its non-folders subtree" {
     // The system_prefixes list explicitly blocks /var/folders and /var/tmp,
@@ -1152,7 +1245,6 @@ test "issue-407: root_policy blocks /var and its non-folders subtree" {
     try testing.expect(!root_policy.isIndexableRoot("/private/var"));
     try testing.expect(!root_policy.isIndexableRoot("/private/var/log"));
 }
-
 
 test "issue-412: bundle reports 'missing tool' for tool field of wrong type" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
@@ -1176,7 +1268,6 @@ test "issue-412: bundle reports 'missing tool' for tool field of wrong type" {
 
     try testing.expect(std.mem.indexOf(u8, out.items, "missing 'tool' field") == null);
 }
-
 
 test "issue-413: bundle truncation drops subsequent ops without telling the caller" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
@@ -1222,7 +1313,6 @@ test "issue-413: bundle truncation drops subsequent ops without telling the call
     try testing.expect(std.mem.indexOf(u8, out.items, "[2]") != null);
 }
 
-
 test "issue-424-B: bundle falls through to inline args when arguments is empty object" {
     // Forge-style buggy clients sometimes send `arguments: {}` AND put the
     // real args inline at the op level. The dispatcher currently sees the
@@ -1258,7 +1348,6 @@ test "issue-424-B: bundle falls through to inline args when arguments is empty o
     try testing.expect(std.mem.indexOf(u8, out.items, "received keys: []") == null);
 }
 
-
 test "issue-512: direct tools call accepts inline args when arguments is empty" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -1281,9 +1370,10 @@ test "issue-512: direct tools call accepts inline args when arguments is empty" 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, call_json, .{});
     defer parsed.deinit();
 
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const pipe = try cio.makePipe();
-    defer _ = std.c.close(pipe[0]);
-    defer _ = std.c.close(pipe[1]);
+    defer cio.closeFd(pipe[0]);
+    defer cio.closeFd(pipe[1]);
 
     bench_ctx.runHandleCall(
         io,
@@ -1304,7 +1394,6 @@ test "issue-512: direct tools call accepts inline args when arguments is empty" 
     try testing.expect(std.mem.indexOf(u8, response, "src/main.zig") != null);
     try testing.expect(std.mem.indexOf(u8, response, "missing 'path'") == null);
 }
-
 
 test "issue-424-D: received-keys diagnostic hints at inline-args workaround when empty" {
     // When a sub-op fails with truly-empty args, the diagnostic should
@@ -1340,7 +1429,6 @@ test "issue-424-D: received-keys diagnostic hints at inline-args workaround when
     try testing.expect(std.mem.indexOf(u8, out.items, "received keys:") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "inline shape") != null);
 }
-
 
 test "issue-424-A: bundle envelope errors carry the 'error:' prefix consistently" {
     // Pre-fix the bundle dispatcher emits 'op must be an object' and
@@ -1381,7 +1469,6 @@ test "issue-424-A: bundle envelope errors carry the 'error:' prefix consistently
     try testing.expect(std.mem.indexOf(u8, out2.items, "error: missing 'tool'") != null);
 }
 
-
 test "issue-441: bundle rejects codedb_projects sub-op" {
     // codedb_projects lists every indexed project on the machine, which is a
     // global directory enumeration unrelated to whatever repo the agent is
@@ -1415,7 +1502,6 @@ test "issue-441: bundle rejects codedb_projects sub-op" {
     try testing.expect(std.mem.indexOf(u8, out.items, "error: codedb_projects not allowed in bundle") != null);
 }
 
-
 test "issue-441: codedb_projects branch is excluded from augmented oneOf" {
     // Mirror of the dispatcher rejection at the schema level — when the
     // discriminated oneOf is opted into via CODEDB_DISCRIMINATED_SCHEMA=1,
@@ -1444,7 +1530,6 @@ test "issue-441: codedb_projects branch is excluded from augmented oneOf" {
         try testing.expect(!std.mem.eql(u8, tool_const.string, "codedb_projects"));
     }
 }
-
 
 test "issue-443: codedb_bundle is omitted from default tools/list response" {
     // The codedb_bundle tool has been a footgun across multiple stages:
@@ -1489,7 +1574,6 @@ test "issue-443: codedb_bundle is omitted from default tools/list response" {
     try testing.expect(saw_outline);
 }
 
-
 test "issue-443: codedb_bundle is advertised when CODEDB_BUNDLE_ENABLED=1" {
     // Re-enable path. When bundle_enabled is true the runtime response
     // includes codedb_bundle, exactly as it did before this gate.
@@ -1509,7 +1593,6 @@ test "issue-443: codedb_bundle is advertised when CODEDB_BUNDLE_ENABLED=1" {
     }
     try testing.expect(saw_bundle);
 }
-
 
 test "issue-434: codedb_bundle ops items schema requires arguments field" {
     // The codedb_bundle inputSchema in tools_list advertises ops items as
@@ -1547,7 +1630,6 @@ test "issue-434: codedb_bundle ops items schema requires arguments field" {
     try testing.expect(has_tool);
     try testing.expect(has_arguments);
 }
-
 
 test "issue-437: codedb_bundle ops items schema has discriminated oneOf per sub-tool" {
     // Stage 2 of the bundle-schema fix. Stage 1 (#434) made `arguments`
@@ -1621,7 +1703,6 @@ test "issue-437: codedb_bundle ops items schema has discriminated oneOf per sub-
         try testing.expect(!std.mem.eql(u8, tool_const.string, "codedb_edit"));
     }
 }
-
 
 test "issue-503: parsePositional treats `codedb mcp <path>` as path-as-root" {
     // Before fix: parser took the isCommand("mcp") branch, set root=".",
@@ -1714,7 +1795,6 @@ test "parsePositional: existing commands still parse correctly (regression)" {
     }
 }
 
-
 test "issue-502: isValidMcpFlag whitelist rejects unknown flags" {
     // Before fix: `codedb mcp --snapshot` silently swallowed the flag and
     // started the server with surprising state. After fix, mainImpl rejects
@@ -1725,7 +1805,6 @@ test "issue-502: isValidMcpFlag whitelist rejects unknown flags" {
     try testing.expect(!main_mod.isValidMcpFlag("--help")); // rewritten by parsePositional before reaching here
     try testing.expect(!main_mod.isValidMcpFlag(""));
 }
-
 
 test "issue-502: findGitRootFrom walks up to a .git directory" {
     var tmp = testing.tmpDir(.{});
@@ -1937,6 +2016,13 @@ test "issue-528: parseDepsArgs flags before/after path, rejects unknown + bad de
     try testing.expectError(error.MissingPath, mcp_mod.parseDepsArgs(&[_][]const u8{"deps"}, 1));
 }
 
+test "issue-528: hasExtraCliArgs rejects unused positional args for arity-zero commands" {
+    try testing.expect(!main_mod.hasExtraCliArgs(&[_][]const u8{ "codedb", "tree" }, 2));
+    try testing.expect(main_mod.hasExtraCliArgs(&[_][]const u8{ "codedb", "tree", "typo" }, 2));
+    try testing.expect(!main_mod.hasExtraCliArgs(&[_][]const u8{ "codedb", "status" }, 2));
+    try testing.expect(main_mod.hasExtraCliArgs(&[_][]const u8{ "codedb", "hot", "extra" }, 2));
+}
+
 test "issue-528: finishCli maps error-prefixed handler output to exit 1" {
     const alloc = testing.allocator;
     // #6: handler emitted an error → bridge now returns exit 1
@@ -1955,4 +2041,428 @@ test "issue-528: finishCli maps error-prefixed handler output to exit 1" {
     var empty_out: std.ArrayList(u8) = .empty;
     defer empty_out.deinit(alloc);
     try testing.expectEqual(@as(u8, 0), mcp_mod.finishCli(&empty_out, 0));
+}
+
+test "issue-538: temp roots are indexable only when CODEDB_ALLOW_TEMP opts in" {
+    // Default (footgun guard, #80/#346): temp roots are refused so codedb never
+    // indexes a scratch dir by accident.
+    try testing.expect(!root_policy.isIndexableRoot("/tmp/cdbtest"));
+    try testing.expect(!root_policy.isIndexableRoot("/private/tmp/cdbtest"));
+
+    // Opt-in escape hatch for SWE-bench / CI harnesses that clone throwaway
+    // checkouts under /tmp (issue #538).
+    cio.posixSetenv("CODEDB_ALLOW_TEMP", "1");
+    defer cio.posixUnsetenv("CODEDB_ALLOW_TEMP");
+    try testing.expect(root_policy.isIndexableRoot("/tmp/cdbtest"));
+    try testing.expect(root_policy.isIndexableRoot("/private/tmp/cdbtest/src"));
+
+    // The opt-in must NOT widen the guard to real system roots.
+    try testing.expect(!root_policy.isIndexableRoot("/etc"));
+    try testing.expect(!root_policy.isIndexableRoot("/usr/local/bin"));
+    try testing.expect(!root_policy.isIndexableRoot("/"));
+}
+
+test "issue-570: codedb_context falls back to plain words for all-lowercase tasks" {
+    // 'fix search ranking' has no identifier-shaped token (no snake_case, no
+    // camelCase, no quotes), so extractContextCandidates finds nothing and the
+    // handler dead-ends with 'no candidate identifiers found'. Natural-language
+    // tasks are the documented input shape — the composer must fall back to
+    // plain words instead of erroring.
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/ranking.zig", "pub fn rankingBoost() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"task":"fix search ranking"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_context, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // An all-lowercase task must not dead-end…
+    try testing.expect(std.mem.indexOf(u8, out.items, "no candidate identifiers") == null);
+    // …its longest meaningful word ('ranking') must drive the composer.
+    try testing.expect(std.mem.indexOf(u8, out.items, "ranking") != null);
+}
+
+test "issue-573: cli bridge must not bind a leading flag as the positional name" {
+    // Live repro: `codedb callers --max-results 3 indexFile` reported
+    // "1 call sites for '--max-results'" — the bridge takes args[cmd_args_start]
+    // blindly, so a leading flag silently becomes the name. It must fall
+    // through to the command's usage error instead.
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/a.zig", "pub fn indexFile() void {}\npub fn caller() void {\n    indexFile();\n}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const argv = [_][]const u8{ "--max-results", "3", "indexFile" };
+    const code = mcp_mod.runCliTool(io, testing.allocator, &explorer, &store, ".", "callers", &argv, 0, &out);
+    try testing.expect(code != null);
+    // The flag must not be reported as the function name…
+    try testing.expect(std.mem.indexOf(u8, out.items, "call sites for '--max-results'") == null);
+    // …the command fails to its usage line instead.
+    try testing.expect(std.mem.indexOf(u8, out.items, "callers <name>") != null);
+
+    // Companion UX defect, same audit: an explicitly empty symbol name must be
+    // a usage error (mirrors codedb_callers), not "no results for: ".
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const sargs_json =
+        \\{"name":""}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, sargs_json, .{});
+    defer parsed.deinit();
+
+    var sout: std.ArrayList(u8) = .empty;
+    defer sout.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_symbol, &parsed.value.object, &sout, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, sout.items, "error: empty name") != null);
+}
+
+test "issue-576: codedb_ls distinguishes a non-indexed path from an empty listing" {
+    // `codedb ls nonexistent/dir` printed 'no entries' with exit 0 —
+    // indistinguishable from a real-but-empty directory. An index only knows
+    // a directory through files under it, so an empty listing for a non-empty
+    // prefix always means the path is not indexed: say so (the 'error:' prefix
+    // also makes finishCli return exit 1 on the CLI bridge).
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/a.zig", "pub fn a() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const bad_json =
+        \\{"path":"nonexistent/dir"}
+    ;
+    const bad_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, bad_json, .{});
+    defer bad_parsed.deinit();
+
+    var bad_out: std.ArrayList(u8) = .empty;
+    defer bad_out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_ls, &bad_parsed.value.object, &bad_out, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, bad_out.items, "error: no indexed files under 'nonexistent/dir'") != null);
+
+    // A real prefix still lists its entries.
+    const ok_json =
+        \\{"path":"src"}
+    ;
+    const ok_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, ok_json, .{});
+    defer ok_parsed.deinit();
+
+    var ok_out: std.ArrayList(u8) = .empty;
+    defer ok_out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_ls, &ok_parsed.value.object, &ok_out, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, ok_out.items, "a.zig") != null);
+}
+
+test "issue-578: cli bridge serves codedb_changes" {
+    // `codedb changes` parsed as a ROOT directory (unknown first token in the
+    // [root] <command> grammar) and printed usage — codedb_changes existed
+    // only as an MCP tool because the bridge had no store to hand to
+    // handleChanges. The bridge must serve it like the other read-only tools.
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/a.zig", "pub fn a() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = store.recordSnapshot("src/a.zig", 10, 123) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const argv = [_][]const u8{};
+    const code = mcp_mod.runCliTool(io, testing.allocator, &explorer, &store, ".", "changes", &argv, 0, &out);
+    // Pre-#578 the bridge did not know 'changes' and returned null.
+    try testing.expect(code != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "seq:") != null);
+}
+
+// ─── audit (2026-06-09): latent-issue sweep — secret-path detection ───
+// src/watcher.zig + src/snapshot.zig isSensitivePath missed *.env suffix files and
+// .git-credentials, so those secrets were indexed/read.
+test "audit: isSensitivePath blocks *.env suffix files and .git-credentials" {
+    try testing.expect(watcher.isSensitivePath("production.env"));
+    try testing.expect(watcher.isSensitivePath("staging.env"));
+    try testing.expect(watcher.isSensitivePath("secrets.env"));
+    try testing.expect(watcher.isSensitivePath("deploy/secrets.env"));
+    try testing.expect(watcher.isSensitivePath(".git-credentials"));
+    // existing positive (prefix .env.* form) must still hold
+    try testing.expect(watcher.isSensitivePath(".env.production"));
+    // negatives — guard against an over-broad change
+    try testing.expect(!watcher.isSensitivePath("main.zig"));
+    try testing.expect(!watcher.isSensitivePath("environment.ts"));
+}
+
+// ─── #568: empty deps lists print '(none)' with no '(N files)' summary ───
+// Non-empty lists end with a '(N files)' summary; empty lists printed a body
+// line '  (none)' and no summary, so machine consumers that parse the list
+// body saw one entry (engram counted in-degree 1 for every zero-importer
+// file). The summary line must be present unconditionally.
+test "issue-568: deps empty list prints a (0 files) summary" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/lone.zig", "pub fn lonely() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    // imported_by (default): nothing imports src/lone.zig.
+    const rev_json =
+        \\{"path":"src/lone.zig"}
+    ;
+    const rev_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, rev_json, .{});
+    defer rev_parsed.deinit();
+    var rev_out: std.ArrayList(u8) = .empty;
+    defer rev_out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_deps, &rev_parsed.value.object, &rev_out, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, rev_out.items, "(none)") != null);
+    try testing.expect(std.mem.indexOf(u8, rev_out.items, "(0 files)") != null);
+
+    // depends_on: src/lone.zig imports nothing.
+    const fwd_json =
+        \\{"path":"src/lone.zig","direction":"depends_on"}
+    ;
+    const fwd_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, fwd_json, .{});
+    defer fwd_parsed.deinit();
+    var fwd_out: std.ArrayList(u8) = .empty;
+    defer fwd_out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_deps, &fwd_parsed.value.object, &fwd_out, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, fwd_out.items, "(none)") != null);
+    try testing.expect(std.mem.indexOf(u8, fwd_out.items, "(0 files)") != null);
+}
+
+test "issue-589: isSensitivePath blocks all OpenSSH default private key names" {
+    // The exact-name list covers id_rsa and id_ed25519 but misses the other
+    // ssh-keygen defaults: id_ecdsa, id_dsa, and the FIDO variants
+    // id_ecdsa_sk / id_ed25519_sk. Outside ~/.ssh (which the directory rule
+    // catches), a key copied into a repo — deploy/id_ecdsa — was indexed and
+    // readable while deploy/id_rsa was blocked.
+    const keys = [_][]const u8{ "id_ecdsa", "id_dsa", "id_ecdsa_sk", "id_ed25519_sk" };
+    for (keys) |k| {
+        try testing.expect(watcher.isSensitivePath(k));
+        try testing.expect(snapshot_mod.isSensitivePath(k));
+    }
+    try testing.expect(watcher.isSensitivePath("deploy/id_ecdsa"));
+    // negatives — names that merely start like a key must stay indexable
+    try testing.expect(!watcher.isSensitivePath("id_map.zig"));
+    try testing.expect(!watcher.isSensitivePath("identity.ts"));
+}
+
+test "issue-592: cli-daemon spawn lock is exclusive per project" {
+    // Concurrent cold CLI calls used to fork a cli-daemon EACH (no mutual
+    // exclusion), every duplicate re-scanned the index, and the stale-socket
+    // unlink let late arrivals steal the winner's socket — orphan daemons
+    // churned CPU long after the calls exited. The per-project flock makes
+    // spawn mutually exclusive: holders win, probes report unavailable, and
+    // the kernel releases the lock on any exit.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_len];
+
+    const held = main_mod.daemonLockTryAcquire(dir_path);
+    try testing.expect(held != null);
+    // A second acquire (the would-be duplicate daemon) must lose...
+    try testing.expect(main_mod.daemonLockTryAcquire(dir_path) == null);
+    // ...and the CLI spawn probe must report the lock as taken.
+    try testing.expect(!main_mod.daemonLockAvailable(dir_path));
+
+    main_mod.daemonLockRelease(held.?);
+    try testing.expect(main_mod.daemonLockAvailable(dir_path));
+}
+
+test "cli-mcp-parity: runCliTool bridges navigation commands to MCP handlers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try exp.indexFile("src/store.zig", "pub const Store = struct {};\n");
+    try exp.indexFile("src/main.zig", "const Store = @import(\"store.zig\").Store;\npub fn main() void {}\n");
+
+    var store = Store.init(aa);
+
+    // glob: pattern -> matching indexed paths (reuses handleGlob)
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        const code = mcp_mod.runCliTool(io, aa, &exp, &store, ".", "glob", &.{ "codedb", ".", "glob", "src/*.zig" }, 3, &out);
+        try testing.expectEqual(@as(?u8, 0), code);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/store.zig") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
+    }
+
+    // symbol: name -> definition site (reuses handleSymbol)
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        const code = mcp_mod.runCliTool(io, aa, &exp, &store, ".", "symbol", &.{ "codedb", ".", "symbol", "Store" }, 3, &out);
+        try testing.expectEqual(@as(?u8, 0), code);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/store.zig") != null);
+    }
+
+    // unknown command -> null so runQuery falls through to its own usage error
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        try testing.expectEqual(@as(?u8, null), mcp_mod.runCliTool(io, aa, &exp, &store, ".", "bogus", &.{ "codedb", ".", "bogus" }, 3, &out));
+    }
+
+    // missing required arg -> usage line, exit 1
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        try testing.expectEqual(@as(?u8, 1), mcp_mod.runCliTool(io, aa, &exp, &store, ".", "glob", &.{ "codedb", ".", "glob" }, 3, &out));
+        try testing.expect(std.mem.indexOf(u8, out.items, "usage") != null);
+    }
+}
+
+test "issue-531: codedb_context max_tokens packs sections by value under the budget" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    // A defined symbol with a fat body (inlined when unbudgeted) plus several
+    // mention files so the snippets section is large too.
+    try explorer.indexFile("src/widget.zig",
+        \\pub fn widgetFrobnicate() void {
+        \\    const filler_line_01: u64 = 1;
+        \\    const filler_line_02: u64 = 2;
+        \\    const filler_line_03: u64 = 3;
+        \\    const filler_line_04: u64 = 4;
+        \\    const filler_line_05: u64 = 5;
+        \\    const filler_line_06: u64 = 6;
+        \\    const filler_line_07: u64 = 7;
+        \\    const filler_line_08: u64 = 8;
+        \\    const filler_line_09: u64 = 9;
+        \\    const filler_line_10: u64 = 10;
+        \\    const filler_line_11: u64 = 11;
+        \\    const filler_line_12: u64 = 12;
+        \\    const filler_line_13: u64 = 13;
+        \\    const filler_line_14: u64 = 14;
+        \\    const filler_line_15: u64 = 15;
+        \\    const filler_line_16: u64 = 16;
+        \\    const filler_line_17: u64 = 17;
+        \\    const filler_line_18: u64 = 18;
+        \\    const filler_line_19: u64 = 19;
+        \\    const filler_line_20: u64 = 20;
+        \\    _ = filler_line_01;
+        \\}
+    );
+    var name_buf: [32]u8 = undefined;
+    var content_buf: [512]u8 = undefined;
+    for (0..5) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "src/mention_{d}.zig", .{i});
+        const content = try std.fmt.bufPrint(&content_buf,
+            \\pub fn helper_{d}() void {{
+            \\    widgetFrobnicate();
+            \\    widgetFrobnicate();
+            \\    widgetFrobnicate();
+            \\}}
+        , .{i});
+        try explorer.indexFile(name, content);
+    }
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_full =
+        \\{"task":"investigate widgetFrobnicate"}
+    ;
+    const parsed_full = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_full, .{});
+    defer parsed_full.deinit();
+    var out_full: std.ArrayList(u8) = .empty;
+    defer out_full.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_context, &parsed_full.value.object, &out_full, &store, &explorer, &agents);
+
+    const args_budget =
+        \\{"task":"investigate widgetFrobnicate","max_tokens":256}
+    ;
+    const parsed_budget = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_budget, .{});
+    defer parsed_budget.deinit();
+    var out_budget: std.ArrayList(u8) = .empty;
+    defer out_budget.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_context, &parsed_budget.value.object, &out_budget, &store, &explorer, &agents);
+
+    // Unbudgeted output is unchanged (no markers) and bigger.
+    try testing.expect(std.mem.indexOf(u8, out_full.items, "[max_tokens") == null);
+    try testing.expect(out_full.items.len > out_budget.items.len);
+
+    // Budgeted output respects ~4 chars/token, with a small allowance for
+    // the omission markers themselves.
+    try testing.expect(out_budget.items.len <= 256 * 4 + 512);
+    try testing.expect(std.mem.indexOf(u8, out_budget.items, "[max_tokens") != null);
+
+    // Value order: the head and the file list survive; the fat snippet
+    // section is what gets dropped.
+    try testing.expect(std.mem.indexOf(u8, out_budget.items, "# Task") != null);
+    try testing.expect(std.mem.indexOf(u8, out_budget.items, "## Most-relevant files") != null);
+    try testing.expect(std.mem.indexOf(u8, out_budget.items, "## Top sites") == null);
+}
+
+test "windows: spawnDetached command line round-trips argv with trailing backslashes" {
+    // spawnDetachedWindows quotes every arg but escapes only embedded quotes.
+    // Per CommandLineToArgvW rules, backslashes preceding a quote must be
+    // doubled: an arg ending in a backslash (any Windows root path like
+    // `D:\` or `D:\proj\`) is emitted as "D:\proj\" whose trailing \" escapes
+    // the CLOSING quote, so the spawned child sees that arg fused with
+    // whatever follows. This is the real cli-daemon auto-spawn argv shape
+    // (self_exe, abs_root, "cli-daemon") with a drive-root project. The
+    // command line is split back with std's Windows argv parser — the same
+    // CRT-compatible rules every spawned child applies.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    const argv = [_][]const u8{ "C:\\tools\\codedb.exe", "D:\\", "cli-daemon", "say \"hi\"", "a\\\\b", "tail\\\\" };
+    const cmd = cio.windowsCommandLine(alloc, &argv) orelse return error.TestUnexpectedResult;
+    defer alloc.free(cmd);
+    const cmd_w = try std.unicode.utf8ToUtf16LeAlloc(alloc, cmd);
+    defer alloc.free(cmd_w);
+
+    var it = try std.process.Args.Iterator.Windows.init(alloc, cmd_w);
+    defer it.deinit();
+    for (argv) |expected| {
+        const got = it.next() orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(expected, got);
+    }
+    try testing.expect(it.next() == null);
 }

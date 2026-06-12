@@ -26,6 +26,150 @@ fn expectOutlineImport(outline: *const explore.FileOutline, import_path: []const
 }
 
 
+test "issue-1: multi-line TS/JS import paths captured for dep graph" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/role-driver.ts",
+        \\import {
+        \\  existsSync,
+        \\  readdirSync,
+        \\} from "../bus/in-memory-event-bus.ts";
+        \\
+        \\import { join } from "node:path";
+        \\
+        \\export * from "./re-export.ts";
+        \\
+        \\// loads config from "config.json" at boot
+        \\
+        \\export class RoleDriver {}
+    );
+
+    var outline = (try explorer.getOutline("src/role-driver.ts", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try testing.expectEqual(Language.typescript, outline.language);
+    // Single-line import already worked (regression guard) ...
+    try expectOutlineImport(&outline, "node:path");
+    // ... the multi-line import is the bug: its `from "..."` sits on a line
+    // that does not contain "import ", so it was dropped from the dep graph.
+    try expectOutlineImport(&outline, "../bus/in-memory-event-bus.ts");
+    // re-export deps (export ... from) are also dependencies.
+    try expectOutlineImport(&outline, "./re-export.ts");
+    // A comment (or string) that merely contains `from "..."` must NOT become a
+    // dependency. The old over-broad match grabbed exactly this kind of thing.
+    for (outline.imports.items) |imp| {
+        try testing.expect(!std.mem.eql(u8, imp, "config.json"));
+    }
+}
+
+test "issue-2: relative imports resolve to repo paths in the dep graph" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("daemon/src/role/role-driver.ts",
+        \\import { foo } from "../bus/event-bus.ts";
+        \\import { join } from "node:path";
+    );
+
+    const deps = explorer.dep_graph.getForwardDeps("daemon/src/role/role-driver.ts") orelse
+        return error.TestUnexpectedResult;
+    var found_resolved = false;
+    var found_raw = false;
+    var found_bare = false;
+    for (deps) |d| {
+        if (std.mem.eql(u8, d, "daemon/src/bus/event-bus.ts")) found_resolved = true;
+        if (std.mem.eql(u8, d, "../bus/event-bus.ts")) found_raw = true;
+        if (std.mem.eql(u8, d, "node:path")) found_bare = true;
+    }
+    // the relative import resolves to a repo-rooted path ...
+    try testing.expect(found_resolved);
+    // ... the raw "../" form no longer appears in the graph (was dropped before) ...
+    try testing.expect(!found_raw);
+    // ... and bare specifiers are unaffected.
+    try testing.expect(found_bare);
+
+    // imported_by must now resolve to the importer.
+    const importers = try explorer.dep_graph.getImportedBy("daemon/src/bus/event-bus.ts", testing.allocator);
+    defer {
+        for (importers) |imp| testing.allocator.free(imp);
+        testing.allocator.free(importers);
+    }
+    var found_importer = false;
+    for (importers) |imp| {
+        if (std.mem.eql(u8, imp, "daemon/src/role/role-driver.ts")) found_importer = true;
+    }
+    try testing.expect(found_importer);
+}
+
+test "issue-2: extensionless relative imports resolve using the importer's extension" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    // Common TS/JS form: the import omits the ".ts" extension.
+    try explorer.indexFile("daemon/src/role/role-driver.ts",
+        \\import { foo } from "../bus/event-bus";
+    );
+
+    const deps = explorer.dep_graph.getForwardDeps("daemon/src/role/role-driver.ts") orelse
+        return error.TestUnexpectedResult;
+    var found = false;
+    for (deps) |d| {
+        if (std.mem.eql(u8, d, "daemon/src/bus/event-bus.ts")) found = true;
+    }
+    // Resolved to the indexed file path, with the importer's .ts extension added.
+    try testing.expect(found);
+
+    const importers = try explorer.dep_graph.getImportedBy("daemon/src/bus/event-bus.ts", testing.allocator);
+    defer {
+        for (importers) |imp| testing.allocator.free(imp);
+        testing.allocator.free(importers);
+    }
+    var found_importer = false;
+    for (importers) |imp| {
+        if (std.mem.eql(u8, imp, "daemon/src/role/role-driver.ts")) found_importer = true;
+    }
+    try testing.expect(found_importer);
+}
+
+test "issue-2: interned dependency keys are reused, not re-allocated per reindex" {
+    var dg = DependencyGraph.init(testing.allocator);
+    defer dg.deinit();
+
+    const a = try dg.internString("daemon/src/bus/event-bus.ts");
+    const b = try dg.internString("daemon/src/bus/event-bus.ts");
+    // Same content -> same backing allocation, so re-indexing a file with the
+    // same relative imports does not grow the arena on every rebuild.
+    try testing.expect(a.ptr == b.ptr);
+
+    const c = try dg.internString("daemon/src/other.ts");
+    try testing.expect(a.ptr != c.ptr);
+}
+
+test "issue-548: a string containing 'import ' is not captured as a dependency" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    // A plain const whose string value merely contains "import " — it is NOT an
+    // import statement, so it must not produce a dependency edge.
+    try explorer.indexFile("src/msg.ts", "export const ERROR = 'failed to import the config module';");
+    var outline = (try explorer.getOutline("src/msg.ts", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+    for (outline.imports.items) |imp| {
+        try testing.expect(!std.mem.eql(u8, imp, "failed to import the config module"));
+    }
+
+    // Regression guard: a real single-line import is still captured.
+    try explorer.indexFile("src/dep.ts", "import { real } from './real-dep.ts';");
+    var outline2 = (try explorer.getOutline("src/dep.ts", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline2.deinit();
+    try expectOutlineImport(&outline2, "./real-dep.ts");
+}
+
 test "issue-301: Dart / Flutter parser" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -711,13 +855,16 @@ test "issue-151: Go func and type definitions" {
     defer outline.deinit();
     var func_count: usize = 0;
     var struct_count: usize = 0;
+    var interface_count: usize = 0;
     for (outline.symbols.items) |sym| {
         if (sym.kind == .function) func_count += 1;
         if (sym.kind == .struct_def) struct_count += 1;
+        if (sym.kind == .interface_def) interface_count += 1;
     }
     try testing.expect(func_count == 2); // main + Validate
-    try testing.expect(struct_count == 2); // Config + Handler
     try testing.expect(outline.imports.items.len == 1); // "fmt"
+    try testing.expect(struct_count == 1); // Config
+    try testing.expect(interface_count == 1); // Handler
 }
 
 
@@ -1725,3 +1872,115 @@ test "issue-532: ReScript parser" {
     try expectOutlineImport(&outline, "Belt");
 }
 
+
+// ─── audit (2026-06-09): latent-issue sweep — parser/deps fixes ───
+
+// src/explore.zig parseDelimitedImport — Kotlin/Swift `import X as Y` stored "X as Y" as
+// the dep key because the alias-trim was skipped for the empty-delimiter callers.
+test "audit: Kotlin import alias stripped from dep path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer.indexFile("Main.kt", "import com.example.Foo as Bar\n");
+    var outline = (try explorer.getOutline("Main.kt", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+    var saw_clean = false;
+    var saw_aliased = false;
+    for (outline.imports.items) |imp| {
+        if (std.mem.eql(u8, imp, "com.example.Foo")) saw_clean = true;
+        if (std.mem.eql(u8, imp, "com.example.Foo as Bar")) saw_aliased = true;
+    }
+    try testing.expect(saw_clean);
+    try testing.expect(!saw_aliased);
+}
+
+// src/explore.zig getImportedBy — basename fallback over-attached an ambiguous bare
+// import to every same-basename file; now skipped when the basename is ambiguous.
+test "audit: ambiguous bare import must not cross same-basename dirs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("a/conf.py", "x = 1\n");
+    try explorer.indexFile("b/conf.py", "y = 2\n");
+    try explorer.indexFile("importer.py", "import conf\n");
+
+    const a_imp = try explorer.getImportedBy("a/conf.py", testing.allocator);
+    defer {
+        for (a_imp) |i| testing.allocator.free(i);
+        testing.allocator.free(a_imp);
+    }
+    const b_imp = try explorer.getImportedBy("b/conf.py", testing.allocator);
+    defer {
+        for (b_imp) |i| testing.allocator.free(i);
+        testing.allocator.free(b_imp);
+    }
+
+    var a_attached = false;
+    for (a_imp) |i| {
+        if (std.mem.eql(u8, i, "importer.py")) a_attached = true;
+    }
+    var b_attached = false;
+    for (b_imp) |i| {
+        if (std.mem.eql(u8, i, "importer.py")) b_attached = true;
+    }
+
+    // the same ambiguous bare import must not be attributed to two same-basename files
+    try testing.expect(!(a_attached and b_attached));
+}
+
+// src/explore.zig extractPythonModulePath/parsePythonLine — `import a, b` recorded only
+// the first module; now one dep is recorded per comma-separated module.
+test "audit: Python comma import records all modules" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("m.py", "import alpha, beta\n");
+
+    var outline = (try explorer.getOutline("m.py", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try expectOutlineImport(&outline, "alpha.py");
+    try expectOutlineImport(&outline, "beta.py");
+}
+
+
+// renderImportedBy (the MCP codedb_deps reverse path) kept the unconditional
+// basename fallback when getImportedBy gained the ambiguity guard — the same
+// bare import is still attributed to every same-basename file through the
+// main deps tool.
+test "issue-588: renderImportedBy suppresses the ambiguous basename fallback" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("a/conf.py", "x = 1\n");
+    try explorer.indexFile("b/conf.py", "y = 2\n");
+    try explorer.indexFile("importer.py", "import conf\n");
+
+    var a_out: std.ArrayList(u8) = .empty;
+    defer a_out.deinit(testing.allocator);
+    _ = try explorer.renderImportedBy("a/conf.py", testing.allocator, &a_out);
+    var b_out: std.ArrayList(u8) = .empty;
+    defer b_out.deinit(testing.allocator);
+    _ = try explorer.renderImportedBy("b/conf.py", testing.allocator, &b_out);
+
+    const a_attached = std.mem.indexOf(u8, a_out.items, "importer.py") != null;
+    const b_attached = std.mem.indexOf(u8, b_out.items, "importer.py") != null;
+    // The ambiguous bare import must not be attributed to both files.
+    try testing.expect(!(a_attached and b_attached));
+
+    // Single-basename case keeps the fallback: with exactly one conf.py the
+    // importer is still listed.
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    var explorer2 = Explorer.init(arena2.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer2.indexFile("a/conf.py", "x = 1\n");
+    try explorer2.indexFile("importer.py", "import conf\n");
+
+    var solo_out: std.ArrayList(u8) = .empty;
+    defer solo_out.deinit(testing.allocator);
+    _ = try explorer2.renderImportedBy("a/conf.py", testing.allocator, &solo_out);
+    try testing.expect(std.mem.indexOf(u8, solo_out.items, "importer.py") != null);
+}

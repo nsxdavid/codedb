@@ -726,7 +726,7 @@ fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem
         const import_count = try readSectionInt(u32, bytes, &cursor);
         try outline.imports.ensureTotalCapacity(allocator, import_count);
         for (0..import_count) |_| {
-            const imp = try readSectionStringBorrowed(bytes, &cursor, 4096);
+            const imp = try readSectionStringBorrowed(bytes, &cursor, std.math.maxInt(u16));
             outline.imports.appendAssumeCapacity(imp);
         }
 
@@ -771,13 +771,39 @@ fn rebuildDepsFromOutline(explorer: *Explorer, path: []const u8, outline: *const
     errdefer deps.deinit(allocator);
     try deps.ensureTotalCapacity(allocator, outline.imports.items.len);
 
+    // Dedup like Explorer.rebuildDepsFor: a file importing the same module more
+    // than once (e.g. ../foo for both a type and a value) must not produce
+    // duplicate forward edges, so a snapshot-restored graph matches a fresh one.
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+
     for (outline.imports.items) |imp| {
-        if (std.mem.indexOf(u8, imp, "..") != null) continue;
-        deps.appendAssumeCapacity(imp);
+        // Same resolution as Explorer.rebuildDepsFor: relative specifiers
+        // resolve to repo paths so restored deps match a freshly-indexed graph.
+        const dep = (try explore_mod.resolveDependencyKey(&explorer.dep_graph, outline.path, imp, allocator)) orelse continue;
+        const gop = try seen.getOrPut(dep);
+        if (gop.found_existing) continue;
+        deps.appendAssumeCapacity(dep);
     }
 
     try explorer.dep_graph.setDeps(path, deps);
 }
+
+// Process max-RSS in bytes (macOS getrusage reports bytes; Linux reports KiB).
+// Profiler-only: attribution of load-phase memory growth, not a public API.
+fn loadMaxRssBytes() u64 {
+    if (@import("builtin").os.tag == .windows) return 0;
+    var ru: std.c.rusage = undefined;
+    if (std.c.getrusage(0, &ru) != 0) return 0;
+    const raw: u64 = @intCast(@max(0, ru.maxrss));
+    return if (@import("builtin").os.tag == .linux) raw * 1024 else raw;
+}
+// Written only when `load_prof` is set by loadSnapshotFast; the loader is
+// single-threaded so plain vars are safe.
+var load_prof: bool = false;
+var prof_content_ns: i128 = 0;
+var prof_deps_ns: i128 = 0;
+var prof_symidx_ns: i128 = 0;
 
 fn insertRestoredFile(
     explorer: *Explorer,
@@ -797,13 +823,34 @@ fn insertRestoredFile(
 
     // When the content was read from an mmap the Explorer has adopted, store a
     // borrowed (zero-copy) cache value; otherwise dupe it as usual.
+    const t_content: i128 = if (load_prof) cio.nanoTimestamp() else 0;
     if (borrow_content) {
         try explorer.contents.putBorrowed(path, content);
     } else {
         try explorer.contents.put(path, content);
     }
+    if (load_prof) prof_content_ns += cio.nanoTimestamp() - t_content;
 
+    const t_deps: i128 = if (load_prof) cio.nanoTimestamp() else 0;
     try rebuildDepsFromOutline(explorer, path, &restored_outline, allocator);
+    if (load_prof) prof_deps_ns += cio.nanoTimestamp() - t_deps;
+
+    // Mirror commitParsedFileOwnedOutline (explore.zig:872): symbol_index is built
+    // eagerly on every ingest and has NO lazy rebuild trigger. resolveCallees reads
+    // it without a fallback (#524 perf note), so restored files must populate it
+    // here or call-graph edges into them are lost after a snapshot load. had_prior
+    // is false: insertRestoredFile errors above if the path already exists.
+    const t_symidx: i128 = if (load_prof) cio.nanoTimestamp() else 0;
+    explorer.rebuildSymbolIndexFor(path, &restored_outline, false);
+    if (load_prof) prof_symidx_ns += cio.nanoTimestamp() - t_symidx;
+
+    // Restored files are absent from word_index and trigram_index at load time
+    // (both are rebuilt lazily/incrementally). Register the path in
+    // skip_trigram_files so searchContent's Tier 3 scans its content; without
+    // this the file falls out of every search tier the moment the trigram index
+    // is non-empty (Tier 5's full scan is then ruled out). Mirrors the
+    // outline-only branch of commitParsedFileOwnedOutline. See #507 / #537.
+    try explorer.skip_trigram_files.put(path, {});
 }
 
 // Below this many files the per-file freshness stats run on the loading thread:
@@ -858,9 +905,29 @@ fn loadSnapshotFast(
     store: *Store,
     allocator: std.mem.Allocator,
 ) !bool {
+    const outline_section_mark = explorer.outlineSectionMark();
+    const content_section_mark = explorer.contentSectionMark();
+    var inserted_paths: std.ArrayList([]const u8) = .empty;
+    defer inserted_paths.deinit(allocator);
+    var load_ok = false;
+    defer if (!load_ok) {
+        // POSIX mmap and Windows' aligned heap-read fallback both feed borrowed
+        // content slices into Explorer. If validation rejects the snapshot after
+        // adoption, remove files inserted during this attempt before dropping the
+        // backing sections they may still borrow from.
+        for (inserted_paths.items) |path| explorer.removeFile(path);
+        explorer.releaseOutlineSectionsFrom(outline_section_mark);
+        explorer.releaseContentSectionsFrom(content_section_mark);
+    };
+
     // Optional phase profiler (CODEDB_LOAD_PROFILE): prints a load breakdown to
     // stderr. Near-zero cost when off (one getenv + a few timestamps).
     const prof = cio.posixGetenv("CODEDB_LOAD_PROFILE") != null;
+    load_prof = prof;
+    prof_content_ns = 0;
+    prof_deps_ns = 0;
+    prof_symidx_ns = 0;
+    const rss0: u64 = if (prof) loadMaxRssBytes() else 0;
     const t_load0: i128 = if (prof) cio.nanoTimestamp() else 0;
     var fresh_ns: i128 = 0;
 
@@ -891,6 +958,7 @@ fn loadSnapshotFast(
         explorer.dep_graph.reverse.ensureTotalCapacity(fc) catch {};
     }
 
+    const rss_outline: u64 = if (prof) loadMaxRssBytes() else 0;
     const t_outline: i128 = if (prof) cio.nanoTimestamp() else 0;
     var sections = (try readSections(io, snapshot_path, allocator)) orelse return false;
     defer sections.deinit();
@@ -928,12 +996,15 @@ fn loadSnapshotFast(
     var content_borrowed = false;
     const section: []const u8 = section_blk: {
         const fsize: usize = std.math.cast(usize, file_stat.size) orelse return false;
-        if (std.posix.mmap(null, fsize, .{ .READ = true }, .{ .TYPE = .SHARED }, content_file.handle, 0)) |m| {
+        // POSIX returns a true mmap that can be unmapped with any allocator
+        // parameter; Windows uses an aligned heap buffer, so allocate with the
+        // Explorer allocator that will own the adopted section on success.
+        if (cio.mapFileRead(io, explorer.allocator, content_file, fsize)) |m| {
             if (explorer.adoptContentSection(m)) {
                 content_borrowed = true;
                 break :section_blk m[sec_base..][0..sec_len];
             } else |_| {
-                std.posix.munmap(m);
+                cio.unmapFileRead(explorer.allocator, m);
             }
         } else |_| {}
         const h = allocator.alloc(u8, sec_len) catch return false;
@@ -986,6 +1057,7 @@ fn loadSnapshotFast(
         }
     }
 
+    const rss_recs: u64 = if (prof) loadMaxRssBytes() else 0;
     // ── Pass B: freshness check (parallelized for large trees). ──
     // statFile every record to detect edits made since the snapshot. These are
     // independent, allocation-free per-file syscalls — the dominant load cost once
@@ -1042,8 +1114,23 @@ fn loadSnapshotFast(
         }
     }
     if (prof) fresh_ns += cio.nanoTimestamp() - t_fresh0;
-
+    const rss_fresh: u64 = if (prof) loadMaxRssBytes() else 0;
     // ── Pass C: insert restored / changed / outline-only files (sequential). ──
+    // Invalidate the stale call graph at the first explorer mutation — after
+    // header/section validation (so an early-rejected snapshot leaves the
+    // existing graph untouched) but before the snapshot's restored centrality
+    // lands (which this must not wipe). Failed loads from here roll back via
+    // removeFile, which re-invalidates as it goes.
+    explorer.invalidateCallGraph();
+
+    // #564: defer the global symbol index — Pass C's per-file rebuilds become
+    // no-ops and ensureSymbolIndex builds it from outlines on first
+    // symbol/caller/callpath use. Plain search never needs it, so one-shot
+    // CLI queries skip the inserts and their heap entirely.
+    explorer.markSymbolIndexIncomplete();
+    var insert_ns: i128 = 0;
+    var store_ns: i128 = 0;
+    inserted_paths.ensureTotalCapacity(allocator, records.items.len) catch return false;
     for (records.items, fresh_results) |record, fr| {
         const path = record.path;
         const content = record.content;
@@ -1064,20 +1151,27 @@ fn loadSnapshotFast(
                 stale_outline.deinit();
             }
             explorer.indexFile(path, dc) catch continue;
+            inserted_paths.appendAssumeCapacity(path);
             const hash = std.hash.Wyhash.hash(0, dc);
             _ = store.recordSnapshot(path, dc.len, hash) catch {};
         } else if (outline_states.fetchRemove(path)) |removed| {
+            const t_ins: i128 = if (prof) cio.nanoTimestamp() else 0;
             insertRestoredFile(explorer, removed.key, content, removed.value, allocator, content_borrowed) catch {
                 allocator.free(removed.key);
                 var bad_outline = removed.value;
                 bad_outline.deinit();
                 continue;
             };
+            if (prof) insert_ns += cio.nanoTimestamp() - t_ins;
+            inserted_paths.appendAssumeCapacity(removed.key);
             const hash = record.stored_hash orelse std.hash.Wyhash.hash(0, content);
+            const t_st: i128 = if (prof) cio.nanoTimestamp() else 0;
             _ = store.recordSnapshot(removed.key, content.len, hash) catch {};
+            if (prof) store_ns += cio.nanoTimestamp() - t_st;
         } else {
             word_index_can_load_from_disk = false;
             explorer.indexFileOutlineOnly(path, content) catch continue;
+            inserted_paths.appendAssumeCapacity(path);
             const hash = record.stored_hash orelse std.hash.Wyhash.hash(0, content);
             _ = store.recordSnapshot(path, content.len, hash) catch {};
         }
@@ -1085,6 +1179,7 @@ fn loadSnapshotFast(
         file_count += 1;
     }
 
+    const rss_insert: u64 = if (prof) loadMaxRssBytes() else 0;
     if (file_count == 0) return false;
     if (expected_file_count) |expected| {
         if (file_count != expected) return false;
@@ -1095,27 +1190,23 @@ fn loadSnapshotFast(
     explorer.markWordIndexIncomplete(word_index_can_load_from_disk);
 
     if (sections.get(@intFromEnum(SectionId.freq_table))) |freq_entry| {
-        if (freq_entry.length == 256 * 256 * 2) {
+        if (freq_entry.length == 256 * 256 * 2) freq_load: {
             const index_mod = @import("index.zig");
-            const ft = allocator.create([256][256]u16) catch return file_count > 0;
-            const freq_file = std.Io.Dir.cwd().openFile(io, snapshot_path, .{}) catch return file_count > 0;
+            // setFrequencyTable copies the table, so ft is freed on every
+            // path -- including success -- and a single defer covers them all.
+            const ft = allocator.create([256][256]u16) catch break :freq_load;
+            defer allocator.destroy(ft);
+            const freq_file = std.Io.Dir.cwd().openFile(io, snapshot_path, .{}) catch break :freq_load;
             defer freq_file.close(io);
             var bulk_buf: [256 * 256 * 2]u8 = undefined;
-            const nr = freq_file.readPositionalAll(io, &bulk_buf, freq_entry.offset) catch {
-                allocator.destroy(ft);
-                return file_count > 0;
-            };
-            if (nr != bulk_buf.len) {
-                allocator.destroy(ft);
-                return file_count > 0;
-            }
+            const nr = freq_file.readPositionalAll(io, &bulk_buf, freq_entry.offset) catch break :freq_load;
+            if (nr != bulk_buf.len) break :freq_load;
             for (0..256) |a| {
                 for (0..256) |b| {
                     ft[a][b] = std.mem.readInt(u16, bulk_buf[(a * 256 + b) * 2 ..][0..2], .little);
                 }
             }
             index_mod.setFrequencyTable(ft);
-            allocator.destroy(ft);
         }
     }
 
@@ -1139,8 +1230,23 @@ fn loadSnapshotFast(
             "[load-profile] {d} files  total={d:.1}ms  outline={d:.1}ms  loop={d:.1}ms (freshness={d:.1}ms, rest={d:.1}ms)\n",
             .{ file_count, ms(now - t_load0), ms(outline_ns), ms(loop_ns), ms(fresh_ns), ms(loop_ns - fresh_ns) },
         );
+        std.debug.print(
+            "[load-profile]   insert={d:.1}ms (content={d:.1}ms, deps={d:.1}ms, symidx={d:.1}ms, other={d:.1}ms)  store={d:.1}ms\n",
+            .{ ms(insert_ns), ms(prof_content_ns), ms(prof_deps_ns), ms(prof_symidx_ns), ms(insert_ns - prof_content_ns - prof_deps_ns - prof_symidx_ns), ms(store_ns) },
+        );
+        const mb = struct {
+            fn f(b: u64) f64 {
+                return @as(f64, @floatFromInt(b)) / (1024.0 * 1024.0);
+            }
+        }.f;
+        const rss_end = loadMaxRssBytes();
+        std.debug.print(
+            "[load-profile]   maxrss: start={d:.1}MB +outline={d:.1}MB +records={d:.1}MB +freshness={d:.1}MB +insert={d:.1}MB +tail={d:.1}MB end={d:.1}MB\n",
+            .{ mb(rss0), mb(rss_outline -| rss0), mb(rss_recs -| rss_outline), mb(rss_fresh -| rss_recs), mb(rss_insert -| rss_fresh), mb(rss_end -| rss_insert), mb(rss_end) },
+        );
     }
 
+    load_ok = true;
     return true;
 }
 
@@ -1219,54 +1325,51 @@ fn parseJsonU64(json: []const u8, key: []const u8) ?u64 {
 }
 
 /// Returns true for secret/credential paths that must never be persisted to a
-/// snapshot or live-indexed. Kept in lockstep with `watcher.isSensitivePath`;
-/// the two are parity-tested in test_snapshot.zig ("issue-528: isSensitivePath
-/// parity") so any future drift in this security filter fails CI.
+/// snapshot or live-indexed. Single implementation of this security filter;
+/// `watcher.isSensitivePath` delegates here (parity-tested in test_snapshot.zig
+/// "issue-528: isSensitivePath parity").
 pub fn isSensitivePath(path: []const u8) bool {
-    const sensitive_names = [_][]const u8{
-        ".env",
-        ".env.local",
-        ".env.production",
-        ".env.development",
-        ".env.staging",
-        ".env.test",
-        ".dev.vars",
-        "credentials.json",
-        "service-account.json",
-        "secrets.json",
-        "secrets.yaml",
-        "secrets.yml",
-        ".npmrc",
-        ".pypirc",
-        ".netrc",
-        "id_rsa",
-        "id_ed25519",
-        ".pem",
-    };
-
-    // Check exact filename (basename)
     const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[sep + 1 ..] else path;
-
+    // Fast path: most source files have extensions like .zig, .ts, .py — none start with '.'
+    // or match sensitive patterns. Skip the full check for common cases.
+    if (basename.len == 0) return false;
+    const first = basename[0];
+    // Only check sensitive names if basename starts with '.', 'c', 's', 'i' or has key/cert extension
+    if (first != '.' and first != 'c' and first != 's' and first != 'i') {
+        // Still need to check extensions and directory patterns
+        if (std.mem.endsWith(u8, basename, ".env") or
+            std.mem.endsWith(u8, basename, ".pem") or
+            std.mem.endsWith(u8, basename, ".key") or
+            std.mem.endsWith(u8, basename, ".p12") or
+            std.mem.endsWith(u8, basename, ".pfx") or
+            std.mem.endsWith(u8, basename, ".jks")) return true;
+        if (std.mem.indexOf(u8, path, ".ssh/") != null or
+            std.mem.indexOf(u8, path, ".gnupg/") != null or
+            std.mem.indexOf(u8, path, ".aws/") != null) return true;
+        return false;
+    }
+    // .env, .env.<token>; do NOT match .envoy, .envrc, .environment, etc.
+    if (basename.len >= 4 and std.mem.eql(u8, basename[0..4], ".env") and
+        (basename.len == 4 or basename[4] == '.' or basename[4] == '-' or basename[4] == '_')) return true;
+    // Exact matches
+    const sensitive_names = [_][]const u8{
+        ".dev.vars",        ".npmrc",               ".pypirc",      ".netrc",
+        "credentials.json", "service-account.json", "secrets.json", "secrets.yaml",
+        "secrets.yml",      "id_rsa",               "id_ed25519",   ".git-credentials",
+        "id_ecdsa",         "id_dsa",               "id_ecdsa_sk",  "id_ed25519_sk",
+    };
     for (sensitive_names) |name| {
         if (std.mem.eql(u8, basename, name)) return true;
     }
-
-    // Catch .env, .env.anything; do NOT match .envoy, .envrc, .environment, etc.
-    if (basename.len >= 4 and std.mem.eql(u8, basename[0..4], ".env") and
-        (basename.len == 4 or basename[4] == '.' or basename[4] == '-' or basename[4] == '_')) return true;
-
-    // Check extensions
-    if (endsWith(basename, ".pem")) return true;
-    if (endsWith(basename, ".key")) return true;
-    if (endsWith(basename, ".p12")) return true;
-    if (endsWith(basename, ".pfx")) return true;
-    if (endsWith(basename, ".jks")) return true;
-
-    // Check directory patterns
-    if (std.mem.indexOf(u8, path, ".ssh/") != null) return true;
-    if (std.mem.indexOf(u8, path, ".gnupg/") != null) return true;
-    if (std.mem.indexOf(u8, path, ".aws/") != null) return true;
-
+    if (std.mem.endsWith(u8, basename, ".env") or
+        std.mem.endsWith(u8, basename, ".pem") or
+        std.mem.endsWith(u8, basename, ".key") or
+        std.mem.endsWith(u8, basename, ".p12") or
+        std.mem.endsWith(u8, basename, ".pfx") or
+        std.mem.endsWith(u8, basename, ".jks")) return true;
+    if (std.mem.indexOf(u8, path, ".ssh/") != null or
+        std.mem.indexOf(u8, path, ".gnupg/") != null or
+        std.mem.indexOf(u8, path, ".aws/") != null) return true;
     return false;
 }
 fn endsWith(s: []const u8, suffix: []const u8) bool {
@@ -1323,7 +1426,7 @@ pub fn writeProjectCacheSnapshot(
     allocator: std.mem.Allocator,
 ) !void {
     const hash = std.hash.Wyhash.hash(0, root_path);
-    const home_raw = cio.posixGetenv("HOME") orelse return;
+    const home_raw = cio.userHome() orelse return;
     const home = allocator.dupe(u8, home_raw) catch return;
     defer allocator.free(home);
     const secondary = std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}/codedb.snapshot", .{ home, hash }) catch return;
@@ -1341,6 +1444,7 @@ pub fn writeProjectCacheSnapshot(
 
     try writeSnapshot(io, explorer, root_path, secondary, allocator);
 }
+
 
 fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
     for (s) |c| {

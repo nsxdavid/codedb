@@ -1,6 +1,99 @@
 # Changelog
 
 
+## 0.2.5825 - 2026-06-07
+
+`0.2.5825` is a broad retrieval-quality + capability cut. It fixes a class of
+**post-snapshot-load search and recall gaps** found by engram's `codedb-report`
+(#537, #539, #547), restores **call-graph edges into snapshot-restored files**
+(#537b), adds a **call-path query tool** and **PageRank graph ranking** (#531),
+**richer symbol search** and **token-leaner JSON output**, a batch of **TS/JS
+dependency-graph fixes** (#540, #541, #548), an **opt-in for indexing temp
+roots** (#538), and **CLI hardening** (#528).
+
+### Search recall after a snapshot load (#537, #539)
+
+- **Restored files are searchable again.** After a fast snapshot load a restored
+  file was registered in neither `trigram_index` nor `skip_trigram_files`, so
+  `codedb_search` omitted it entirely once the trigram index was non-empty (the
+  Tier 5 full scan is then ruled out). `insertRestoredFile` now registers restored
+  files in `skip_trigram_files`, mirroring the outline-only path (#507).
+- **`searchContent` blends the complete word index into recall.** It rebuilds the
+  lazily-loaded word index on first use (like `searchWord`), so Tier 0 ranks every
+  file the inverted index knows about — a relevant restored file competes on
+  relevance instead of being crowded out of `max_results` by hot files.
+
+### Call graph into restored files (#537b)
+
+- **`resolveCallees` no longer drops edges into restored files.** `insertRestoredFile`
+  now rebuilds `symbol_index` for restored files (it is built eagerly on every
+  commit and has no lazy fallback), so `codedb_callers` and call-path resolution
+  see edges into snapshot-restored files after a load.
+
+### Opt-in temp-root indexing (#538)
+
+- **`CODEDB_ALLOW_TEMP=1` env or `--allow-temp` flag** allow indexing roots under
+  `/tmp` and `/private/tmp`. The footgun guard stays the default; the opt-in
+  unblocks SWE-bench-Lite / CI retrieval harnesses that clone throwaway checkouts
+  into temp dirs. System dirs (`/usr`, `/etc`, …) and the home-directory guard are
+  unchanged.
+
+### Call-path queries + PageRank ranking (#531)
+
+- **New `codedb_callpath` tool / CLI command** — the shortest resolved call chain
+  between two symbols (`A → … → B`), each hop returned as `path:name@line`. Backed
+  by `codegraph.shortestCallPath` (BFS) over the retained resolved call graph;
+  `codedb_callers` now chains a `next: codedb_callpath …` hint.
+- **Graph-aware ranking upgraded to PageRank.** Per-file centrality used by
+  `searchContentRanked` now defaults to PageRank over the resolved call graph,
+  replacing simple weighted in-degree. `CODEDB_IN_DEGREE_CENTRALITY` reverts to
+  in-degree; `CODEDB_NO_CENTRALITY` disables the boost.
+
+### Smarter symbol search
+
+- **`codedb_symbol` gains kind / prefix / glob / fuzzy filters** (`searchSymbols`)
+  — match by exact name, prefix, glob pattern, typo-tolerant fuzzy, or kind
+  (function / struct / interface / class / method / enum), with an optional source
+  body per hit.
+
+### Token-leaner, structured output
+
+- **`format=json`** on `codedb_search` and `codedb_symbol` returns structured
+  results with search-provenance meta and structured tool errors.
+- **`paths_only`** on `codedb_search` drops the matched-line text (~50% fewer
+  tokens per call for broad surveys), and **`path_glob`** filters results by glob
+  (bare patterns like `*.zig` are auto-promoted to `**/*.zig`).
+
+### TS/JS dependency graph (#540, #541, #548)
+
+- **Multi-line and re-export imports are captured** (#540, #542) — a closing
+  `} from "..."` line or `export * from "..."` now feeds the dep graph, guarded so
+  `from "..."` inside comments/strings isn't mistaken for a dependency.
+- **Relative imports resolve to repo paths** (#541, #543) — `./` / `../`
+  specifiers resolve to repo-rooted paths (with extensionless-import handling) so
+  they show up in `deps` / `imported_by`; resolved keys are interned so re-indexing
+  doesn't grow the arena per import.
+- **No bogus deps from strings** (#548) — a line that merely *contains* an
+  `import` keyword (e.g. an error message) is no longer captured as a
+  dependency; only statement-position imports are.
+
+### `search` consults the word index (#547)
+
+- **The CLI `search` path now loads the word inverted index**, not just the
+  trigram, so `searchContent`'s Tier 0 recall surfaces identifier terms that
+  `word` finds (long / low-frequency names) — matching `word` / `mcp`. Previously
+  `search` was trigram-only and went blind to such identifiers at scale.
+
+### CLI hardening (#528)
+
+- **Argument arity + validation** — extra or typo'd arguments to commands
+  (`tree`, `hot`, `status`, …) now report a usage error and exit non-zero instead
+  of silently succeeding.
+
+### Contributors
+
+Thanks to **@nsxdavid** for the TS/JS dependency-graph fixes (#542, #543). 🙏
+
 ## 0.2.5824 - 2026-06-05
 
 `0.2.5824` adds a deterministic, no-LLM **code-graph** layer. codedb now builds a

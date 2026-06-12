@@ -10,6 +10,7 @@ const MmapTrigramIndex = idx.MmapTrigramIndex;
 const AnyTrigramIndex = idx.AnyTrigramIndex;
 const SparseNgramIndex = idx.SparseNgramIndex;
 const codegraph = @import("codegraph.zig");
+const git = @import("git.zig");
 
 /// Fast hash context for u32-keyed maps on hot paths (ranked search aggregation).
 /// Zig's AutoHashMap runs the 4 key bytes through Wyhash even for an integer key;
@@ -225,13 +226,35 @@ pub const DependencyGraph = struct {
     forward: std.StringHashMap(std.ArrayList([]const u8)),
     reverse: std.StringHashMap(std.StringHashMap(void)),
     allocator: std.mem.Allocator,
+    /// Owns the resolved dependency strings the graph creates (e.g. relative
+    /// imports normalized to repo paths). Raw specifiers handed in by callers
+    /// are still borrowed; only graph-minted strings live here. Freed after the
+    /// maps in deinit, so map keys/values never outlive their backing bytes.
+    str_arena: std.heap.ArenaAllocator,
+    /// Dedup map for interned strings: resolved path -> its single arena-owned
+    /// copy. Re-resolving the same import (e.g. on every watcher reindex) reuses
+    /// that copy instead of growing the arena by a fresh allocation each time.
+    interned: std.StringHashMap([]const u8),
 
     pub fn init(allocator: std.mem.Allocator) DependencyGraph {
         return .{
             .forward = std.StringHashMap(std.ArrayList([]const u8)).init(allocator),
             .reverse = std.StringHashMap(std.StringHashMap(void)).init(allocator),
             .allocator = allocator,
+            .str_arena = std.heap.ArenaAllocator.init(allocator),
+            .interned = std.StringHashMap([]const u8).init(allocator),
         };
+    }
+
+    /// Intern a string into the graph-owned arena, returning a slice valid for
+    /// the lifetime of the graph. Repeated calls with the same content return
+    /// the same slice, so re-indexing a file does not leak a fresh copy per
+    /// import. Use for resolved paths that have no other owner.
+    pub fn internString(self: *DependencyGraph, s: []const u8) ![]const u8 {
+        if (self.interned.get(s)) |existing| return existing;
+        const owned = try self.str_arena.allocator().dupe(u8, s);
+        try self.interned.put(owned, owned);
+        return owned;
     }
 
     pub fn deinit(self: *DependencyGraph) void {
@@ -246,6 +269,11 @@ pub const DependencyGraph = struct {
             entry.value_ptr.deinit();
         }
         self.reverse.deinit();
+
+        // The interned map's keys/values live in str_arena; free the map
+        // structure, then the arena (which forward/reverse also borrow from).
+        self.interned.deinit();
+        self.str_arena.deinit();
     }
 
     pub fn setDeps(self: *DependencyGraph, path: []const u8, deps: std.ArrayList([]const u8)) !void {
@@ -301,6 +329,10 @@ pub const DependencyGraph = struct {
     }
 
     pub fn getImportedBy(self: *const DependencyGraph, path: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
+        return self.getImportedByFiltered(path, allocator, true);
+    }
+
+    pub fn getImportedByFiltered(self: *const DependencyGraph, path: []const u8, allocator: std.mem.Allocator, allow_basename: bool) ![]const []const u8 {
         // Extract basename for matching (e.g., "src/store.zig" -> "store.zig")
         const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
 
@@ -319,8 +351,10 @@ pub const DependencyGraph = struct {
             }
         }
 
-        // Also check basename match (imports often use short names)
-        if (!std.mem.eql(u8, path, basename)) {
+        // Basename fallback (imports often use short names). Skipped when the basename is
+        // ambiguous across indexed files (allow_basename=false): a bare `import conf`
+        // can't be attributed to a specific same-basename file (a/conf.py vs b/conf.py).
+        if (allow_basename and !std.mem.eql(u8, path, basename)) {
             if (self.reverse.get(basename)) |rev_set| {
                 var rev_iter = rev_set.keyIterator();
                 while (rev_iter.next()) |key_ptr| {
@@ -599,11 +633,123 @@ fn matchGlobRec(pattern: []const u8, gi_start: usize, path: []const u8, ti_start
     return ti == path.len;
 }
 
+/// Resolved call graph retained for path queries (#531). Node metadata slices
+/// borrow stable outline/symbol strings; edges and adjacency are owned.
+pub const CallGraph = struct {
+    edges: []codegraph.Edge,
+    adj: []std.ArrayList(codegraph.NodeId),
+    node_path: []const []const u8,
+    node_name: []const []const u8,
+    node_line: []const u32,
+
+    pub fn deinit(self: *CallGraph, allocator: std.mem.Allocator) void {
+        allocator.free(self.edges);
+        codegraph.freeAdjacency(allocator, self.adj);
+        allocator.free(self.node_path);
+        allocator.free(self.node_name);
+        allocator.free(self.node_line);
+    }
+};
+
+pub const CallPathStep = struct {
+    path: []const u8,
+    name: []const u8,
+    line: u32,
+};
+
+/// rVSM file-size prior (BugLocator — Zhou et al., ICSE 2012). IR-based fault
+/// localization shows the file a commit / bug report targets skews LARGE (core
+/// files), yet codedb's ranking penalizes long docs. This is an opt-in EXPERIMENT
+/// (research.md / todo.md P0): favor big *code* files via a multiplier on the
+/// rerank score. Off unless CODEDB_RVSM_SIZE_PRIOR is set; amp/slope tunable via
+/// CODEDB_RVSM_AMP (default 0.5) and CODEDB_RVSM_K (default 1.0). Size is the
+/// file's line_count (always present on the search path; word-index doc lengths
+/// are not — `search` runs with the word index disabled), normalized to the
+/// corpus average over code files. Doc-language files are excluded (multiplier
+/// 1.0) so a giant CHANGELOG can't ride the prior over the real code gold.
+const RvsmSizePrior = struct {
+    enabled: bool = false,
+    amp: f32 = 0.5,
+    k: f32 = 1.0,
+    avg_lines: f32 = 1.0,
+
+    fn envF32(name: []const u8, default_val: f32) f32 {
+        const v = cio.posixGetenv(name) orelse return default_val;
+        return std.fmt.parseFloat(f32, std.mem.trim(u8, v, " \t\r\n")) catch default_val;
+    }
+
+    fn fromEnv(ex: *const Explorer) RvsmSizePrior {
+        if (cio.posixGetenv("CODEDB_RVSM_SIZE_PRIOR") == null) return .{};
+        var total: u64 = 0;
+        var n: u64 = 0;
+        var it = ex.outlines.valueIterator();
+        while (it.next()) |o| {
+            if (o.line_count > 0 and !isDocLanguage(o.language)) {
+                total += o.line_count;
+                n += 1;
+            }
+        }
+        const avg: f32 = if (n == 0) 1.0 else @as(f32, @floatFromInt(total)) / @as(f32, @floatFromInt(n));
+        return .{
+            .enabled = true,
+            .amp = envF32("CODEDB_RVSM_AMP", 0.5),
+            .k = envF32("CODEDB_RVSM_K", 1.0),
+            .avg_lines = avg,
+        };
+    }
+
+    /// Multiplier centered at 1.0 for an average-length code file:
+    /// 1 + amp·tanh(k·(line_count/avg − 1)), in (1−amp, 1+amp). Monotonic in size.
+    fn multiplier(self: RvsmSizePrior, ex: *const Explorer, path: []const u8) f32 {
+        if (!self.enabled) return 1.0;
+        const o = ex.outlines.get(path) orelse return 1.0;
+        if (o.line_count == 0 or isDocLanguage(o.language)) return 1.0;
+        const x = @as(f32, @floatFromInt(o.line_count)) / self.avg_lines;
+        return 1.0 + self.amp * std.math.tanh(self.k * (x - 1.0));
+    }
+};
+
+/// File-frequency lexical penalty: down-weight files the query matches on MANY
+/// lines. A file the query saturates is usually a dispatcher, registry,
+/// re-export, or changelog — not the implementation the searcher wants, which is
+/// typically the file *named* after the concept (already lifted by the
+/// eponymy/stem boost in rerankSignalScore). This is codedb's analog of engram's
+/// learned negative-lexical weight (LEARNED_W lexical = -2). ON by default at amp
+/// 0.8 (tuned on the swe-lite retrieval sweep: 0.8 lifted a buried gold with no
+/// regressions, 0.95 over-penalized symbol-owner files whose gold is legitimately
+/// saturated). Disable with CODEDB_LEX_FREQ_PENALTY=0; override strength with
+/// CODEDB_LEX_FREQ_AMP. The multiplier is 1.0 for the least-matched file and
+/// 1-amp for the most-matched, linear in normalized match-line count — it only
+/// reorders among comparably-scored files and rarely overturns a strong
+/// eponymy/symbol hit.
+const LexFreqPenalty = struct {
+    enabled: bool = true,
+    amp: f32 = 0.8,
+
+    fn fromEnv() LexFreqPenalty {
+        if (cio.posixGetenv("CODEDB_LEX_FREQ_PENALTY")) |v| {
+            if (std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "off"))
+                return .{ .enabled = false };
+        }
+        return .{ .enabled = true, .amp = RvsmSizePrior.envF32("CODEDB_LEX_FREQ_AMP", 0.8) };
+    }
+
+    /// cnt = match-line count for this file; max_count = the largest such count
+    /// in the result set. Returns 1.0 when disabled or when every file ties
+    /// (max_count <= 1) — nothing to discriminate.
+    fn multiplier(self: LexFreqPenalty, cnt: u32, max_count: u32) f32 {
+        if (!self.enabled or max_count <= 1) return 1.0;
+        const norm = @as(f32, @floatFromInt(cnt - 1)) / @as(f32, @floatFromInt(max_count - 1));
+        return 1.0 - self.amp * norm;
+    }
+};
 pub const Explorer = struct {
     outlines: std.StringHashMap(FileOutline),
     dep_graph: DependencyGraph,
     contents: ContentCache,
     symbol_index: std.StringHashMap(std.ArrayList(SymbolLocation)),
+    /// False after a snapshot fast-load until ensureSymbolIndex runs (#564).
+    symbol_index_complete: bool,
     word_index: WordIndex,
     trigram_index: AnyTrigramIndex,
     /// Paths indexed with skip_trigram=true (past 15k cap or excluded).
@@ -619,13 +765,27 @@ pub const Explorer = struct {
     /// merge them after the commit loop (see watcher.initialScanWithWorkerCount).
     defer_word_index: bool = false,
     mu: cio.RwLock = .{},
-    /// Per-file "call centrality" (summed weighted in-degree of the file's
-    /// functions in the resolved call graph). Built lazily, used as an additive
+    /// Per-file call-graph centrality (PageRank by default, or in-degree when
+    /// CODEDB_IN_DEGREE_CENTRALITY is set). Built lazily, used as an additive
     /// ranking boost in searchContentRanked. Null until built; guarded by
     /// centrality_build_mu. Keys are borrowed `outlines` keys (stable).
     call_centrality: ?std.StringHashMap(f32) = null,
+    /// Retained resolved call graph (edges + adjacency + per-node metadata) for
+    /// codedb_callpath. Built lazily alongside centrality; may be rebuilt after a
+    /// snapshot load that restored centrality without edges.
+    call_graph: ?CallGraph = null,
     centrality_build_mu: cio.Mutex = .{},
     root_dir: ?std.Io.Dir = null,
+    /// Absolute project root path (duped in setRoot) — needed to shell out to
+    /// git for the co-change map (#550).
+    root_path: ?[]const u8 = null,
+    /// file → strongest git co-change partners (#550). Built lazily from
+    /// `git log --name-only`; null until built (or unavailable: no root, not
+    /// a repo). Guarded by cochange_build_mu; attempted-flag stops re-shelling
+    /// when git is absent.
+    co_change: ?std.StringHashMap([]git.CoChangePartner) = null,
+    co_change_attempted: bool = false,
+    cochange_build_mu: cio.Mutex = .{},
     io: ?std.Io = null,
     /// When non-null, append one JSON line per searchContent invocation
     /// to this path (v0 rerank-trace experiment). Borrowed; caller owns
@@ -658,14 +818,22 @@ pub const Explorer = struct {
     pub fn setRoot(self: *Explorer, io: std.Io, root_path: []const u8) void {
         self.io = io;
         self.root_dir = std.Io.Dir.cwd().openDir(io, root_path, .{}) catch null;
+        if (self.root_path) |old| self.allocator.free(old);
+        self.root_path = self.allocator.dupe(u8, root_path) catch null;
     }
 
     pub fn init(allocator: std.mem.Allocator, content_cache_capacity: u32) Explorer {
+        return initFallible(allocator, content_cache_capacity) catch
+            std.debug.panic("Explorer.init: OOM allocating {d} content cache slots", .{content_cache_capacity});
+    }
+
+    fn initFallible(allocator: std.mem.Allocator, content_cache_capacity: u32) !Explorer {
         return .{
             .outlines = std.StringHashMap(FileOutline).init(allocator),
             .dep_graph = DependencyGraph.init(allocator),
-            .contents = ContentCache.init(allocator, content_cache_capacity),
+            .contents = try ContentCache.initAlloc(allocator, content_cache_capacity),
             .symbol_index = std.StringHashMap(std.ArrayList(SymbolLocation)).init(allocator),
+            .symbol_index_complete = true,
             .word_index = WordIndex.init(allocator),
             .trigram_index = .{ .heap = TrigramIndex.init(allocator) },
             .skip_trigram_files = std.StringHashMap(void).init(allocator),
@@ -685,12 +853,16 @@ pub const Explorer = struct {
 
         var sym_iter = self.symbol_index.iterator();
         while (sym_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.deinit(self.allocator);
         }
         self.symbol_index.deinit();
 
         self.contents.deinit();
         if (self.call_centrality) |*c| c.deinit();
+        if (self.call_graph) |*cg| cg.deinit(self.allocator);
+        if (self.co_change) |*cc| git.freeCoChange(cc, self.allocator);
+        if (self.root_path) |p| self.allocator.free(p);
 
         self.word_index.deinit();
         self.trigram_index.deinit();
@@ -701,7 +873,7 @@ pub const Explorer = struct {
         // munmap'd after contents.deinit (above): the cache holds borrowed slices
         // into these maps, but deinit skips freeing borrowed values, so the maps
         // are still valid through it and only released here.
-        for (self.content_section_maps.items) |m| std.posix.munmap(m);
+        for (self.content_section_maps.items) |m| cio.unmapFileRead(self.allocator, m);
         self.content_section_maps.deinit(self.allocator);
         if (self.root_dir) |d| {
             if (self.io) |io| d.close(io);
@@ -714,10 +886,49 @@ pub const Explorer = struct {
         try self.outline_section_bufs.append(self.allocator, buf);
     }
 
+    pub fn outlineSectionMark(self: *const Explorer) usize {
+        return self.outline_section_bufs.items.len;
+    }
+
+    pub fn releaseOutlineSectionsFrom(self: *Explorer, mark: usize) void {
+        while (self.outline_section_bufs.items.len > mark) {
+            const buf = self.outline_section_bufs.pop().?;
+            self.allocator.free(buf);
+        }
+    }
+
     /// Take ownership of an mmap'd snapshot content section that the ContentCache
     /// borrows (value_owned=false) slices from. munmap'd at deinit.
     pub fn adoptContentSection(self: *Explorer, map: []align(std.heap.page_size_min) const u8) !void {
         try self.content_section_maps.append(self.allocator, map);
+    }
+
+    pub fn contentSectionMark(self: *const Explorer) usize {
+        return self.content_section_maps.items.len;
+    }
+
+    pub fn releaseContentSectionsFrom(self: *Explorer, mark: usize) void {
+        while (self.content_section_maps.items.len > mark) {
+            const map = self.content_section_maps.pop().?;
+            cio.unmapFileRead(self.allocator, map);
+        }
+    }
+
+    fn invalidateCallGraphLocked(self: *Explorer) void {
+        if (self.call_centrality) |*c| {
+            c.deinit();
+            self.call_centrality = null;
+        }
+        if (self.call_graph) |*cg| {
+            cg.deinit(self.allocator);
+            self.call_graph = null;
+        }
+    }
+
+    pub fn invalidateCallGraph(self: *Explorer) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.invalidateCallGraphLocked();
     }
 
     /// Number of slots in the heap trigram index id_to_path array (benchmark helper).
@@ -762,8 +973,12 @@ pub const Explorer = struct {
 
     pub fn commitParsedFileOwnedOutline(self: *Explorer, path: []const u8, content: []const u8, outline: FileOutline, full_index: bool, skip_trigram: bool) !void {
         var owned_outline = outline;
-        errdefer owned_outline.deinit();
-        var persistent_outline = try cloneOutline(&owned_outline, self.allocator);
+        // One deinit only: an errdefer here would stack with the defer below
+        // and double-free the parsed outline on any post-clone error.
+        var persistent_outline = cloneOutline(&owned_outline, self.allocator) catch |err| {
+            owned_outline.deinit();
+            return err;
+        };
         defer owned_outline.deinit();
         errdefer persistent_outline.deinit();
         if (persistent_outline.owns_path) {
@@ -795,20 +1010,27 @@ pub const Explorer = struct {
         persistent_outline.path = stable_path;
 
         const prior_content = self.contents.get(stable_path);
-        try self.contents.put(stable_path, content);
+        // Any failure below must put the word index back the way it was —
+        // indexFile wipes the old postings before adding new ones, and search
+        // serves whatever the postings say. prior_content stays valid through
+        // every fallible step because contents.put runs last.
+        errdefer if (full_index and !self.defer_word_index) {
+            if (prior_content) |old| {
+                self.word_index.indexFile(stable_path, old) catch {};
+            } else {
+                self.word_index.removeFile(stable_path);
+            }
+        };
 
         if (full_index) {
+            // A disabled word index (cold CLI scan keeps it off to save memory)
+            // can't absorb this file, so it no longer reflects the indexed set —
+            // ranked/BM25 readers must lazy-rebuild instead of trusting it (#546).
+            if (!self.word_index.enabled) self.word_index_complete = false;
             if (!self.word_index_complete) {
                 self.word_index_can_load_from_disk = false;
             }
             if (!self.defer_word_index) try self.word_index.indexFile(stable_path, content);
-            // If trigram indexing fails below, restore word_index to its previous state
-            // to prevent word_index and trigram_index from diverging.
-            errdefer if (prior_content) |old| {
-                self.word_index.indexFile(stable_path, old) catch {};
-            } else {
-                self.word_index.removeFile(stable_path);
-            };
             if (self.word_index_complete) {
                 self.word_index_generation +%= 1;
             }
@@ -841,6 +1063,11 @@ pub const Explorer = struct {
 
         try self.rebuildDepsFor(stable_path, &persistent_outline);
         self.rebuildSymbolIndexFor(stable_path, &persistent_outline, !is_new);
+        self.invalidateCallGraphLocked();
+
+        // Last fallible step: put frees the prior cache value in place, so it
+        // must run only once nothing after it can still need prior_content.
+        try self.contents.put(stable_path, content);
 
         outline_gop.value_ptr.* = persistent_outline;
         if (prior_outline) |*old_outline| old_outline.deinit();
@@ -1234,7 +1461,10 @@ pub const Explorer = struct {
     }
 
     pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, content: []const u8) !ParsedFile {
-        var parser = Explorer.init(allocator, DEFAULT_CONTENT_CACHE_CAPACITY);
+        // A parser shell only carries the allocator into the parse methods: a
+        // 1-slot cache keeps the per-file cost flat, and OOM here must surface
+        // as an error, not ContentCache.init's daemon-killing panic.
+        var parser = try Explorer.initFallible(allocator, 1);
         defer parser.deinit();
         var parsed_outline = try parseOutlineWithParser(&parser, path, content);
         defer parsed_outline.deinit();
@@ -1343,6 +1573,35 @@ pub const Explorer = struct {
         self.word_index_persisted_generation = self.word_index_generation;
     }
 
+    /// Snapshot fast-load defers the global symbol index — plain content
+    /// search never reads it, so one-shot CLI queries skip ~symbols-per-file
+    /// map inserts and their heap (#564). rebuildSymbolIndexFor no-ops while
+    /// incomplete; ensureSymbolIndex builds it on first symbol/caller use.
+    pub fn markSymbolIndexIncomplete(self: *Explorer) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.symbol_index_complete = false;
+    }
+
+    /// Build the global symbol index from outlines if a snapshot fast-load
+    /// deferred it (#564). Cheap when complete (one flag check). Mirrors the
+    /// lazy word-index rebuild: call BEFORE taking the shared lock — this
+    /// takes the exclusive lock itself.
+    pub fn ensureSymbolIndex(self: *Explorer) void {
+        self.mu.lockShared();
+        const incomplete = !self.symbol_index_complete;
+        self.mu.unlockShared();
+        if (!incomplete) return;
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.symbol_index_complete) return;
+        self.symbol_index_complete = true;
+        var it = self.outlines.iterator();
+        while (it.next()) |entry| {
+            self.rebuildSymbolIndexFor(entry.key_ptr.*, entry.value_ptr, false);
+        }
+    }
+
     pub fn disableWordIndexDiskLoad(self: *Explorer) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -1406,9 +1665,11 @@ pub const Explorer = struct {
         }
         self.dep_graph.remove(path);
         self.removeSymbolIndexFor(path);
+        _ = self.skip_trigram_files.remove(path);
         self.contents.remove(path);
         self.word_index.removeFile(path);
         self.trigram_index.removeFile(path);
+        self.invalidateCallGraphLocked();
 
         if (self.outlines.fetchRemove(path)) |kv| {
             var outline = kv.value;
@@ -1600,7 +1861,7 @@ pub const Explorer = struct {
         }
         const io = self.io orelse return null;
         const dir = self.root_dir orelse std.Io.Dir.cwd();
-        const data = dir.readFileAlloc(io, path, allocator, .limited(512 * 1024)) catch return null;
+        const data = dir.readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024)) catch return null;
         return .{ .data = data, .owned = true, .allocator = allocator };
     }
 
@@ -1753,6 +2014,7 @@ pub const Explorer = struct {
     }
 
     pub fn findSymbol(self: *Explorer, name: []const u8, allocator: std.mem.Allocator) !?struct { path: []const u8, symbol: Symbol } {
+        self.ensureSymbolIndex();
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -1805,6 +2067,7 @@ pub const Explorer = struct {
     }
 
     pub fn findAllSymbols(self: *Explorer, name: []const u8, allocator: std.mem.Allocator) ![]const SymbolResult {
+        self.ensureSymbolIndex();
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -1862,6 +2125,161 @@ pub const Explorer = struct {
             }
         }
         return result_list.toOwnedSlice(allocator);
+    }
+
+    pub const SymbolSearchSpec = struct {
+        name: ?[]const u8 = null,
+        prefix: ?[]const u8 = null,
+        pattern: ?[]const u8 = null,
+        kind: ?SymbolKind = null,
+        fuzzy: bool = false,
+        max_results: usize = 50,
+    };
+
+    pub const ScoredSymbolResult = struct {
+        path: []const u8,
+        symbol: Symbol,
+        score: f32,
+    };
+
+    pub fn parseSymbolKind(s: []const u8) ?SymbolKind {
+        if (std.mem.eql(u8, s, "interface")) return .interface_def;
+        if (std.mem.eql(u8, s, "struct")) return .struct_def;
+        if (std.mem.eql(u8, s, "enum")) return .enum_def;
+        if (std.mem.eql(u8, s, "method")) return .method;
+        if (std.mem.eql(u8, s, "function")) return .function;
+        if (std.mem.eql(u8, s, "class")) return .class_def;
+        return std.meta.stringToEnum(SymbolKind, s);
+    }
+
+    pub fn skipTrigramFileCount(self: *Explorer) usize {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        return self.skip_trigram_files.count();
+    }
+
+    fn symbolMatchScore(spec: SymbolSearchSpec, name: []const u8) ?f32 {
+        const has_name = spec.name != null or spec.prefix != null or spec.pattern != null or spec.fuzzy;
+        if (!has_name) return 1.0;
+        if (spec.name) |n| {
+            if (spec.fuzzy) return fuzzyScore(n, name);
+            if (!std.mem.eql(u8, name, n)) return null;
+            return 1.0;
+        }
+        if (spec.prefix) |p| {
+            if (!std.mem.startsWith(u8, name, p)) return null;
+            return 0.95;
+        }
+        if (spec.pattern) |pat| {
+            if (!matchGlob(pat, name)) return null;
+            return 0.9;
+        }
+        return null;
+    }
+
+    pub fn searchSymbols(self: *Explorer, spec: SymbolSearchSpec, allocator: std.mem.Allocator) ![]ScoredSymbolResult {
+        self.ensureSymbolIndex();
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        var list: std.ArrayList(ScoredSymbolResult) = .empty;
+        errdefer {
+            for (list.items) |r| {
+                allocator.free(r.path);
+                allocator.free(r.symbol.name);
+                if (r.symbol.detail) |d| allocator.free(d);
+            }
+            list.deinit(allocator);
+        }
+
+        const Dedup = struct {
+            fn contains(items: []const ScoredSymbolResult, path: []const u8, line: u32) bool {
+                for (items) |r| {
+                    if (r.symbol.line_start == line and std.mem.eql(u8, r.path, path)) return true;
+                }
+                return false;
+            }
+        };
+
+        const appendOne = struct {
+            fn call(
+                list_ptr: *std.ArrayList(ScoredSymbolResult),
+                alloc: std.mem.Allocator,
+                path: []const u8,
+                sym: Symbol,
+                score: f32,
+            ) !void {
+                if (Dedup.contains(list_ptr.items, path, sym.line_start)) return;
+                try list_ptr.append(alloc, .{
+                    .path = try alloc.dupe(u8, path),
+                    .symbol = .{
+                        .name = try alloc.dupe(u8, sym.name),
+                        .kind = sym.kind,
+                        .line_start = sym.line_start,
+                        .line_end = sym.line_end,
+                        .detail = if (sym.detail) |d| try alloc.dupe(u8, d) else null,
+                    },
+                    .score = score,
+                });
+            }
+        }.call;
+
+        var sym_iter = self.symbol_index.iterator();
+        while (sym_iter.next()) |entry| {
+            const sym_name = entry.key_ptr.*;
+            const score = symbolMatchScore(spec, sym_name) orelse continue;
+            for (entry.value_ptr.items) |loc| {
+                if (spec.kind) |k| if (loc.kind != k) continue;
+                var detail: ?[]const u8 = null;
+                if (self.outlines.getPtr(loc.path)) |outline| {
+                    for (outline.symbols.items) |sym| {
+                        if (sym.line_start == loc.line_start and std.mem.eql(u8, sym.name, sym_name)) {
+                            detail = sym.detail;
+                            break;
+                        }
+                    }
+                }
+                try appendOne(&list, allocator, loc.path, .{
+                    .name = sym_name,
+                    .kind = loc.kind,
+                    .line_start = loc.line_start,
+                    .line_end = loc.line_end,
+                    .detail = detail,
+                }, score);
+            }
+        }
+
+        // Collect ALL candidates before sorting — capping during collection
+        // would keep whichever matches hash-map iteration order surfaced
+        // first, not the best-scored ones. The cap applies after the sort.
+        var ol_iter = self.outlines.iterator();
+        while (ol_iter.next()) |entry| {
+            for (entry.value_ptr.symbols.items) |sym| {
+                const score = symbolMatchScore(spec, sym.name) orelse continue;
+                if (spec.kind) |k| if (sym.kind != k) continue;
+                if (Dedup.contains(list.items, entry.key_ptr.*, sym.line_start)) continue;
+                try appendOne(&list, allocator, entry.key_ptr.*, sym, score);
+            }
+        }
+
+        const SortCtx = struct {
+            pub fn lessThan(_: void, a: ScoredSymbolResult, b: ScoredSymbolResult) bool {
+                if (a.score != b.score) return a.score > b.score;
+                const name_cmp = std.mem.order(u8, a.symbol.name, b.symbol.name);
+                if (name_cmp != .eq) return name_cmp == .lt;
+                return std.mem.order(u8, a.path, b.path) == .lt;
+            }
+        };
+        std.mem.sort(ScoredSymbolResult, list.items, {}, SortCtx.lessThan);
+        if (list.items.len > spec.max_results) {
+            for (list.items[spec.max_results..]) |r| {
+                allocator.free(r.path);
+                allocator.free(r.symbol.name);
+                if (r.symbol.detail) |d| allocator.free(d);
+            }
+            list.shrinkRetainingCapacity(spec.max_results);
+        }
+        return list.toOwnedSlice(allocator);
     }
 
     // Resolve an exact symbol name to its definition sites for codedb_find's
@@ -1929,6 +2347,7 @@ pub const Explorer = struct {
         max: usize,
     ) ![]CalleeRef {
         if (max == 0 or line_end < line_start) return &.{};
+        self.ensureSymbolIndex();
         const content = (self.getContent(path, allocator) catch return &.{}) orelse return &.{};
         const body = sliceLineRange(content, line_start, line_end);
         if (body.len == 0) return &.{};
@@ -2002,20 +2421,18 @@ pub const Explorer = struct {
     /// name-only resolution. Conservative: only the highest-collision names.
     fn isUbiquitousName(name: []const u8) bool {
         const common = [_][]const u8{
-            "init",        "deinit",   "append",   "get",       "set",
-            "put",         "getOrPut", "remove",   "contains",  "has",
-            "count",       "len",      "items",    "alloc",     "free",
-            "create",      "destroy",  "lock",     "unlock",    "tryLock",
-            "next",        "iterator", "clone",    "dupe",      "slice",
-            "reset",       "clear",    "format",   "hash",      "eql",
-            "write",       "writeAll", "print",    "read",      "close",
-            "open",        "value",    "key",      "toOwnedSlice", "pop",
-            "push",        "find",     "add",      "new",       "build",
-            "run",         "deinit",   "toString", "valueOf",   "of",
+            "init",   "deinit",   "append",   "get",          "set",
+            "put",    "getOrPut", "remove",   "contains",     "has",
+            "count",  "len",      "items",    "alloc",        "free",
+            "create", "destroy",  "lock",     "unlock",       "tryLock",
+            "next",   "iterator", "clone",    "dupe",         "slice",
+            "reset",  "clear",    "format",   "hash",         "eql",
+            "write",  "writeAll", "print",    "read",         "close",
+            "open",   "value",    "key",      "toOwnedSlice", "pop",
+            "push",   "find",     "add",      "new",          "build",
+            "run",    "deinit",   "toString", "valueOf",      "of",
         };
-        for (common) |c| {
-            if (std.mem.eql(u8, name, c)) return true;
-        }
+        for (common) |c| if (std.mem.eql(u8, name, c)) return true;
         return false;
     }
 
@@ -2040,6 +2457,7 @@ pub const Explorer = struct {
         return content[start..i];
     }
     pub fn renderSymbols(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !bool {
+        self.ensureSymbolIndex();
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -2095,10 +2513,25 @@ pub const Explorer = struct {
     }
 
     pub fn searchContent(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+        // #550: the graph-distance gate in rerankAndFinalize reads
+        // symbol_index, which a snapshot fast-load defers (#564). Identifier-
+        // shaped queries ensure it here, pre-shared-lock — ensureSymbolIndex
+        // takes the exclusive lock itself.
+        if (max_results > 0 and queryNamesIdentifier(query) and
+            cio.posixGetenv("CODEDB_NO_CENTRALITY") == null and
+            cio.posixGetenv("CODEDB_NO_GRAPH_DISTANCE") == null)
+        {
+            self.ensureSymbolIndex();
+        }
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
         if (max_results == 0) return try allocator.alloc(SearchResult, 0);
+        const reserve_skip_trigram_quota = !self.word_index_complete and self.skip_trigram_files.count() > 0;
+        const primary_tier_limit = if (reserve_skip_trigram_quota and max_results > 1)
+            max_results - 1
+        else
+            max_results;
 
         var breakdown: SearchBreakdown = .{};
         defer self.last_search_breakdown = breakdown;
@@ -2113,10 +2546,12 @@ pub const Explorer = struct {
 
         // Tier 0: word index direct lookup — O(1) hash lookup plus bounded
         // content extraction. A per-file cap forces diversity so a single hot
-        // file cannot saturate the quota. Code files are considered before
-        // docs, and files with more exact word hits are considered first so
-        // popular identifiers and skip-trigram canonical files are not hidden
-        // behind earlier low-signal posting-list entries.
+        // file cannot saturate the quota. Files that DEFINE a symbol named by
+        // the query are considered first (#546: mention-dense test files used
+        // to eat the whole file budget, so the defining file never even became
+        // a candidate for the reranker), then code before docs, then files
+        // with more exact word hits so popular identifiers and skip-trigram
+        // canonical files are not hidden behind low-signal posting entries.
         const t0_start = cio.nanoTimestamp();
         const word_hits = self.word_index.search(query);
         if (word_hits.len > 0) {
@@ -2125,6 +2560,7 @@ pub const Explorer = struct {
                 count: u32,
                 first_seen: usize,
                 is_doc: bool,
+                defines: bool,
             };
 
             var tier0_files_by_path = std.StringHashMap(Tier0File).init(allocator);
@@ -2135,11 +2571,14 @@ pub const Explorer = struct {
                 if (hit_path.len == 0) continue;
                 const gop = tier0_files_by_path.getOrPut(hit_path) catch continue;
                 if (!gop.found_existing) {
+                    const is_doc = isDocLanguage(detectLanguage(hit_path));
+                    const defines = !is_doc and self.fileDefinesSymbol(hit_path, query);
                     gop.value_ptr.* = .{
                         .path = hit_path,
                         .count = 0,
                         .first_seen = ordinal,
-                        .is_doc = isDocLanguage(detectLanguage(hit_path)),
+                        .is_doc = is_doc,
+                        .defines = defines,
                     };
                 }
                 gop.value_ptr.count +|= 1;
@@ -2157,6 +2596,7 @@ pub const Explorer = struct {
                 std.sort.block(Tier0File, tier0_files.items, {}, struct {
                     pub fn lessThan(_: void, a: Tier0File, b: Tier0File) bool {
                         if (a.is_doc != b.is_doc) return !a.is_doc;
+                        if (a.defines != b.defines) return a.defines;
                         if (a.count != b.count) return a.count > b.count;
                         if (a.first_seen != b.first_seen) return a.first_seen < b.first_seen;
                         return std.mem.lessThan(u8, a.path, b.path);
@@ -2164,15 +2604,15 @@ pub const Explorer = struct {
                 }.lessThan);
             }
 
-            const tier0_per_file_cap: usize = if (tier0_files.items.len <= 1) max_results else @max(1, max_results / 5);
+            const tier0_per_file_cap: usize = if (tier0_files.items.len <= 1) primary_tier_limit else @max(1, primary_tier_limit / 5);
             var tier0_exact_capacity: usize = 0;
             for (tier0_files.items) |stats| {
                 tier0_exact_capacity += @min(@as(usize, stats.count), tier0_per_file_cap);
-                if (tier0_exact_capacity >= max_results) break;
+                if (tier0_exact_capacity >= primary_tier_limit) break;
             }
-            const use_line_hits = tier0_exact_capacity >= max_results and tier0_per_file_cap <= 256;
+            const use_line_hits = tier0_exact_capacity >= primary_tier_limit and tier0_per_file_cap <= 256;
             for (tier0_files.items) |stats| {
-                if (result_list.items.len >= max_results) break;
+                if (result_list.items.len >= primary_tier_limit) break;
                 const ref = self.readContentForSearch(stats.path, allocator) orelse continue;
                 defer ref.deinit();
                 if (use_line_hits) {
@@ -2187,24 +2627,30 @@ pub const Explorer = struct {
                             target_count += 1;
                         }
                     }
-                    try appendTargetLineHits(stats.path, ref.data, allocator, target_lines[0..target_count], max_results, &result_list);
-                    if (result_list.items.len < max_results) searched.put(stats.path, {}) catch {};
+                    try appendTargetLineHits(stats.path, ref.data, allocator, target_lines[0..target_count], primary_tier_limit, &result_list);
+                    if (reserve_skip_trigram_quota or result_list.items.len < primary_tier_limit) searched.put(stats.path, {}) catch {};
                 } else {
                     searched.put(stats.path, {}) catch {};
-                    try searchInContent(stats.path, ref.data, query, allocator, tier0_per_file_cap, max_results, &result_list);
+                    try searchInContent(stats.path, ref.data, query, allocator, tier0_per_file_cap, primary_tier_limit, &result_list);
                 }
             }
-            if (result_list.items.len >= max_results) {
+            if (result_list.items.len >= primary_tier_limit) {
                 breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
                 breakdown.tier_reached = 0;
                 breakdown.result_count = @intCast(result_list.items.len);
-                if (use_line_hits) {
+                if (reserve_skip_trigram_quota) {
+                    // Keep one result slot open for restored/outline-only files in
+                    // Tier 3. A partial word index can contain newly hot files only;
+                    // returning here would starve snapshot-restored files and
+                    // rebuilding the full index here regresses warm search latency.
+                } else if (use_line_hits) {
                     return result_list.toOwnedSlice(allocator);
+                } else {
+                    const t_rerank = cio.nanoTimestamp();
+                    const res = self.rerankAndFinalize(&result_list, query, allocator);
+                    breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
+                    return res;
                 }
-                const t_rerank = cio.nanoTimestamp();
-                const res = self.rerankAndFinalize(&result_list, query, allocator);
-                breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
-                return res;
             }
         }
         breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
@@ -2286,11 +2732,12 @@ pub const Explorer = struct {
                     if (searched.contains(path)) continue;
                     const ref = self.readContentForSearch(path, allocator) orelse continue;
                     defer ref.deinit();
-                    try searchInContent(path, ref.data, query, allocator, max_per_file, max_results, &result_list);
-                    if (result_list.items.len >= max_results) {
+                    try searchInContent(path, ref.data, query, allocator, max_per_file, primary_tier_limit, &result_list);
+                    if (result_list.items.len >= primary_tier_limit) {
                         breakdown.tier1_ns = cio.nanoTimestamp() - t1_start;
                         breakdown.tier_reached = 2;
                         breakdown.result_count = @intCast(result_list.items.len);
+                        if (reserve_skip_trigram_quota) break;
                         const t_rerank = cio.nanoTimestamp();
                         const res = self.rerankAndFinalize(&result_list, query, allocator);
                         breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
@@ -2424,14 +2871,41 @@ pub const Explorer = struct {
         if (tier0_files_len == 0) return false;
         const tier0_files = tier0_files_buf[0..tier0_files_len];
         if (tier0_files.len > 1) {
-            std.sort.block(Tier0File, tier0_files, {}, struct {
-                pub fn lessThan(_: void, a: Tier0File, b: Tier0File) bool {
+            const RankCtx = struct {
+                query: []const u8,
+                // Path-prior portion of rerankSignalScore: the canonical-file signals
+                // (basename-stem match, path segment) and demotion penalties. Without it
+                // this fast-path rendered in raw hit-count order, so a high-frequency
+                // non-canonical file outranked the canonical basename match.
+                fn prior(path: []const u8, q: []const u8) f32 {
+                    const base = std.fs.path.basename(path);
+                    const stem_end = std.mem.indexOfScalar(u8, base, '.') orelse base.len;
+                    const stem = base[0..stem_end];
+                    var s: f32 = 0;
+                    if (asciiEqlIgnoreCase(stem, q)) {
+                        s += 15.0;
+                    } else if (asciiContainsIgnoreCase(stem, q) or asciiContainsIgnoreCase(q, stem)) {
+                        s += 8.0;
+                    } else if (pathHasSegmentIgnoreCase(path, q)) {
+                        s += 6.0;
+                    }
+                    if (pathHasSegment(path, "tests") or pathHasSegment(path, "test")) s *= 0.6;
+                    if (pathHasSegment(path, "examples") or pathHasSegment(path, "example")) s *= 0.6;
+                    if (pathHasSegment(path, "vendor") or pathHasSegment(path, "node_modules") or
+                        pathHasSegment(path, "third_party")) s *= 0.4;
+                    return s;
+                }
+                pub fn lessThan(ctx: @This(), a: Tier0File, b: Tier0File) bool {
+                    const pa = prior(a.path, ctx.query);
+                    const pb = prior(b.path, ctx.query);
+                    if (pa != pb) return pa > pb;
                     if (a.is_doc != b.is_doc) return !a.is_doc;
                     if (a.count != b.count) return a.count > b.count;
                     if (a.first_seen != b.first_seen) return a.first_seen < b.first_seen;
                     return std.mem.lessThan(u8, a.path, b.path);
                 }
-            }.lessThan);
+            };
+            std.sort.block(Tier0File, tier0_files, RankCtx{ .query = query }, RankCtx.lessThan);
         }
 
         const tier0_per_file_cap: usize = if (tier0_files.len <= 1) max_results else @max(1, max_results / 5);
@@ -2545,13 +3019,65 @@ pub const Explorer = struct {
     /// final return) gets the same ranking — pre-fix only the fall-through
     /// path applied multi-signal scoring.
     fn rerankAndFinalize(
-        self: *const Explorer,
+        self: *Explorer,
         result_list: *std.ArrayList(SearchResult),
         query: []const u8,
         allocator: std.mem.Allocator,
     ) ![]const SearchResult {
+        const sp = RvsmSizePrior.fromEnv(self);
+        const lfp = LexFreqPenalty.fromEnv();
+
+        // The file-frequency penalty (engram's negative-lexical signal) needs the
+        // per-file match-line count across the whole result set, so tally it up
+        // front. Built only when the experiment is enabled — zero cost otherwise.
+        var file_hit_counts = std.StringHashMap(u32).init(allocator);
+        defer file_hit_counts.deinit();
+        var max_file_hits: u32 = 0;
+        if (lfp.enabled) {
+            for (result_list.items) |r| {
+                const gop = try file_hit_counts.getOrPut(r.path);
+                gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+                if (gop.value_ptr.* > max_file_hits) max_file_hits = gop.value_ptr.*;
+            }
+        }
+
+        // #550: a single-token query that exactly names a known symbol gets the
+        // call-graph distance boost here too (the multi-word BM25 path applies
+        // it in searchContentRanked). The symbol_index gate keeps plain word
+        // queries from ever paying for a graph build.
+        var gd_arena = std.heap.ArenaAllocator.init(allocator);
+        defer gd_arena.deinit();
+        var graph_dist: ?std.StringHashMap(u8) = null;
+        if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null and
+            cio.posixGetenv("CODEDB_NO_GRAPH_DISTANCE") == null and
+            (self.call_graph != null or self.symbol_index.contains(query)))
+        {
+            self.ensureCallGraph(allocator);
+            const ga = gd_arena.allocator();
+            var gd_terms = std.StringHashMap(void).init(ga);
+            gd_terms.put(query, {}) catch {};
+            graph_dist = self.queryGraphDistances(&gd_terms, ga);
+        }
+
+        // #550 signal 2: git co-change. Seeds are the result files that
+        // DEFINE the queried symbol, so plain word queries never trigger the
+        // one-time `git log` shell-out.
+        var cc_seeds = std.StringHashMap(void).init(allocator);
+        defer cc_seeds.deinit();
+        if (cio.posixGetenv("CODEDB_NO_COCHANGE") == null) {
+            for (result_list.items) |r| {
+                if (cc_seeds.contains(r.path)) continue;
+                if (self.fileDefinesSymbol(r.path, query)) cc_seeds.put(r.path, {}) catch {};
+            }
+            if (cc_seeds.count() > 0) self.ensureCoChange();
+        }
+
         for (result_list.items) |*r| {
             r.score = self.rerankSignalScore(r.*, query);
+            r.score *= graphDistanceBoost(graph_dist, r.path);
+            r.score *= self.coChangeBoost(&cc_seeds, r.path);
+            if (lfp.enabled) r.score *= lfp.multiplier(file_hit_counts.get(r.path) orelse 1, max_file_hits);
+            if (sp.enabled) r.score *= sp.multiplier(self, r.path);
         }
         if (result_list.items.len > 1) {
             std.sort.block(SearchResult, result_list.items, {}, struct {
@@ -2572,6 +3098,17 @@ pub const Explorer = struct {
     /// Compose the rerank signals for one search hit (issue #429).
     fn rerankSignalScore(self: *const Explorer, r: SearchResult, query: []const u8) f32 {
         var score: f32 = countOccurrences(r.line_text, query);
+
+        // #598: mention-dense tooling files (a bench script repeating the term
+        // six times per line) saturate the per-line count and shrug off the
+        // ×0.5 path prior below. Cap the occurrence BASE for tooling paths
+        // before the stem/symbol boosts so density cannot dominate, while an
+        // eponymous lookup (query 'install' → install/install.sh) still wins
+        // through its +15 stem boost.
+        const is_tooling_path = pathHasSegment(r.path, "bench") or pathHasSegment(r.path, "benchmarks") or
+            pathHasSegment(r.path, "scripts") or pathHasSegment(r.path, "website") or
+            pathHasSegment(r.path, "install");
+        if (is_tooling_path) score = @min(score, 2.0);
 
         if (self.outlines.get(r.path)) |outline| {
             for (outline.symbols.items) |sym| {
@@ -2602,8 +3139,14 @@ pub const Explorer = struct {
             score += 6.0;
         }
 
-        if (pathHasSegment(r.path, "tests") or pathHasSegment(r.path, "test")) score *= 0.6;
+        // #580: match BM25's pathRelevanceMultiplier — test files identified by
+        // BASENAME (tests.zig, test_*.zig, *_tests.zig) are tests even without
+        // a test/ directory segment.
+        const is_test_file = pathHasSegment(r.path, "tests") or pathHasSegment(r.path, "test") or
+            std.mem.startsWith(u8, basename, "test") or std.mem.indexOf(u8, basename, "_test") != null;
+        if (is_test_file) score *= 0.6;
         if (pathHasSegment(r.path, "examples") or pathHasSegment(r.path, "example")) score *= 0.6;
+        if (is_tooling_path) score *= 0.5;
         if (pathHasSegment(r.path, "vendor") or pathHasSegment(r.path, "node_modules") or
             pathHasSegment(r.path, "third_party")) score *= 0.4;
         // Doc-language penalty: markdown / data files (CHANGELOG.md, design
@@ -2676,16 +3219,17 @@ pub const Explorer = struct {
         @memcpy(buf[pos..][0..close.len], close);
         pos += close.len;
 
-        var file = std.Io.Dir.cwd().openFile(io_inst, path, .{ .mode = .write_only }) catch blk: {
-            break :blk std.Io.Dir.cwd().createFile(io_inst, path, .{ .truncate = false }) catch return;
-        };
+        // .truncate = false opens the existing file or creates it in one call.
+        // .read = true because Windows requires read access on the handle for
+        // length() below, even though we only append with positional writes.
+        var file = std.Io.Dir.cwd().createFile(io_inst, path, .{ .read = true, .truncate = false }) catch return;
         var current_size = file.length(io_inst) catch {
             file.close(io_inst);
             return;
         };
         if (current_size >= size_limit) {
             file.close(io_inst);
-            file = std.Io.Dir.cwd().createFile(io_inst, path, .{ .truncate = true }) catch return;
+            file = std.Io.Dir.cwd().createFile(io_inst, path, .{ .read = true, .truncate = true }) catch return;
             current_size = 0;
         }
         defer file.close(io_inst);
@@ -2748,57 +3292,177 @@ pub const Explorer = struct {
         return 1.0 + alpha * @log(1.0 + c);
     }
 
+    /// Query-specific call-graph distance (#550): BFS outward — callers and
+    /// callees — from every function whose name equals a query term, recording
+    /// each reached file's minimum hop distance. Arena-allocated; null when no
+    /// graph is built or no term names a symbol, so ranking is unchanged.
+    fn queryGraphDistances(self: *Explorer, terms: *const std.StringHashMap(void), ta: std.mem.Allocator) ?std.StringHashMap(u8) {
+        const cg = self.call_graph orelse return null;
+        const n = cg.node_name.len;
+        if (n == 0) return null;
+        const max_hops: u8 = 3;
+        const unseen: u8 = std.math.maxInt(u8);
+
+        const dist = ta.alloc(u8, n) catch return null;
+        @memset(dist, unseen);
+
+        var queue: std.ArrayList(codegraph.NodeId) = .empty;
+        for (cg.node_name, 0..) |name, nid| {
+            if (name.len < 3) continue;
+            var it = terms.keyIterator();
+            while (it.next()) |t| {
+                if (asciiEqlIgnoreCase(name, t.*)) {
+                    dist[nid] = 0;
+                    queue.append(ta, @intCast(nid)) catch return null;
+                    break;
+                }
+            }
+        }
+        if (queue.items.len == 0) return null;
+
+        // adj is forward-only (callees); a reverse copy makes the walk
+        // undirected so callers of a matched symbol count as near too.
+        const radj = ta.alloc(std.ArrayList(codegraph.NodeId), n) catch return null;
+        for (radj) |*l| l.* = .empty;
+        for (cg.edges) |e| {
+            if (e.from < n and e.to < n) radj[e.to].append(ta, e.from) catch return null;
+        }
+
+        var head: usize = 0;
+        while (head < queue.items.len) : (head += 1) {
+            const nid = queue.items[head];
+            const d = dist[nid];
+            if (d >= max_hops) continue;
+            for (cg.adj[nid].items) |nb| {
+                if (dist[nb] != unseen) continue;
+                dist[nb] = d + 1;
+                queue.append(ta, nb) catch return null;
+            }
+            for (radj[nid].items) |nb| {
+                if (dist[nb] != unseen) continue;
+                dist[nb] = d + 1;
+                queue.append(ta, nb) catch return null;
+            }
+        }
+
+        var file_dist = std.StringHashMap(u8).init(ta);
+        for (queue.items) |nid| {
+            const gop = file_dist.getOrPut(cg.node_path[nid]) catch return null;
+            if (!gop.found_existing or gop.value_ptr.* > dist[nid]) gop.value_ptr.* = dist[nid];
+        }
+        return file_dist;
+    }
+
+    /// Boost for files within a few call hops of a symbol the query names,
+    /// halving per hop: 0 hops ×1.5, 1 ×1.25, 2 ×1.125, 3 ×1.0625. Like
+    /// centralityBoost it is always ≥ 1 — never a filter — and 1.0 whenever
+    /// the distance signal is off, so ranking degrades to the status quo.
+    fn graphDistanceBoost(file_dist: ?std.StringHashMap(u8), path: []const u8) f32 {
+        const m = file_dist orelse return 1.0;
+        const d = m.get(path) orelse return 1.0;
+        const gamma: f32 = 0.5;
+        return 1.0 + gamma / @as(f32, @floatFromInt(@as(u32, 1) << @intCast(d)));
+    }
+
+    /// True when a query token looks like a code identifier (camelCase or
+    /// snake_case) — the same shape heuristic the ranked tokenizer uses to
+    /// split identifiers. Gates symbol-index and call-graph work so plain
+    /// natural-language words never pay for either.
+    fn queryNamesIdentifier(query: []const u8) bool {
+        for (query) |c| {
+            if (c == '_' or (c >= 'A' and c <= 'Z')) return true;
+        }
+        return false;
+    }
+
+    /// True when `path`'s outline defines a symbol named `name` (any kind,
+    /// case-insensitive). Outline-based so it works on snapshot fast-loads
+    /// where symbol_index is deferred (#564).
+    fn fileDefinesSymbol(self: *const Explorer, path: []const u8, name: []const u8) bool {
+        const outline = self.outlines.get(path) orelse return false;
+        for (outline.symbols.items) |sym| {
+            if (asciiEqlIgnoreCase(sym.name, name)) return true;
+        }
+        return false;
+    }
+
+    /// Build the git co-change map once (#550): `git log --name-only` over
+    /// the last 500 commits, mega-commits (>32 files) skipped, top 8 partners
+    /// per file. Needs root_path (setRoot); silently unavailable outside a
+    /// git repo — the attempted flag stops re-shelling. Mirrors
+    /// ensureCallGraph: call while holding at least a shared lock on `mu`.
+    fn ensureCoChange(self: *Explorer) void {
+        if (self.co_change != null or self.co_change_attempted) return;
+        self.cochange_build_mu.lock();
+        defer self.cochange_build_mu.unlock();
+        if (self.co_change != null or self.co_change_attempted) return;
+        self.co_change_attempted = true;
+        const root = self.root_path orelse return;
+        self.co_change = git.buildCoChange(self.allocator, root, 500, 32, 8);
+    }
+
+    /// Boost for files that historically change together with the files
+    /// defining the queried symbol — git co-change, the temporal sibling of
+    /// graphDistanceBoost (#550). Always ≥ 1, never a filter; 1.0 when the
+    /// map or seeds are absent. Two shared commits is the noise floor;
+    /// strength saturates at eight (×1.25).
+    fn coChangeBoost(self: *const Explorer, seeds: *const std.StringHashMap(void), path: []const u8) f32 {
+        const cc = self.co_change orelse return 1.0;
+        if (seeds.count() == 0) return 1.0;
+        if (seeds.contains(path)) return 1.0;
+        var best: u32 = 0;
+        var it = seeds.keyIterator();
+        while (it.next()) |s| {
+            const partners = cc.get(s.*) orelse continue;
+            for (partners) |p| {
+                if (p.count > best and std.mem.eql(u8, p.path, path)) best = p.count;
+            }
+        }
+        if (best < 2) return 1.0;
+        const strength = @min(@as(f32, @floatFromInt(best)) / 8.0, 1.0);
+        return 1.0 + 0.25 * strength;
+    }
+
     /// Public, lock-acquiring entry point for single-threaded callers (the
     /// index/scan path) to pre-build call_centrality before persisting a snapshot,
     /// so a later load can restore it instead of paying the lazy first-query build.
     /// ensureCallCentrality assumes the caller already holds a shared lock (it is
     /// normally reached from searchContentRanked); this wrapper takes that lock.
     pub fn buildCallCentrality(self: *Explorer, allocator: std.mem.Allocator) void {
+        self.ensureSymbolIndex();
         self.mu.lockShared();
         defer self.mu.unlockShared();
         self.ensureCallCentrality(allocator);
     }
 
-    /// Build `call_centrality` once (idempotent, mutex-guarded). Must be called
-    /// while holding at least a shared lock on `mu` (it reads outlines/contents
-    /// via readContentForSearch, which assumes the lock is held). The resolved
-    /// call graph: for each function body, extract call sites (codegraph), resolve
-    /// each callee name through the function symbol table, and accumulate weighted
-    /// in-degree per callee; aggregate to per-file scores.
-    fn ensureCallCentrality(self: *Explorer, allocator: std.mem.Allocator) void {
-        if (self.call_centrality != null) return;
+    /// Build the resolved call graph once (idempotent, mutex-guarded). Must be
+    /// called while holding at least a shared lock on `mu`. Retains edges for
+    /// codedb_callpath and computes per-file centrality (PageRank by default).
+    fn ensureCallGraph(self: *Explorer, allocator: std.mem.Allocator) void {
+        if (self.call_graph != null) return;
+        // #564: never build (and cache) a graph from a deferred symbol index —
+        // resolveCallees would see no definitions and the empty graph would be
+        // cached forever. Callers that need the graph ensureSymbolIndex first;
+        // ranking paths just skip the boost until then.
+        if (!self.symbol_index_complete) return;
         self.centrality_build_mu.lock();
         defer self.centrality_build_mu.unlock();
-        if (self.call_centrality != null) return; // built while we waited
+        if (self.call_graph != null) return;
 
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const a = arena_state.allocator();
 
-        // Pass 1: node id per function/method symbol + name -> [node ids] resolver.
         var node_path: std.ArrayList([]const u8) = .empty;
+        var node_name: std.ArrayList([]const u8) = .empty;
+        var node_line: std.ArrayList(u32) = .empty;
+        var funcs: std.ArrayList(codegraph.FuncInput) = .empty;
         var name_to_ids = std.StringHashMap(std.ArrayList(codegraph.NodeId)).init(a);
+
         var it = self.outlines.iterator();
         while (it.next()) |entry| {
             const path = entry.key_ptr.*;
-            for (entry.value_ptr.symbols.items) |sym| {
-                if (sym.kind != .function and sym.kind != .method) continue;
-                const id: codegraph.NodeId = @intCast(node_path.items.len);
-                node_path.append(a, path) catch return;
-                const gop = name_to_ids.getOrPut(sym.name) catch return;
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-                gop.value_ptr.append(a, id) catch return;
-            }
-        }
-        if (node_path.items.len == 0) return;
-
-        const in_degree = a.alloc(f32, node_path.items.len) catch return;
-        @memset(in_degree, 0);
-
-        // Pass 2: per file, slice each function body, extract + resolve call sites.
-        var it2 = self.outlines.iterator();
-        while (it2.next()) |entry| {
-            const ref = self.readContentForSearch(entry.key_ptr.*, a) orelse continue;
+            const ref = self.readContentForSearch(path, a) orelse continue;
             defer ref.deinit();
             const content = ref.data;
             var offs: std.ArrayList(usize) = .empty;
@@ -2814,28 +3478,175 @@ pub const Explorer = struct {
                 const end_line = @min(sym.line_end, nlines);
                 const end = if (end_line < nlines) offs.items[end_line] else content.len;
                 if (end <= start) continue;
-                const callees = codegraph.extractCallees(a, content[start..end]) catch continue;
-                for (callees) |nm| {
-                    const ids = name_to_ids.get(nm) orelse continue;
-                    if (ids.items.len == 0) continue;
-                    const w: f32 = 1.0 / @as(f32, @floatFromInt(ids.items.len));
-                    for (ids.items) |cid| in_degree[cid] += w;
-                }
+                const id: codegraph.NodeId = @intCast(node_path.items.len);
+                node_path.append(a, path) catch return;
+                node_name.append(a, sym.name) catch return;
+                node_line.append(a, sym.line_start) catch return;
+                funcs.append(a, .{ .id = id, .body = content[start..end] }) catch return;
+                const gop = name_to_ids.getOrPut(sym.name) catch return;
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                gop.value_ptr.append(a, id) catch return;
             }
         }
+        const n_nodes = node_path.items.len;
+        if (n_nodes == 0) return;
 
-        // Aggregate weighted in-degree per file. Keys borrow stable outlines keys.
-        var cmap = std.StringHashMap(f32).init(self.allocator);
-        for (node_path.items, in_degree) |path, deg| {
-            if (deg == 0) continue;
-            const gop = cmap.getOrPut(path) catch continue;
-            if (!gop.found_existing) gop.value_ptr.* = 0;
-            gop.value_ptr.* += deg;
+        var resolve = std.StringHashMap([]const codegraph.NodeId).init(a);
+        var n2i = name_to_ids.iterator();
+        while (n2i.next()) |e| resolve.put(e.key_ptr.*, e.value_ptr.items) catch return;
+
+        var edges_tmp = codegraph.buildEdges(a, funcs.items, &resolve, false) catch return;
+        defer edges_tmp.deinit(a);
+
+        const buildOwned = struct {
+            fn call(
+                exp: *Explorer,
+                edges_src: []const codegraph.Edge,
+                paths: []const []const u8,
+                names: []const []const u8,
+                lines: []const u32,
+            ) !void {
+                const alloc = exp.allocator;
+                const n = paths.len;
+
+                const edges_owned = try alloc.dupe(codegraph.Edge, edges_src);
+                errdefer alloc.free(edges_owned);
+
+                const adj = try codegraph.buildAdjacency(alloc, edges_owned, n);
+                errdefer codegraph.freeAdjacency(alloc, adj);
+
+                const np = try alloc.dupe([]const u8, paths);
+                errdefer alloc.free(np);
+
+                const nn = try alloc.dupe([]const u8, names);
+                errdefer alloc.free(nn);
+
+                const nl = try alloc.dupe(u32, lines);
+                errdefer alloc.free(nl);
+
+                const node_scores = if (cio.posixGetenv("CODEDB_IN_DEGREE_CENTRALITY") != null)
+                    try codegraph.inDegreeCentrality(alloc, edges_owned, n)
+                else
+                    try codegraph.pageRank(alloc, edges_owned, n, 0.85, 20);
+                defer alloc.free(node_scores);
+
+                if (exp.call_centrality == null) {
+                    var cmap = std.StringHashMap(f32).init(alloc);
+                    for (np, node_scores) |path, score| {
+                        if (score == 0) continue;
+                        const gop = cmap.getOrPut(path) catch continue;
+                        if (!gop.found_existing) gop.value_ptr.* = 0;
+                        gop.value_ptr.* += score;
+                    }
+                    exp.call_centrality = cmap;
+                }
+
+                exp.call_graph = .{
+                    .edges = edges_owned,
+                    .adj = adj,
+                    .node_path = np,
+                    .node_name = nn,
+                    .node_line = nl,
+                };
+            }
+        }.call;
+        buildOwned(self, edges_tmp.items, node_path.items, node_name.items, node_line.items) catch return;
+    }
+
+    /// Build `call_centrality` once (idempotent, mutex-guarded). Must be called
+    /// while holding at least a shared lock on `mu`.
+    fn ensureCallCentrality(self: *Explorer, allocator: std.mem.Allocator) void {
+        if (self.call_centrality != null) return;
+        self.ensureCallGraph(allocator);
+    }
+
+    /// Shortest resolved call chain between two symbol names. Returns owned steps
+    /// (path, name, line) or null when either symbol is missing or unreachable.
+    pub fn findCallPath(
+        self: *Explorer,
+        from_name: []const u8,
+        to_name: []const u8,
+        allocator: std.mem.Allocator,
+        max_hops: usize,
+    ) !?[]CallPathStep {
+        self.ensureSymbolIndex();
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        self.ensureCallGraph(allocator);
+        const cg = self.call_graph orelse return null;
+
+        var from_ids: std.ArrayList(codegraph.NodeId) = .empty;
+        defer from_ids.deinit(allocator);
+        var to_ids: std.ArrayList(codegraph.NodeId) = .empty;
+        defer to_ids.deinit(allocator);
+
+        for (cg.node_name, 0..) |name, id| {
+            const nid: codegraph.NodeId = @intCast(id);
+            if (std.mem.eql(u8, name, from_name)) try from_ids.append(allocator, nid);
+            if (std.mem.eql(u8, name, to_name)) try to_ids.append(allocator, nid);
         }
-        self.call_centrality = cmap;
+        if (from_ids.items.len == 0 or to_ids.items.len == 0) return null;
+
+        const node_ids = codegraph.shortestCallPath(
+            allocator,
+            cg.adj,
+            cg.node_path.len,
+            from_ids.items,
+            to_ids.items,
+            max_hops,
+        ) catch return null;
+        const path = node_ids orelse return null;
+        defer allocator.free(path);
+
+        var steps: std.ArrayList(CallPathStep) = .empty;
+        errdefer steps.deinit(allocator);
+        errdefer {
+            for (steps.items) |s| {
+                allocator.free(s.path);
+                allocator.free(s.name);
+            }
+        }
+        // Dupe into the caller's allocator: cg.node_path/node_name live in the
+        // call graph, which any indexFile/removeFile invalidates after the
+        // shared lock here is released. Borrowed slices would dangle.
+        for (path) |nid| {
+            const step_path = try allocator.dupe(u8, cg.node_path[nid]);
+            errdefer allocator.free(step_path);
+            const step_name = try allocator.dupe(u8, cg.node_name[nid]);
+            try steps.append(allocator, .{
+                .path = step_path,
+                .name = step_name,
+                .line = cg.node_line[nid],
+            });
+        }
+        return try steps.toOwnedSlice(allocator);
     }
 
     pub fn searchContentRanked(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+        // #546: BM25 reads the word index's id_to_path + ranked-doc table, which a
+        // mmap/disk-loaded index lacks until rebuilt (word_index_complete = false).
+        // The recall readers (searchContent, searchWord, renderWord) already trigger
+        // this lazy rebuild; searchContentRanked did not — so ranked search returned
+        // nothing on a cold CLI / freshly-loaded snapshot (the index served `word`,
+        // but here N collapsed to 0). Rebuild before the shared lock, matching the
+        // siblings — rebuildWordIndex takes the exclusive lock.
+        if (max_results > 0) {
+            self.mu.lockShared();
+            const needs_rebuild = !self.word_index_complete and
+                (self.contents.len() > 0 or (self.io != null and self.root_dir != null));
+            self.mu.unlockShared();
+            if (needs_rebuild) try self.rebuildWordIndex();
+        }
+        // #550: the graph-distance gate below reads symbol_index, which a
+        // snapshot fast-load defers (#564). Identifier-shaped queries ensure it
+        // here, pre-shared-lock — ensureSymbolIndex takes the exclusive lock.
+        if (max_results > 0 and queryNamesIdentifier(query) and
+            cio.posixGetenv("CODEDB_NO_CENTRALITY") == null and
+            cio.posixGetenv("CODEDB_NO_GRAPH_DISTANCE") == null)
+        {
+            self.ensureSymbolIndex();
+        }
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -2882,6 +3693,29 @@ pub const Explorer = struct {
             }
         }
         if (terms_set.count() == 0) return try allocator.alloc(SearchResult, 0);
+
+        // #550: query-specific call-graph distance — boost files within a few
+        // call hops of the symbols the query names. Build the graph only when a
+        // raw query token exactly names a known symbol, so NL-only queries on a
+        // cold CLI never pay for it; once built (warm daemon, callpath, or a
+        // prior symbol-shaped query) the distances are computed from any seed.
+        // CODEDB_NO_CENTRALITY disables both graph signals (ensureCallGraph
+        // would repopulate call_centrality); CODEDB_NO_GRAPH_DISTANCE just this one.
+        var graph_dist: ?std.StringHashMap(u8) = null;
+        if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null and
+            cio.posixGetenv("CODEDB_NO_GRAPH_DISTANCE") == null)
+        {
+            if (self.call_graph == null) {
+                var gate_tok = idx.WordTokenizer{ .buf = query };
+                while (gate_tok.next()) |w| {
+                    if (self.symbol_index.contains(w)) {
+                        self.ensureCallGraph(allocator);
+                        break;
+                    }
+                }
+            }
+            graph_dist = self.queryGraphDistances(&terms_set, ta);
+        }
 
         // BM25 constants.
         const k1: f32 = 1.2;
@@ -2976,6 +3810,27 @@ pub const Explorer = struct {
         }
         if (per_doc.count() == 0) return try allocator.alloc(SearchResult, 0);
 
+        // #550 signal 2: git co-change. Seeds are the candidate files that
+        // DEFINE a query-named symbol; without seeds the one-time `git log`
+        // shell-out never happens.
+        var cc_seeds = std.StringHashMap(void).init(ta);
+        if (cio.posixGetenv("CODEDB_NO_COCHANGE") == null) {
+            var seed_iter = per_doc.iterator();
+            while (seed_iter.next()) |entry| {
+                const doc_id = entry.key_ptr.*;
+                const p = if (doc_id < self.word_index.id_to_path.items.len) self.word_index.id_to_path.items[doc_id] else "";
+                if (p.len == 0 or cc_seeds.contains(p)) continue;
+                var t_it = terms_set.keyIterator();
+                while (t_it.next()) |t| {
+                    if (self.fileDefinesSymbol(p, t.*)) {
+                        cc_seeds.put(p, {}) catch {};
+                        break;
+                    }
+                }
+            }
+            if (cc_seeds.count() > 0) self.ensureCoChange();
+        }
+
         const Cand = struct { doc_id: u32, score: f32, best_line: u32 };
         var cands: std.ArrayList(Cand) = .empty;
         defer cands.deinit(ta);
@@ -2986,7 +3841,11 @@ pub const Explorer = struct {
             const cand_path = if (cand_doc_id < self.word_index.id_to_path.items.len) self.word_index.id_to_path.items[cand_doc_id] else "";
             cands.appendAssumeCapacity(.{
                 .doc_id = cand_doc_id,
-                .score = entry.value_ptr.score * pathRelevanceMultiplier(cand_path, &terms_set) * self.centralityBoost(cand_path),
+                .score = entry.value_ptr.score *
+                    pathRelevanceMultiplier(cand_path, &terms_set) *
+                    self.centralityBoost(cand_path) *
+                    graphDistanceBoost(graph_dist, cand_path) *
+                    self.coChangeBoost(&cc_seeds, cand_path),
                 .best_line = entry.value_ptr.best_line,
             });
         }
@@ -3034,6 +3893,21 @@ pub const Explorer = struct {
         }
 
         return result_list.toOwnedSlice(allocator);
+    }
+
+    /// Query-shape-aware search shared by the CLI (`runQuery`, used by both the
+    /// cold path and the warm cli-daemon) and the MCP `search` handler so the two
+    /// rank identically. A multi-word query expresses conceptual/NL intent and
+    /// routes to BM25 + centrality (`searchContentRanked`); a single token keeps
+    /// literal substring matching (`searchContent`) so exact-identifier lookups
+    /// still work. #546: the CLI path previously always called the unranked
+    /// `searchContent`, so multi-word CLI/daemon searches never reached the ranker.
+    pub fn searchContentAuto(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+        const multiword = std.mem.indexOfScalar(u8, query, ' ') != null;
+        return if (multiword)
+            self.searchContentRanked(query, allocator, max_results)
+        else
+            self.searchContent(query, allocator, max_results);
     }
 
     /// Search file contents using a regex pattern with trigram acceleration.
@@ -3114,7 +3988,75 @@ pub const Explorer = struct {
 
         self.mu.lockShared();
         defer self.mu.unlockShared();
+        // #569: a multi-word query can never be a single index token — fall back
+        // to per-token matching so phrase-shaped queries don't silently dead-end.
+        if (std.mem.indexOfScalar(u8, word, ' ') != null) {
+            return self.searchWordTokensLocked(word, allocator);
+        }
         return self.word_index.searchDeduped(word, allocator);
+    }
+
+    /// Per-token fallback for a whitespace-separated query (#569): each distinct
+    /// token is looked up in the word index and files are ranked by how many
+    /// distinct tokens they hit, then total hits, then path. Returns one
+    /// representative hit (lowest matching line) per file, allocated for the
+    /// caller. Caller must hold the shared lock.
+    fn searchWordTokensLocked(self: *Explorer, query: []const u8, allocator: std.mem.Allocator) ![]const idx.WordHit {
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+
+        const Agg = struct { distinct: u32, total: u32, line: u32, last_token: u32 };
+        var per_doc = U32HashMap(Agg).init(sa);
+
+        var seen_tokens = std.StringHashMap(void).init(sa);
+        var token_serial: u32 = 0;
+        var tok = idx.WordTokenizer{ .buf = query };
+        while (tok.next()) |raw| {
+            if (raw.len < 2) continue;
+            const lower = try sa.alloc(u8, raw.len);
+            for (raw, 0..) |c, i| lower[i] = idx.normalizeChar(c);
+            const tok_gop = try seen_tokens.getOrPut(lower);
+            if (tok_gop.found_existing) continue;
+            token_serial += 1;
+            for (self.word_index.search(lower)) |h| {
+                const gop = try per_doc.getOrPut(h.doc_id);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .{ .distinct = 1, .total = 1, .line = h.line_num, .last_token = token_serial };
+                } else {
+                    gop.value_ptr.total += 1;
+                    if (gop.value_ptr.last_token != token_serial) {
+                        gop.value_ptr.distinct += 1;
+                        gop.value_ptr.last_token = token_serial;
+                    }
+                    if (h.line_num < gop.value_ptr.line) gop.value_ptr.line = h.line_num;
+                }
+            }
+        }
+        if (per_doc.count() == 0) return try allocator.alloc(idx.WordHit, 0);
+
+        const Ranked = struct { doc_id: u32, distinct: u32, total: u32, line: u32 };
+        const ranked = try sa.alloc(Ranked, per_doc.count());
+        var it = per_doc.iterator();
+        var n: usize = 0;
+        while (it.next()) |e| : (n += 1) {
+            ranked[n] = .{ .doc_id = e.key_ptr.*, .distinct = e.value_ptr.distinct, .total = e.value_ptr.total, .line = e.value_ptr.line };
+        }
+        const SortCtx = struct {
+            wi: *const idx.WordIndex,
+            fn lessThan(ctx: @This(), a: Ranked, b: Ranked) bool {
+                if (a.distinct != b.distinct) return a.distinct > b.distinct;
+                if (a.total != b.total) return a.total > b.total;
+                const pa = ctx.wi.hitPath(.{ .doc_id = a.doc_id, .line_num = 0 });
+                const pb = ctx.wi.hitPath(.{ .doc_id = b.doc_id, .line_num = 0 });
+                return std.mem.lessThan(u8, pa, pb);
+            }
+        };
+        std.mem.sort(Ranked, ranked, SortCtx{ .wi = &self.word_index }, SortCtx.lessThan);
+
+        const out_hits = try allocator.alloc(idx.WordHit, ranked.len);
+        for (ranked, 0..) |r, i| out_hits[i] = .{ .doc_id = r.doc_id, .line_num = r.line };
+        return out_hits;
     }
 
     /// Format a word-index lookup directly from the posting list. The indexer
@@ -3131,6 +4073,20 @@ pub const Explorer = struct {
 
         self.mu.lockShared();
         defer self.mu.unlockShared();
+
+        // #569: multi-word queries fall back to per-token matching — one line
+        // per file, files hitting more distinct tokens first.
+        if (std.mem.indexOfScalar(u8, word, ' ') != null) {
+            const hits = try self.searchWordTokensLocked(word, allocator);
+            defer allocator.free(hits);
+            try out.ensureUnusedCapacity(allocator, 64 + hits.len * 48);
+            const w = cio.listWriter(out, allocator);
+            try w.print("{d} hits for '{s}' (tokenized):\n", .{ hits.len, word });
+            for (hits) |h| {
+                try w.print("  {s}:{d}\n", .{ self.word_index.hitPath(h), h.line_num });
+            }
+            return;
+        }
 
         const hits = self.word_index.search(word);
         try out.ensureUnusedCapacity(allocator, 64 + hits.len * 48);
@@ -3362,7 +4318,17 @@ pub const Explorer = struct {
     pub fn getImportedBy(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
         self.mu.lockShared();
         defer self.mu.unlockShared();
-        return self.dep_graph.getImportedBy(path, allocator);
+        // A bare import resolved only by basename is ambiguous when 2+ indexed files
+        // share that basename; disable the basename fallback in that case so it is not
+        // attributed to every same-basename file (e.g. a/conf.py and b/conf.py).
+        const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
+        var basename_count: usize = 0;
+        var it = self.outlines.keyIterator();
+        while (it.next()) |k| {
+            const kb = if (std.mem.lastIndexOfScalar(u8, k.*, '/')) |p| k.*[p + 1 ..] else k.*;
+            if (std.mem.eql(u8, kb, basename)) basename_count += 1;
+        }
+        return self.dep_graph.getImportedByFiltered(path, allocator, basename_count <= 1);
     }
 
     pub fn renderImportedBy(self: *Explorer, path: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !struct { count: usize, known: bool } {
@@ -3370,6 +4336,15 @@ pub const Explorer = struct {
         defer self.mu.unlockShared();
 
         const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
+        // #588: mirror getImportedBy — a bare import resolved only by basename
+        // is ambiguous when 2+ indexed files share the basename; skip the
+        // fallback rather than attribute it to every candidate.
+        var basename_count: usize = 0;
+        var bit = self.outlines.keyIterator();
+        while (bit.next()) |k| {
+            const kb = if (std.mem.lastIndexOfScalar(u8, k.*, '/')) |p| k.*[p + 1 ..] else k.*;
+            if (std.mem.eql(u8, kb, basename)) basename_count += 1;
+        }
         const exact = self.dep_graph.reverse.get(path);
         const w = cio.listWriter(out, allocator);
         var count: usize = 0;
@@ -3382,7 +4357,7 @@ pub const Explorer = struct {
             }
         }
 
-        if (!std.mem.eql(u8, path, basename)) {
+        if (basename_count <= 1 and !std.mem.eql(u8, path, basename)) {
             if (self.dep_graph.reverse.get(basename)) |rev_set| {
                 var rev_iter = rev_set.keyIterator();
                 while (rev_iter.next()) |key_ptr| {
@@ -3564,24 +4539,22 @@ pub const Explorer = struct {
             }
         } else if (startsWith(line, "import ") or startsWith(line, "from ")) {
             try appendOutlineSymbol(a, outline, line, .import, line_num, null);
-            // Extract module path and convert dots to slashes for dep matching.
-            // "from mypackage.utils.helpers import X" → "mypackage/utils/helpers.py"
-            // "import os.path" → "os/path.py"
-            if (extractPythonModulePath(line)) |mod_path| {
-                var buf: [512]u8 = undefined;
-                var pos: usize = 0;
-                for (mod_path) |c| {
-                    if (pos >= buf.len - 3) break;
-                    buf[pos] = if (c == '.') '/' else c;
-                    pos += 1;
+            if (startsWith(line, "from ")) {
+                // "from mypackage.utils import X" -> mypackage/utils.py (single module dep)
+                if (extractPythonModulePath(line)) |mod_path| {
+                    try appendPythonModuleDep(a, outline, mod_path);
                 }
-                if (pos + 3 <= buf.len) {
-                    buf[pos] = '.';
-                    buf[pos + 1] = 'p';
-                    buf[pos + 2] = 'y';
-                    pos += 3;
+            } else {
+                // "import a, b.c, d as e" -- record one dep per comma-separated module.
+                const rest = std.mem.trimStart(u8, line[7..], " \t");
+                var it = std.mem.splitScalar(u8, rest, ',');
+                while (it.next()) |raw| {
+                    var mod = std.mem.trim(u8, raw, " \t");
+                    if (std.mem.indexOf(u8, mod, " as ")) |as_pos| mod = std.mem.trimEnd(u8, mod[0..as_pos], " \t");
+                    if (std.mem.indexOfScalar(u8, mod, ' ')) |sp| mod = mod[0..sp];
+                    if (mod.len == 0 or mod[0] == '.') continue;
+                    try appendPythonModuleDep(a, outline, mod);
                 }
-                try appendImportPath(a, outline, buf[0..pos]);
             }
         }
     }
@@ -3605,8 +4578,24 @@ pub const Explorer = struct {
                 try appendOutlineSymbol(a, outline, name, kind, line_num, line);
             }
         }
-        if (containsAny(line, &.{ "import ", "require(" })) {
+        if (startsWith(line, "import ") or containsAny(line, &.{"require("})) {
             try appendOutlineSymbol(a, outline, line, .import, line_num, null);
+            if (extractStringLiteral(line)) |path| {
+                try appendImportPath(a, outline, path);
+            }
+        } else if (startsWith(line, "} from ") or
+            (startsWith(line, "export ") and containsAny(line, &.{ " from \"", " from '" })))
+        {
+            // Closing line of a multi-line import/export, e.g.
+            //   import {
+            //     a, b,
+            //   } from "../mod.ts";
+            // or a re-export like `export * from "./x.ts"`. The `from "..."`
+            // clause lands on a line that does not contain "import ", so without
+            // this branch the path is dropped (only single-line imports were
+            // captured). Gated on these concrete shapes so arbitrary `from "..."`
+            // inside strings/comments (e.g. SQL `select * from "users"`) is not
+            // mistaken for a dependency.
             if (extractStringLiteral(line)) |path| {
                 try appendImportPath(a, outline, path);
             }
@@ -4164,9 +5153,16 @@ pub const Explorer = struct {
                 try appendOutlineSymbol(a, outline, name, .function, line_num, line);
             }
         } else if (startsWith(line, "type ")) {
-            const rest = line[5..];
+            const rest = std.mem.trim(u8, line[5..], " \t");
             if (extractIdent(rest)) |name| {
-                try appendOutlineSymbol(a, outline, name, .struct_def, line_num, line);
+                const after = std.mem.trim(u8, rest[name.len..], " \t");
+                const kind: SymbolKind = if (startsWith(after, "interface"))
+                    .interface_def
+                else if (startsWith(after, "struct"))
+                    .struct_def
+                else
+                    .type_alias;
+                try appendOutlineSymbol(a, outline, name, kind, line_num, line);
             }
         } else if (startsWith(line, "import ")) {
             if (extractStringLiteral(line)) |path| {
@@ -4507,16 +5503,21 @@ pub const Explorer = struct {
         defer seen.deinit();
 
         for (outline.imports.items) |imp| {
-            if (std.mem.indexOf(u8, imp, "..") != null) continue;
-            const gop = try seen.getOrPut(imp);
+            const dep = (try resolveDependencyKey(&self.dep_graph, outline.path, imp, self.allocator)) orelse continue;
+            const gop = try seen.getOrPut(dep);
             if (gop.found_existing) continue;
-            try deps.append(self.allocator, imp);
+            try deps.append(self.allocator, dep);
         }
 
         try self.dep_graph.setDeps(path, deps);
     }
 
-    fn rebuildSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline, had_prior: bool) void {
+    pub fn rebuildSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline, had_prior: bool) void {
+        // #564: while the index is deferred (snapshot fast-load), per-file
+        // rebuilds are wasted work — ensureSymbolIndex rebuilds everything from
+        // outlines on first use. ensureSymbolIndex flips the flag back BEFORE
+        // calling this, so its own rebuild passes the guard.
+        if (!self.symbol_index_complete) return;
         // removeSymbolIndexFor scans the entire global symbol index, so calling
         // it per file makes a cold scan O(files * total_symbols). A brand-new
         // path has no prior entries to evict, so skip the scan entirely — only
@@ -4525,6 +5526,13 @@ pub const Explorer = struct {
         for (outline.symbols.items) |sym| {
             const gop = self.symbol_index.getOrPut(sym.name) catch continue;
             if (!gop.found_existing) {
+                // The map owns its keys: sym.name belongs to the outline and
+                // dies with it on re-index, while shared-name entries survive.
+                const owned = self.allocator.dupe(u8, sym.name) catch {
+                    _ = self.symbol_index.remove(sym.name);
+                    continue;
+                };
+                gop.key_ptr.* = owned;
                 gop.value_ptr.* = std.ArrayList(SymbolLocation).empty;
             }
             gop.value_ptr.append(self.allocator, .{
@@ -4552,12 +5560,18 @@ pub const Explorer = struct {
                 }
             }
             if (list.items.len == 0) {
-                list.deinit(self.allocator);
+                // Deinit only at actual removal below: ArrayList.deinit poisons
+                // the in-map value, so a failed append here must leave a VALID
+                // (empty) list behind, not a landmine for the next iteration.
                 to_remove.append(self.allocator, entry.key_ptr.*) catch {};
             }
         }
         for (to_remove.items) |key| {
-            _ = self.symbol_index.remove(key);
+            if (self.symbol_index.fetchRemove(key)) |kv| {
+                var hits = kv.value;
+                hits.deinit(self.allocator);
+                self.allocator.free(kv.key);
+            }
         }
     }
 
@@ -5238,17 +6252,13 @@ fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 fn pathHasSegment(path: []const u8, segment: []const u8) bool {
     var iter = std.mem.tokenizeAny(u8, path, "/\\");
-    while (iter.next()) |seg| {
-        if (std.mem.eql(u8, seg, segment)) return true;
-    }
+    while (iter.next()) |seg| if (std.mem.eql(u8, seg, segment)) return true;
     return false;
 }
 
 fn pathHasSegmentIgnoreCase(path: []const u8, segment: []const u8) bool {
     var iter = std.mem.tokenizeAny(u8, path, "/\\");
-    while (iter.next()) |seg| {
-        if (asciiEqlIgnoreCase(seg, segment)) return true;
-    }
+    while (iter.next()) |seg| if (asciiEqlIgnoreCase(seg, segment)) return true;
     return false;
 }
 fn startsWith(haystack: []const u8, needle: []const u8) bool {
@@ -5402,6 +6412,9 @@ fn parseDelimitedImport(line: []const u8, prefix: []const u8, delimiter: []const
     if (delimiter.len > 0) {
         if (std.mem.indexOf(u8, body, delimiter)) |end| body = body[0..end];
     }
+    // Strip a trailing `as <alias>` (Kotlin/Swift aliased import: `import X as Y`) so the
+    // dep key is the imported path X, not "X as Y".
+    if (std.mem.indexOf(u8, body, " as ")) |as_pos| body = body[0..as_pos];
     body = std.mem.trim(u8, body, " \t;");
     return if (body.len > 0) body else null;
 }
@@ -5429,9 +6442,7 @@ fn extractJvmMethodName(line: []const u8) ?[]const u8 {
 
 fn isControlKeyword(name: []const u8) bool {
     const keywords = [_][]const u8{ "if", "for", "while", "switch", "catch", "return", "throw", "new", "when" };
-    for (keywords) |kw| {
-        if (std.mem.eql(u8, name, kw)) return true;
-    }
+    for (keywords) |kw| if (std.mem.eql(u8, name, kw)) return true;
     return false;
 }
 
@@ -5826,9 +6837,7 @@ fn isCKeyword(s: []const u8) bool {
         "typedef",  "static",   "extern", "inline", "const",    "volatile",
         "register", "restrict", "auto",   "break",  "continue",
     };
-    for (keywords) |kw| {
-        if (std.mem.eql(u8, s, kw)) return true;
-    }
+    for (keywords) |kw| if (std.mem.eql(u8, s, kw)) return true;
     return false;
 }
 
@@ -5903,7 +6912,9 @@ fn extractStringLiteral(s: []const u8) ?[]const u8 {
 
 fn normalizePath(path: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
-    errdefer parts.deinit(allocator);
+    // `parts` holds borrowed slices into `path`; free the list on every path
+    // (success included). Previously errdefer-only, which leaked on success.
+    defer parts.deinit(allocator);
 
     var it = std.mem.splitSequence(u8, path, "/");
     while (it.next()) |part| {
@@ -5929,6 +6940,67 @@ fn normalizePath(path: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
     return buf.toOwnedSlice(allocator) catch null;
 }
 
+fn isRelativeImport(spec: []const u8) bool {
+    return std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../");
+}
+
+/// File extension of a path including the leading dot (".ts"), or null if the
+/// final segment has none. A leading-dot file (".env") counts as no extension.
+fn pathExtension(path: []const u8) ?[]const u8 {
+    const ext = std.fs.path.extension(path);
+    return if (ext.len == 0) null else ext;
+}
+
+/// Resolve a relative import specifier (`./` or `../`) against the importing
+/// file's path into a repo-rooted path, e.g.
+///   ("daemon/src/role/role-driver.ts", "../bus/x.ts") -> "daemon/src/bus/x.ts"
+/// Returns null if the path escapes the repo root or allocation fails. The
+/// caller owns the returned slice (allocated with `allocator`).
+fn resolveRelativeImportPath(file_path: []const u8, raw: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    const dir = if (std.mem.lastIndexOfScalar(u8, file_path, '/')) |sep|
+        file_path[0..sep]
+    else
+        ".";
+    const joined = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, raw }) catch return null;
+    defer allocator.free(joined);
+    return normalizePath(joined, allocator);
+}
+
+/// Map a raw import specifier to the dependency key the graph should store:
+///   - relative (./ ../) specifiers resolve to repo paths, interned in the
+///     graph arena (so they outlive the call without mutating outline.imports);
+///   - any other specifier containing ".." can't map to a repo path -> null (skip);
+///   - everything else is returned as-is (borrowed from the caller).
+/// Shared by Explorer.rebuildDepsFor and the snapshot restore path so the two
+/// never diverge. `tmp_allocator` is only used for transient resolution scratch.
+pub fn resolveDependencyKey(
+    dep_graph: *DependencyGraph,
+    importer_path: []const u8,
+    spec: []const u8,
+    tmp_allocator: std.mem.Allocator,
+) !?[]const u8 {
+    if (isRelativeImport(spec)) {
+        const tmp = resolveRelativeImportPath(importer_path, spec, tmp_allocator) orelse return null;
+        defer tmp_allocator.free(tmp);
+        // Extensionless imports ("../foo") are common in TS/JS. The resolved
+        // path then has no extension and won't match the indexed file
+        // ("dir/foo.ts"). Assume the importer's own extension (TS importing TS,
+        // JS importing JS) so the key lines up with the real file. Specifiers
+        // that already carry an extension are left as-is.
+        if (pathExtension(tmp) == null) {
+            if (pathExtension(importer_path)) |ext| {
+                const with_ext = std.fmt.allocPrint(tmp_allocator, "{s}{s}", .{ tmp, ext }) catch
+                    return try dep_graph.internString(tmp);
+                defer tmp_allocator.free(with_ext);
+                return try dep_graph.internString(with_ext);
+            }
+        }
+        return try dep_graph.internString(tmp);
+    }
+    if (std.mem.indexOf(u8, spec, "..") != null) return null;
+    return spec;
+}
+
 fn resolveDartImport(raw: []const u8, file_path: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
     if (std.mem.startsWith(u8, raw, "dart:")) return null;
 
@@ -5936,20 +7008,11 @@ fn resolveDartImport(raw: []const u8, file_path: []const u8, allocator: std.mem.
         return allocator.dupe(u8, raw) catch null;
     }
 
-    const dir = if (std.mem.lastIndexOfScalar(u8, file_path, '/')) |sep|
-        file_path[0..sep]
-    else
-        ".";
-    const joined = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, raw }) catch return null;
-    const result = normalizePath(joined, allocator);
-    allocator.free(joined);
-    return result;
+    return resolveRelativeImportPath(file_path, raw, allocator);
 }
 
 fn containsAny(s: []const u8, needles: []const []const u8) bool {
-    for (needles) |needle| {
-        if (std.mem.indexOf(u8, s, needle) != null) return true;
-    }
+    for (needles) |needle| if (std.mem.indexOf(u8, s, needle) != null) return true;
     return false;
 }
 
@@ -5973,7 +7036,7 @@ fn extractPythonModulePath(line: []const u8) ?[]const u8 {
         const rest = std.mem.trimStart(u8, line[5..], " \t");
         // Skip relative imports (start with dot)
         if (rest.len > 0 and rest[0] == '.') return null;
-        // "from module.path import ..." — extract up to " import"
+        // "from module.path import ..." -- extract up to " import"
         if (std.mem.indexOf(u8, rest, " import")) |imp_pos| {
             const mod = std.mem.trimEnd(u8, rest[0..imp_pos], " \t");
             if (mod.len > 0) return mod;
@@ -5981,13 +7044,33 @@ fn extractPythonModulePath(line: []const u8) ?[]const u8 {
         return null;
     } else if (startsWith(line, "import ")) {
         const rest = std.mem.trimStart(u8, line[7..], " \t");
-        // "import os.path" or "import foo" — take up to comma or space
+        // "import os.path" or "import foo" -- take up to comma or space
         var end: usize = 0;
         while (end < rest.len and rest[end] != ' ' and rest[end] != ',' and rest[end] != '\t') : (end += 1) {}
         if (end > 0) return rest[0..end];
         return null;
     }
     return null;
+}
+
+// Convert a Python module path (`os.path`, `mypackage.utils`) to a repo-style dep key
+// (`os/path.py`) and record it on the outline. Shared by the `from` branch and the
+// comma-split `import a, b` branch in parsePythonLine.
+fn appendPythonModuleDep(a: std.mem.Allocator, outline: *FileOutline, mod_path: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    for (mod_path) |c| {
+        if (pos >= buf.len - 3) break;
+        buf[pos] = if (c == '.') '/' else c;
+        pos += 1;
+    }
+    if (pos + 3 <= buf.len) {
+        buf[pos] = '.';
+        buf[pos + 1] = 'p';
+        buf[pos + 2] = 'y';
+        pos += 3;
+    }
+    try appendImportPath(a, outline, buf[0..pos]);
 }
 
 // ── Fuzzy file matching ─────────────────────────────────────────
@@ -6014,9 +7097,7 @@ fn isSpecialEntryPoint(filename: []const u8) bool {
         "Makefile",     "build.zig",   "Cargo.toml",
         "package.json",
     };
-    for (specials) |s| {
-        if (std.mem.eql(u8, filename, s)) return true;
-    }
+    for (specials) |s| if (std.mem.eql(u8, filename, s)) return true;
     return false;
 }
 

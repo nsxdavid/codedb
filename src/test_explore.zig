@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cio = @import("cio.zig");
 const testing = std.testing;
 const io = std.testing.io;
@@ -76,6 +77,59 @@ test "codegraph: buildEdges resolves callees + inDegree centrality" {
     try testing.expectApproxEqAbs(@as(f32, 0.0), cent[0], 0.001);
     try testing.expectApproxEqAbs(@as(f32, 2.0), cent[1], 0.001);
 }
+
+test "codegraph: pageRank ranks highly-called nodes above leaves" {
+    const funcs = [_]codegraph.FuncInput{
+        .{ .id = 0, .body = "B(); helper();" },
+        .{ .id = 1, .body = "if (x) return;" },
+        .{ .id = 2, .body = "return B();" },
+    };
+    var resolve = std.StringHashMap([]const codegraph.NodeId).init(testing.allocator);
+    defer resolve.deinit();
+    const b_ids = [_]codegraph.NodeId{1};
+    const helper_ids = [_]codegraph.NodeId{2};
+    try resolve.put("B", &b_ids);
+    try resolve.put("helper", &helper_ids);
+
+    var edges = try codegraph.buildEdges(testing.allocator, &funcs, &resolve, false);
+    defer edges.deinit(testing.allocator);
+
+    const pr = try codegraph.pageRank(testing.allocator, edges.items, 3, 0.85, 20);
+    defer testing.allocator.free(pr);
+
+    try testing.expect(pr[1] > pr[0]);
+    try testing.expect(pr[1] > pr[2]);
+}
+
+test "codegraph: shortestCallPath finds A→helper→B chain" {
+    const funcs = [_]codegraph.FuncInput{
+        .{ .id = 0, .body = "B(); helper();" },
+        .{ .id = 1, .body = "if (x) return;" },
+        .{ .id = 2, .body = "return B();" },
+    };
+    var resolve = std.StringHashMap([]const codegraph.NodeId).init(testing.allocator);
+    defer resolve.deinit();
+    const b_ids = [_]codegraph.NodeId{1};
+    const helper_ids = [_]codegraph.NodeId{2};
+    try resolve.put("B", &b_ids);
+    try resolve.put("helper", &helper_ids);
+
+    var edges = try codegraph.buildEdges(testing.allocator, &funcs, &resolve, false);
+    defer edges.deinit(testing.allocator);
+
+    const adj = try codegraph.buildAdjacency(testing.allocator, edges.items, 3);
+    defer codegraph.freeAdjacency(testing.allocator, adj);
+
+    const from = [_]codegraph.NodeId{0};
+    const to = [_]codegraph.NodeId{1};
+    const path = (try codegraph.shortestCallPath(testing.allocator, adj, 3, &from, &to, 0)) orelse return error.TestExpectedEqual;
+    defer testing.allocator.free(path);
+
+    try testing.expectEqual(@as(usize, 2), path.len);
+    try testing.expectEqual(@as(codegraph.NodeId, 0), path[0]);
+    try testing.expectEqual(@as(codegraph.NodeId, 1), path[1]);
+}
+
 const isCommentOrBlank = explore.isCommentOrBlank;
 const Language = explore.Language;
 const SymbolKind = explore.SymbolKind;
@@ -983,6 +1037,12 @@ test "explorer: searchContentRegex no match" {
 
 
 test "git: getGitHead returns 40-char hex SHA in a git repo" {
+    // getGitHead currently shells out to git. In the native Windows Zig test
+    // runner, that subprocess path can recurse through this checkout's tool
+    // plumbing and exhaust the DebugAllocator; POSIX keeps the subprocess
+    // regression covered until getGitHead grows a direct .git/HEAD reader.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     // codedb itself is a git repo, so this should succeed
     const head = try git_mod.getGitHead(".", testing.allocator);
     try testing.expect(head != null);
@@ -1795,6 +1855,11 @@ test "issue-389: FilteredWalker yields symlinked source files" {
 
 
 test "issue-405: FilteredWalker walks directory symlinks safely (cycle + escape)" {
+    // This asserts POSIX directory-symlink traversal and cycle handling. Windows
+    // exposes comparable behavior through reparse points, but Zig's symlink
+    // stat/open path is not equivalent here, so keep the primitive test POSIX.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     // Follow-up to #389. The current FilteredWalker.next() (src/watcher.zig:319-323)
     // treats sym_link entries as files when statFile reports .file, but silently
     // drops sym_link entries whose target is a directory. Real repos rely on
@@ -2109,4 +2174,224 @@ test "issue-528: searchContentRegex surfaces invalid regex as error" {
     try explorer_inst.indexFile("only.zig", "const x = 42;");
     // #10: an unparseable pattern used to be swallowed and reported as "no results".
     try testing.expectError(error.InvalidRegex, explorer_inst.searchContentRegex("[", testing.allocator, 50));
+}
+
+test "issue-531: searchSymbols prefix match" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.indexFile("a.zig", "pub fn parse_foo() void {}\npub fn parse_bar() void {}\npub fn other() void {}");
+
+    const results = try explorer_inst.searchSymbols(.{ .prefix = "parse_", .max_results = 10 }, testing.allocator);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.symbol.name);
+            if (r.symbol.detail) |d| testing.allocator.free(d);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len == 2);
+    for (results) |r| try testing.expect(std.mem.startsWith(u8, r.symbol.name, "parse_"));
+}
+
+test "issue-531: searchSymbols pattern and kind filter" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.indexFile("svc.go",
+        \\type UserManager struct {}
+        \\type OrderManager struct {}
+        \\func main() {}
+    );
+
+    const pattern_results = try explorer_inst.searchSymbols(.{ .pattern = "*Manager", .max_results = 10 }, testing.allocator);
+    defer {
+        for (pattern_results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.symbol.name);
+            if (r.symbol.detail) |d| testing.allocator.free(d);
+        }
+        testing.allocator.free(pattern_results);
+    }
+    try testing.expect(pattern_results.len == 2);
+    try explorer_inst.indexFile("iface.go", "type Reader interface {}");
+
+    const kind = Explorer.parseSymbolKind("interface") orelse return error.TestUnexpectedResult;
+    const iface_results = try explorer_inst.searchSymbols(.{ .kind = kind, .max_results = 10 }, testing.allocator);
+    defer {
+        for (iface_results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.symbol.name);
+            if (r.symbol.detail) |d| testing.allocator.free(d);
+        }
+        testing.allocator.free(iface_results);
+    }
+    try testing.expect(iface_results.len >= 1);
+    try testing.expect(iface_results[0].symbol.kind == .interface_def);
+}
+
+test "issue-531: searchSymbols fuzzy match" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.indexFile("x.zig", "pub fn ensureCallGraph() void {}");
+
+    const results = try explorer_inst.searchSymbols(.{ .name = "ensureCalGraph", .fuzzy = true, .max_results = 5 }, testing.allocator);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.symbol.name);
+            if (r.symbol.detail) |d| testing.allocator.free(d);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len >= 1);
+    try testing.expectEqualStrings("ensureCallGraph", results[0].symbol.name);
+}
+
+// ─── audit (2026-06-09): latent-issue sweep — call-graph phantom edges ───
+// src/codegraph.zig extractCallees paired every '(' with the preceding identifier with
+// no comment/string stripping, so a name mentioned only in a // comment surfaced as a
+// real resolved callee in codedb_context (#548 family, for the call graph).
+test "audit: comment-only mention is not a resolved callee" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var exp = Explorer.init(a, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try exp.indexFile("util.zig", "pub fn uniqueHelper() void {}\n");
+    try exp.indexFile("caller.zig",
+        \\pub fn caller() void {
+        \\    // see uniqueHelper() for details
+        \\}
+        \\
+    );
+    const callees = try exp.resolveCallees("caller.zig", 1, 3, a, 8);
+    for (callees) |c| try testing.expect(!std.mem.eql(u8, c.name, "uniqueHelper"));
+}
+
+test "audit: extractCallees ignores comment/string mentions" {
+    const body =
+        \\    realCall(x);
+        \\    // ghostFn() lives only in this comment
+        \\    log("please stringOnlyFn() here");
+    ;
+    const callees = try codegraph.extractCallees(testing.allocator, body);
+    defer testing.allocator.free(callees);
+    var saw_real = false;
+    for (callees) |c| {
+        if (std.mem.eql(u8, c, "realCall")) saw_real = true;
+        try testing.expect(!std.mem.eql(u8, c, "ghostFn"));
+        try testing.expect(!std.mem.eql(u8, c, "stringOnlyFn"));
+    }
+    try testing.expect(saw_real); // real call in code is still captured
+}
+
+test "issue-586: symbol_index keys must survive re-index of the file that first inserted them" {
+    // rebuildSymbolIndexFor keys the global symbol index with sym.name slices
+    // OWNED BY THE FILE'S OUTLINE. Re-indexing that file deinits the old
+    // outline — freeing the bytes the map hashes and compares — but the entry
+    // survives whenever another file shares the name (init/deinit/main are
+    // shared by nearly every Zig file). Every later probe eql()s freed memory:
+    // UB in release, and under the DebugAllocator poison the O(1) index
+    // silently loses the name, degrading every lookup to the outline scans.
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    // a.zig inserts sharedFn first -> the map key aliases a.zig's outline string.
+    try explorer.indexFile("src/a.zig", "pub fn sharedFn() void {}\n");
+    try explorer.indexFile("src/b.zig", "pub fn sharedFn() void {}\n");
+
+    // Re-index the key owner: its old outline is freed; the entry stays alive
+    // because b.zig still holds a location.
+    try explorer.indexFile("src/a.zig", "pub fn sharedFn() void {}\npub fn other() void {}\n");
+
+    const locs = explorer.symbol_index.get("sharedFn") orelse return error.SymbolLostFromIndex;
+    try testing.expect(locs.items.len >= 2);
+}
+
+test "issue-587: removeFile drops the path from skip_trigram_files" {
+    // Explorer.removeFile cleans dep_graph, symbol_index, contents, word and
+    // trigram indexes, then frees the outlines key — but never removes the
+    // skip_trigram_files entry, whose key ALIASES that freed outlines key.
+    // The tier-3 search scan then iterates a dangling path and hands it to
+    // readContentForSearch (UB read; with reused memory, an arbitrary path).
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    // Outline-only indexing registers the file in skip_trigram_files (#507).
+    try explorer.indexFileOutlineOnly("src/gone.zig", "pub fn ghostFn() void {}\n");
+    try testing.expectEqual(@as(usize, 1), explorer.skip_trigram_files.count());
+
+    explorer.removeFile("src/gone.zig");
+    try testing.expectEqual(@as(usize, 0), explorer.skip_trigram_files.count());
+}
+
+test "issue-594: failed re-index restores the word index from valid prior content" {
+    // commitParsedFileOwnedOutline reads `prior_content` out of the content
+    // cache and THEN calls contents.put, which frees that value in place. The
+    // trigram-failure errdefer later "restores" the word index by re-indexing
+    // prior_content — freed memory. Under the DebugAllocator poison the
+    // tokenizer finds no words in it, so a failed re-index silently wipes the
+    // file's postings instead of restoring them (release builds read garbage).
+    const FailOnce = struct {
+        backing: std.mem.Allocator,
+        next_index: usize = 0,
+        fail_index: usize,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = allocImpl,
+                .resize = resizeImpl,
+                .remap = remapImpl,
+                .free = freeImpl,
+            } };
+        }
+        fn allocImpl(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const idx = self.next_index;
+            self.next_index += 1;
+            if (idx == self.fail_index) return null;
+            return self.backing.rawAlloc(len, alignment, ra);
+        }
+        fn resizeImpl(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.backing.rawResize(memory, alignment, new_len, ra);
+        }
+        fn remapImpl(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.backing.rawRemap(memory, alignment, new_len, ra);
+        }
+        fn freeImpl(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.backing.rawFree(memory, alignment, ra);
+        }
+    };
+
+    // Pass 1: count the allocation window of the re-index on a successful run.
+    var window_start: usize = 0;
+    var window_end: usize = 0;
+    {
+        var counter = FailOnce{ .backing = testing.allocator, .fail_index = std.math.maxInt(usize) };
+        var explorer = Explorer.init(counter.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+        defer explorer.deinit();
+        try explorer.indexFile("src/a.zig", "pub fn alphaTok() void {}\n");
+        window_start = counter.next_index;
+        try explorer.indexFile("src/a.zig", "pub fn betaTok() void {}\n");
+        window_end = counter.next_index;
+    }
+    try testing.expect(window_end > window_start);
+
+    // Pass 2: fail each allocation in that window exactly once. Whenever the
+    // re-index errors out, the old content must still be word-searchable.
+    var fi = window_start;
+    while (fi < window_end) : (fi += 1) {
+        var failer = FailOnce{ .backing = testing.allocator, .fail_index = fi };
+        var explorer = Explorer.init(failer.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+        defer explorer.deinit();
+        explorer.indexFile("src/a.zig", "pub fn alphaTok() void {}\n") catch unreachable;
+        if (explorer.indexFile("src/a.zig", "pub fn betaTok() void {}\n")) |_| {
+            // Tolerated failure — the new content must be live.
+            try testing.expect(explorer.word_index.search("betatok").len > 0);
+        } else |_| {
+            if (explorer.word_index.search("alphatok").len == 0) return error.PriorContentLostOnFailedReindex;
+        }
+    }
 }

