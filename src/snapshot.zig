@@ -792,6 +792,7 @@ fn rebuildDepsFromOutline(explorer: *Explorer, path: []const u8, outline: *const
 // Process max-RSS in bytes (macOS getrusage reports bytes; Linux reports KiB).
 // Profiler-only: attribution of load-phase memory growth, not a public API.
 fn loadMaxRssBytes() u64 {
+    if (@import("builtin").os.tag == .windows) return 0;
     var ru: std.c.rusage = undefined;
     if (std.c.getrusage(0, &ru) != 0) return 0;
     const raw: u64 = @intCast(@max(0, ru.maxrss));

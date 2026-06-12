@@ -1091,9 +1091,6 @@ test "issue-429-c: searchContent rerank boosts lines that are symbol definitions
     try testing.expectEqualStrings("zzz_def.zig", results[0].path);
 }
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
 test "lex-freq-penalty: CODEDB_LEX_FREQ_PENALTY demotes files the query saturates" {
     // engram's learned ranker down-weights pure lexical frequency (LEARNED_W
     // lexical = -2): a file the query matches on MANY lines is usually a
@@ -1115,8 +1112,8 @@ test "lex-freq-penalty: CODEDB_LEX_FREQ_PENALTY demotes files the query saturate
     try explorer.indexFile("src/handler.zig", "pub fn g() void { _ = evt; }\n");
 
     // Disabled (CODEDB_LEX_FREQ_PENALTY=0): equal per-line scores → path-asc tie → dispatcher leads.
-    _ = setenv("CODEDB_LEX_FREQ_PENALTY", "0", 1);
-    defer _ = unsetenv("CODEDB_LEX_FREQ_PENALTY");
+    cio.posixSetenv("CODEDB_LEX_FREQ_PENALTY", "0");
+    defer cio.posixUnsetenv("CODEDB_LEX_FREQ_PENALTY");
     {
         const results = try explorer.searchContent("evt", testing.allocator, 50);
         defer {
@@ -1131,7 +1128,7 @@ test "lex-freq-penalty: CODEDB_LEX_FREQ_PENALTY demotes files the query saturate
     }
 
     // Default (on): dispatcher.zig saturates the query → demoted below handler.zig.
-    _ = unsetenv("CODEDB_LEX_FREQ_PENALTY");
+    cio.posixUnsetenv("CODEDB_LEX_FREQ_PENALTY");
     {
         const results = try explorer.searchContent("evt", testing.allocator, 50);
         defer {

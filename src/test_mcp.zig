@@ -2301,8 +2301,7 @@ test "issue-592: cli-daemon spawn lock is exclusive per project" {
     // ...and the CLI spawn probe must report the lock as taken.
     try testing.expect(!main_mod.daemonLockAvailable(dir_path));
 
-    _ = std.c.flock(held.?, std.c.LOCK.UN);
-    _ = std.c.close(held.?);
+    main_mod.daemonLockRelease(held.?);
     try testing.expect(main_mod.daemonLockAvailable(dir_path));
 }
 

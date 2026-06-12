@@ -615,12 +615,25 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
 //       blob = argv[1..] NUL-joined, e.g. "/proj\0find\0foo"
 //   response (daemon→client): [u8 exit_code][u32 out_len][out_bytes]
 const cli_blob_max: u32 = 64 * 1024;
+const cli_response_max: u32 = 16 * 1024 * 1024;
+const cli_response_too_large = "error: daemon response too large\n";
+
+fn cliResponseLenAllowed(out_len: u32) bool {
+    return out_len <= cli_response_max;
+}
+
+test "cli response length cap rejects oversized frames" {
+    try std.testing.expect(cliResponseLenAllowed(0));
+    try std.testing.expect(cliResponseLenAllowed(cli_response_max));
+    try std.testing.expect(!cliResponseLenAllowed(cli_response_max + 1));
+}
 
 const win = std.os.windows;
 const INVALID_HANDLE_VALUE = win.INVALID_HANDLE_VALUE;
 const GENERIC_READ: u32 = 0x80000000;
 const GENERIC_WRITE: u32 = 0x40000000;
 const OPEN_EXISTING: u32 = 3;
+const OPEN_ALWAYS: u32 = 4;
 const PIPE_ACCESS_DUPLEX: u32 = 0x00000003;
 const PIPE_TYPE_BYTE: u32 = 0x00000000;
 const PIPE_READMODE_BYTE: u32 = 0x00000000;
@@ -774,15 +787,22 @@ fn cliIsQueryCmd(cmd: []const u8) bool {
     return false;
 }
 
+const DaemonLock = if (builtin.os.tag == .windows) win.HANDLE else c_int;
+
 /// #592: per-project cli-daemon spawn lock. Open-or-create
-/// `<data_dir>/cli-daemon.lock` and take an exclusive non-blocking flock.
-/// Returns the fd on success — callers keep it open for the process lifetime
-/// (the kernel releases flocks on exit, so crashes never leave a stale lock).
+/// `<data_dir>/cli-daemon.lock` and take an exclusive non-blocking lock.
+/// Returns the lock handle/fd on success — callers keep it open for the process
+/// lifetime (the OS releases it on exit, so crashes never leave a stale lock).
 /// Returns null when another process holds the lock or the file can't be
 /// opened.
-pub fn daemonLockTryAcquire(data_dir: []const u8) ?c_int {
+pub fn daemonLockTryAcquire(data_dir: []const u8) ?DaemonLock {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const p = std.fmt.bufPrintZ(&buf, "{s}/cli-daemon.lock", .{data_dir}) catch return null;
+    if (builtin.os.tag == .windows) {
+        const handle = CreateFileA(p.ptr, GENERIC_READ | GENERIC_WRITE, 0, null, OPEN_ALWAYS, 0, null);
+        if (handle == INVALID_HANDLE_VALUE) return null;
+        return handle;
+    }
     const fd = std.c.open(p.ptr, .{ .ACCMODE = .RDWR, .CREAT = true }, @as(c_uint, 0o600));
     if (fd < 0) return null;
     if (std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB) != 0) {
@@ -792,12 +812,20 @@ pub fn daemonLockTryAcquire(data_dir: []const u8) ?c_int {
     return fd;
 }
 
+pub fn daemonLockRelease(lock: DaemonLock) void {
+    if (builtin.os.tag == .windows) {
+        win.CloseHandle(lock);
+        return;
+    }
+    _ = std.c.flock(lock, std.c.LOCK.UN);
+    _ = std.c.close(lock);
+}
+
 /// Probe whether the spawn lock is free without keeping it: used by the CLI
 /// auto-spawn path so racing cold calls don't fork duplicate daemons.
 pub fn daemonLockAvailable(data_dir: []const u8) bool {
-    const fd = daemonLockTryAcquire(data_dir) orelse return false;
-    _ = std.c.flock(fd, std.c.LOCK.UN);
-    _ = std.c.close(fd);
+    const lock = daemonLockTryAcquire(data_dir) orelse return false;
+    daemonLockRelease(lock);
     return true;
 }
 
@@ -1009,11 +1037,14 @@ fn cliServeConn(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, s
 
 /// Write the framed response [u8 code][u32 out_len][out_bytes] to `conn`.
 fn cliRespond(conn: CliConn, code: u8, out_bytes: []const u8) void {
+    const response_too_large = out_bytes.len > @as(usize, cli_response_max);
+    const bounded_code: u8 = if (response_too_large) 1 else code;
+    const bounded_bytes: []const u8 = if (response_too_large) cli_response_too_large else out_bytes;
     var hdr: [5]u8 = undefined;
-    hdr[0] = code;
-    std.mem.writeInt(u32, hdr[1..5], @intCast(out_bytes.len), .little);
+    hdr[0] = bounded_code;
+    std.mem.writeInt(u32, hdr[1..5], @intCast(bounded_bytes.len), .little);
     if (!cliWriteFull(conn, &hdr)) return;
-    if (out_bytes.len > 0) _ = cliWriteFull(conn, out_bytes);
+    if (bounded_bytes.len > 0) _ = cliWriteFull(conn, bounded_bytes);
 }
 
 /// Client side. If a daemon is listening for this project, proxy the command to
@@ -1049,6 +1080,7 @@ fn cliTryProxy(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8, a
     if (!cliReadFull(conn, &resp_hdr)) return null;
     const code = resp_hdr[0];
     const out_len = std.mem.readInt(u32, resp_hdr[1..5], .little);
+    if (!cliResponseLenAllowed(out_len)) return null;
 
     if (out_len > 0) {
         const out_bytes = allocator.alloc(u8, out_len) catch return null;
