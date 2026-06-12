@@ -87,7 +87,7 @@ pub const WordIndex = struct {
             self.free_ids.deinit(self.allocator);
             self.doc_lengths.deinit();
             self.allocator.free(self.word_dir);
-            std.posix.munmap(m);
+            cio.unmapFileRead(self.allocator, m);
             return;
         }
         // Free hit lists and duped word keys
@@ -494,7 +494,7 @@ pub const WordIndex = struct {
         self.index.deinit();
         self.path_to_id.deinit();
         self.allocator.free(self.word_dir);
-        std.posix.munmap(data);
+        cio.unmapFileRead(self.allocator, data);
         self.index = new_index;
         self.path_to_id = new_p2i;
         self.word_dir = &.{};
@@ -671,11 +671,7 @@ pub const WordIndex = struct {
             }
         }.lt);
 
-        const rand_suffix = @as(u64, blk: {
-            var ts: std.c.timespec = undefined;
-            _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-            break :blk @as(u64, @intCast(ts.nsec)) ^ (@as(u64, @intCast(ts.sec)) << 1);
-        });
+        const rand_suffix = cio.randU64();
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}/word.index.{x}.tmp", .{ dir_path, rand_suffix });
         defer self.allocator.free(tmp_path);
         const final_path = try std.fmt.allocPrint(self.allocator, "{s}/word.index", .{dir_path});
@@ -894,11 +890,11 @@ pub const WordIndex = struct {
         defer file.close(io);
         const size = file.length(io) catch return null;
         if (size < 51) return null;
-        const data = std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0) catch return null;
-        errdefer std.posix.munmap(data);
+        const data = cio.mapFileRead(io, allocator, file, size) catch return null;
+        errdefer cio.unmapFileRead(allocator, data);
 
-        if (!std.mem.eql(u8, data[0..4], &DISK_MAGIC)) return null;
-        if (std.mem.readInt(u16, data[4..6], .little) != DISK_FORMAT_VERSION) return null;
+        if (!std.mem.eql(u8, data[0..4], &DISK_MAGIC)) return error.MalformedIndex;
+        if (std.mem.readInt(u16, data[4..6], .little) != DISK_FORMAT_VERSION) return error.MalformedIndex;
         const file_count = std.mem.readInt(u32, data[6..10], .little);
 
         var result = WordIndex.init(allocator);
@@ -911,35 +907,35 @@ pub const WordIndex = struct {
         try result.id_to_path.ensureTotalCapacity(allocator, file_count);
         var pos: usize = 51;
         for (0..file_count) |_| {
-            if (pos + 2 > data.len) return null;
+            if (pos + 2 > data.len) return error.MalformedIndex;
             const plen = std.mem.readInt(u16, data[pos..][0..2], .little);
             pos += 2;
-            if (plen == 0 or pos + plen > data.len) return null;
+            if (plen == 0 or pos + plen > data.len) return error.MalformedIndex;
             const path = try allocator.dupe(u8, data[pos .. pos + plen]);
             result.id_to_path.appendAssumeCapacity(path);
             pos += plen;
         }
 
-        if (pos + 4 > data.len) return null;
+        if (pos + 4 > data.len) return error.MalformedIndex;
         const word_count = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
         const word_dir = try allocator.alloc(u32, word_count);
         errdefer allocator.free(word_dir);
         for (0..word_count) |i| {
-            if (pos + 2 > data.len) return null;
+            if (pos + 2 > data.len) return error.MalformedIndex;
             word_dir[i] = @intCast(pos);
             const wlen = std.mem.readInt(u16, data[pos..][0..2], .little);
             pos += 2 + wlen;
-            if (pos + 4 > data.len) return null;
+            if (pos + 4 > data.len) return error.MalformedIndex;
             const hit_count = std.mem.readInt(u32, data[pos..][0..4], .little);
             pos += 4 + @as(usize, hit_count) * @sizeOf(WordHit);
-            if (pos > data.len) return null;
+            if (pos > data.len) return error.MalformedIndex;
         }
 
-        if (pos + 4 > data.len) return null;
+        if (pos + 4 > data.len) return error.MalformedIndex;
         const dl_count = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
-        if (dl_count != file_count or pos + @as(usize, dl_count) * 4 + 8 > data.len) return null;
+        if (dl_count != file_count or pos + @as(usize, dl_count) * 4 + 8 > data.len) return error.MalformedIndex;
         for (0..dl_count) |i| {
             const len = std.mem.readInt(u32, data[pos..][0..4], .little);
             pos += 4;
@@ -947,7 +943,7 @@ pub const WordIndex = struct {
         }
         result.total_tokens = std.mem.readInt(u64, data[pos..][0..8], .little);
         pos += 8;
-        if (pos != data.len) return null;
+        if (pos != data.len) return error.MalformedIndex;
 
         // Hand off: switch to zero-copy mode. result.deinit now takes the mmap path.
         result.mmap_data = data;
@@ -2050,57 +2046,43 @@ pub const MmapTrigramIndex = struct {
         defer post_file.close(io);
         const post_size = post_file.length(io) catch return null;
         if (post_size < 8) return null;
-        const postings_data = std.posix.mmap(
-            null,
-            post_size,
-            .{ .READ = true },
-            .{ .TYPE = .SHARED },
-            post_file.handle,
-            0,
-        ) catch return null;
-        errdefer std.posix.munmap(postings_data);
+        const postings_data = cio.mapFileRead(io, allocator, post_file, post_size) catch return null;
+        errdefer cio.unmapFileRead(allocator, postings_data);
 
         // mmap lookup file
         const lk_file = std.Io.Dir.cwd().openFile(io, lookup_path, .{}) catch {
-            std.posix.munmap(postings_data);
+            cio.unmapFileRead(allocator, postings_data);
             return null;
         };
         defer lk_file.close(io);
         const lk_size = lk_file.length(io) catch {
-            std.posix.munmap(postings_data);
+            cio.unmapFileRead(allocator, postings_data);
             return null;
         };
         if (lk_size < 12) {
-            std.posix.munmap(postings_data);
+            cio.unmapFileRead(allocator, postings_data);
             return null;
         }
-        const lookup_data = std.posix.mmap(
-            null,
-            lk_size,
-            .{ .READ = true },
-            .{ .TYPE = .SHARED },
-            lk_file.handle,
-            0,
-        ) catch {
-            std.posix.munmap(postings_data);
+        const lookup_data = cio.mapFileRead(io, allocator, lk_file, lk_size) catch {
+            cio.unmapFileRead(allocator, postings_data);
             return null;
         };
-        errdefer std.posix.munmap(lookup_data);
+        errdefer cio.unmapFileRead(allocator, lookup_data);
 
         // Validate postings header
-        if (!std.mem.eql(u8, postings_data[0..4], &TrigramIndex.POSTINGS_MAGIC)) return null;
+        if (!std.mem.eql(u8, postings_data[0..4], &TrigramIndex.POSTINGS_MAGIC)) return error.MalformedIndex;
         const post_version = std.mem.readInt(u16, postings_data[4..6], .little);
-        if (post_version < 1 or post_version > TrigramIndex.FORMAT_VERSION) return null;
+        if (post_version < 1 or post_version > TrigramIndex.FORMAT_VERSION) return error.MalformedIndex;
         const file_count: u32 = if (post_version >= 3)
             std.mem.readInt(u32, postings_data[6..10], .little)
         else
             std.mem.readInt(u16, postings_data[6..8], .little);
 
         const file_table_start: usize = if (post_version >= 3) blk: {
-            if (postings_data.len < 51) return null;
+            if (postings_data.len < 51) return error.MalformedIndex;
             break :blk 51;
         } else if (post_version >= 2) blk: {
-            if (postings_data.len < 49) return null;
+            if (postings_data.len < 49) return error.MalformedIndex;
             break :blk 49;
         } else 8;
 
@@ -2113,10 +2095,10 @@ pub const MmapTrigramIndex = struct {
         }
         var pos: usize = file_table_start;
         for (0..file_count) |i| {
-            if (pos + 2 > postings_data.len) return null;
+            if (pos + 2 > postings_data.len) return error.MalformedIndex;
             const path_len = std.mem.readInt(u16, postings_data[pos..][0..2], .little);
             pos += 2;
-            if (pos + path_len > postings_data.len) return null;
+            if (pos + path_len > postings_data.len) return error.MalformedIndex;
             file_table[i] = try allocator.dupe(u8, postings_data[pos .. pos + path_len]);
             parsed += 1;
             pos += path_len;
@@ -2132,11 +2114,11 @@ pub const MmapTrigramIndex = struct {
         const postings_start = pos;
 
         // Validate lookup header
-        if (!std.mem.eql(u8, lookup_data[0..4], &TrigramIndex.LOOKUP_MAGIC)) return null;
+        if (!std.mem.eql(u8, lookup_data[0..4], &TrigramIndex.LOOKUP_MAGIC)) return error.MalformedIndex;
         const lk_version = std.mem.readInt(u16, lookup_data[4..6], .little);
-        if (lk_version < 1 or lk_version > TrigramIndex.FORMAT_VERSION) return null;
+        if (lk_version < 1 or lk_version > TrigramIndex.FORMAT_VERSION) return error.MalformedIndex;
         const entry_count = std.mem.readInt(u32, lookup_data[8..12], .little);
-        if (lookup_data.len < 12 + entry_count * @sizeOf(TrigramIndex.LookupEntry)) return null;
+        if (lookup_data.len < 12 + entry_count * @sizeOf(TrigramIndex.LookupEntry)) return error.MalformedIndex;
 
         return MmapTrigramIndex{
             .postings_data = postings_data,
@@ -2154,8 +2136,8 @@ pub const MmapTrigramIndex = struct {
         for (self.file_table) |p| self.allocator.free(p);
         self.allocator.free(self.file_table);
         self.file_set.deinit();
-        std.posix.munmap(self.postings_data);
-        std.posix.munmap(self.lookup_data);
+        cio.unmapFileRead(self.allocator, self.postings_data);
+        cio.unmapFileRead(self.allocator, self.lookup_data);
     }
 
     pub fn fileCount(self: *const MmapTrigramIndex) u32 {

@@ -30,3 +30,8 @@ logs/
 # Dependency / tooling caches
 zig-pkg/
 __pycache__/
+# Test-run zig global cache (tests invoke `zig build --global-cache-dir .zig-global-cache`)
+.zig-global-cache/
+
+# Local Codex plugin tooling
+.codex-tools/

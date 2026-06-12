@@ -14,6 +14,15 @@ const linter_pref = @import("linter_pref.zig");
 const ContentCache = @import("hot_cache.zig").ContentCache;
 const git = @import("git.zig");
 
+test "cio: processId returns the real pid on every platform" {
+    // nuke's self-pid guard and randU64's entropy mix both assume a real pid.
+    // A platform stub returning 0 (the pre-fix Windows behavior) breaks both
+    // silently, so pin: non-zero and stable across calls.
+    const pid = cio.processId();
+    try testing.expect(pid != 0);
+    try testing.expectEqual(pid, cio.processId());
+}
+
 test "store: record and retrieve snapshots" {
     var store = Store.init(testing.allocator);
     defer store.deinit();
