@@ -168,8 +168,10 @@ pub fn pageRank(
     const out_weight = try allocator.alloc(f32, n_nodes);
     defer allocator.free(out_weight);
     @memset(out_weight, 0);
+    // Only edges with valid destinations propagate rank below, so out_weight
+    // must count exactly those — otherwise valid targets under-receive.
     for (edges) |e| {
-        if (e.from < n_nodes) out_weight[e.from] += e.weight;
+        if (e.from < n_nodes and e.to < n_nodes) out_weight[e.from] += e.weight;
     }
 
     const leak: f32 = (1.0 - damping) / @as(f32, @floatFromInt(n_nodes));

@@ -392,7 +392,10 @@ const FilteredWalker = struct {
                         const real_target = rt_buf[0..rt_len];
                         if (self.real_root.len == 0) continue;
                         if (!std.mem.startsWith(u8, real_target, self.real_root)) continue;
-                        if (real_target.len != self.real_root.len and real_target[self.real_root.len] != '/') continue;
+                        // realPathFile returns native separators. Keep the
+                        // escape check native here; indexed relative paths
+                        // below still use '/' for cross-platform codedb output.
+                        if (real_target.len != self.real_root.len and real_target[self.real_root.len] != std.fs.path.sep) continue;
                         const gop = self.visited_real_paths.getOrPut(self.allocator, real_target) catch continue;
                         if (gop.found_existing) continue;
                         const dup = self.allocator.dupe(u8, real_target) catch {

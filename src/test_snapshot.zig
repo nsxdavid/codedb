@@ -17,6 +17,19 @@ const git_mod = @import("git.zig");
 const AgentRegistry = @import("agent.zig").AgentRegistry;
 const edit_mod = @import("edit.zig");
 
+/// Shared snapshot round-trip recipe for the load-path coverage tests
+/// (issue-537/539 family): write `exp`'s snapshot as `snap_name` inside `tmp`,
+/// then load it into the caller-owned `exp2`/`store`. Returns loadSnapshot's
+/// success flag.
+fn snapshotRoundTrip(exp: *Explorer, tmp: *testing.TmpDir, snap_name: []const u8, exp2: *Explorer, store: *Store, load_alloc: std.mem.Allocator) !bool {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ dir_path, snap_name });
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, exp, dir_path, snap_path, testing.allocator);
+    return snapshot_mod.loadSnapshot(io, snap_path, exp2, store, load_alloc);
+}
 
 test "issue-625: in-tree snapshot is added to .git/info/exclude" {
     var tmp = testing.tmpDir(.{});
@@ -110,7 +123,6 @@ test "issue-35: edits immediately update explorer and snapshot output" {
     try testing.expect(std.mem.indexOf(u8, after_snap, "oldName") == null);
 }
 
-
 test "snapshot_json: snapshot builds and is valid JSON" {
     // Explorer uses arena for internal data
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -147,7 +159,6 @@ test "snapshot_json: snapshot builds and is valid JSON" {
     try testing.expect(symbol_index.contains("main"));
     try testing.expect(symbol_index.contains("version"));
 }
-
 
 test "issue-44: snapshot stale after working tree changes cause stale query results" {
     var tmp = testing.tmpDir(.{});
@@ -204,7 +215,6 @@ test "issue-44: snapshot stale after working tree changes cause stale query resu
     }
     try testing.expect(results.len == 1);
 }
-
 
 test "issue-46: empty-repo snapshot rejected on load" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -288,6 +298,34 @@ test "snapshot: restored outlines borrow strings (round-trip intact + clean dein
     }
     try testing.expect(saw_alpha);
     try testing.expect(saw_beta);
+}
+
+// Pins the cio.mapFileRead / cio.unmapFileRead pair the snapshot loader leans
+// on. On POSIX this is a real mmap; on Windows it is a page-aligned heap buffer
+// read eagerly, so unmap must free with the exact size and alignment that map
+// allocated — testing.allocator flags any mismatch or leak. Also checks the
+// page alignment adoptContentSection's signature requires, and that the
+// mapping survives the source file being closed (the loader closes the
+// snapshot file while borrowed slices into the section stay live).
+test "snapshot: mapFileRead round-trips through unmapFileRead (size, alignment, content)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = "snapshot-section-bytes-0123456789";
+    {
+        var file = try tmp.dir.createFile(io, "mapped.bin", .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, payload);
+    }
+
+    const mapped = blk: {
+        var file = try tmp.dir.openFile(io, "mapped.bin", .{});
+        defer file.close(io);
+        break :blk try cio.mapFileRead(io, testing.allocator, file, payload.len);
+    };
+    try testing.expect(std.mem.isAligned(@intFromPtr(mapped.ptr), std.heap.page_size_min));
+    try testing.expectEqualStrings(payload, mapped);
+    cio.unmapFileRead(testing.allocator, mapped);
 }
 
 // Call-graph centrality (the ranking boost) is persisted in a snapshot section
@@ -378,7 +416,6 @@ test "snapshot: CONTENT_HASHES records the correct per-file hash (order-aligned)
     }
 }
 
-
 test "issue-220: snapshot fast load restores outlines and lazily rebuilds word index" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -453,13 +490,6 @@ test "issue-537: snapshot-restored files stay searchable when trigram index is n
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
-    const dir_path = path_buf[0..dir_path_len];
-    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/cold.codedb", .{dir_path});
-    defer testing.allocator.free(snap_path);
-    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
-
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena2.deinit();
     const aa2 = arena2.allocator();
@@ -467,7 +497,7 @@ test "issue-537: snapshot-restored files stay searchable when trigram index is n
     var store = Store.init(testing.allocator);
     defer store.deinit();
 
-    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, aa2);
+    const loaded = try snapshotRoundTrip(&exp, &tmp, "cold.codedb", &exp2, &store, aa2);
     try testing.expect(loaded);
     try testing.expect(exp2.outlines.get("cold_pkg/buried.zig") != null);
 
@@ -559,7 +589,6 @@ test "snapshot: parallel freshness load re-indexes changed files, restores the r
     }
 }
 
-
 test "snapshot: writer streams uncached file contents for large repos" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -617,7 +646,6 @@ test "snapshot: writer streams uncached file contents for large repos" {
     try testing.expect(loaded.wordIndexIsComplete());
 }
 
-
 test "issue-220: partial word index state rebuilds before search" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -660,7 +688,6 @@ test "issue-220: partial word index state rebuilds before search" {
     try testing.expect(exp2.wordIndexNeedsPersist());
 }
 
-
 test "issue-220: word index persistence tracking skips redundant rewrites" {
     var exp = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer exp.deinit();
@@ -684,7 +711,6 @@ test "issue-220: word index persistence tracking skips redundant rewrites" {
     exp.markWordIndexPersisted(second_gen);
     try testing.expect(!exp.wordIndexNeedsPersist());
 }
-
 
 test "issue-45: snapshot written in non-git directory cannot be loaded" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -716,7 +742,6 @@ test "issue-45: snapshot written in non-git directory cannot be loaded" {
     const snap_head = snapshot_mod.readSnapshotGitHead(io, snap_path);
     try testing.expect(snap_head == null);
 }
-
 
 test "issue-47: concurrent snapshot writes from parallel instances corrupt file" {
     // BUG: Two codedb instances indexing the same repo write codedb.snapshot
@@ -787,7 +812,6 @@ test "issue-47: concurrent snapshot writes from parallel instances corrupt file"
     try testing.expect(loaded);
 }
 
-
 test "issue-42: scan thread is joined before allocator-backed state is freed" {
     var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
@@ -818,7 +842,6 @@ test "issue-42: scan thread is joined before allocator-backed state is freed" {
     allocator.free(data_dir);
     _ = gpa.deinit();
 }
-
 
 test "issue-40: truncated snapshot silently loads partial data" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -860,7 +883,6 @@ test "issue-40: truncated snapshot silently loads partial data" {
     try testing.expect(!loaded);
 }
 
-
 test "issue-41: snapshot not validated against repo identity allows cross-project loading" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -888,7 +910,6 @@ test "issue-41: snapshot not validated against repo identity allows cross-projec
     const loaded = snapshot_mod.loadSnapshotValidated(io, snap_path, "/some/other/project", &exp2, &store, testing.allocator);
     try testing.expect(!loaded);
 }
-
 
 test "snapshot: symbol detail longer than 4096 bytes survives round-trip" {
     // Regression for readSectionString rejecting names/details > 4096 bytes.
@@ -935,7 +956,6 @@ test "snapshot: symbol detail longer than 4096 bytes survives round-trip" {
     const results = try exp2.findAllSymbols("bigSig", sym_arena.allocator());
     try testing.expect(results.len >= 1);
 }
-
 
 test "snapshot: corrupted OUTLINE_STATE section falls back to CONTENT load" {
     // Regression for the codedb 0.2.56 writer u16 overflow bug: when OUTLINE_STATE
@@ -988,7 +1008,6 @@ test "snapshot: corrupted OUTLINE_STATE section falls back to CONTENT load" {
     try testing.expect(results.len >= 1);
 }
 
-
 test "issue-379: snapshot loader returns true with zero outlines for empty-explorer snapshot" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1017,7 +1036,6 @@ test "issue-379: snapshot loader returns true with zero outlines for empty-explo
     }
 }
 
-
 test "issue-528: isSensitivePath parity between snapshot.zig and watcher.zig" {
     // The secret/credential filter is duplicated (snapshot persistence vs live
     // indexing). The #528 audit flagged a possible divergence; the two are
@@ -1026,20 +1044,20 @@ test "issue-528: isSensitivePath parity between snapshot.zig and watcher.zig" {
     // one path but not the other.
     const cases = [_][]const u8{
         // secrets — both copies must block
-        ".env",                  ".env.local",          ".env.production",
-        ".env.development",      ".env.staging",        ".env.test",
-        ".dev.vars",             ".npmrc",              ".pypirc",
-        ".netrc",                "credentials.json",    "service-account.json",
-        "secrets.json",          "secrets.yaml",        "secrets.yml",
-        "id_rsa",                "id_ed25519",          "server.key",
-        "cert.pem",              "keystore.jks",        "identity.pfx",
-        "bundle.p12",            "config/.env.local",   "a/b/secrets.yaml",
+        ".env",                         ".env.local",         ".env.production",
+        ".env.development",             ".env.staging",       ".env.test",
+        ".dev.vars",                    ".npmrc",             ".pypirc",
+        ".netrc",                       "credentials.json",   "service-account.json",
+        "secrets.json",                 "secrets.yaml",       "secrets.yml",
+        "id_rsa",                       "id_ed25519",         "server.key",
+        "cert.pem",                     "keystore.jks",       "identity.pfx",
+        "bundle.p12",                   "config/.env.local",  "a/b/secrets.yaml",
         "deep/nested/.ssh/known_hosts", ".gnupg/secring.gpg", "x/.aws/credentials",
         // non-secrets — both copies must allow (esp. the .env-prefix edge cases)
-        ".envoy.json",           ".environment",        ".envrc",
-        ".envconfig.yaml",       "main.zig",            "src/server.zig",
-        "README.md",             "package.json",        "id_rsa.pub",
-        "envvars.ts",            "Makefile",            "Dockerfile",
+        ".envoy.json",                  ".environment",       ".envrc",
+        ".envconfig.yaml",              "main.zig",           "src/server.zig",
+        "README.md",                    "package.json",       "id_rsa.pub",
+        "envvars.ts",                   "Makefile",           "Dockerfile",
     };
     for (cases) |p| {
         try testing.expectEqual(watcher.isSensitivePath(p), snapshot_mod.isSensitivePath(p));
@@ -1136,13 +1154,6 @@ test "issue-537b: snapshot-restored files resolve call edges (symbol_index diver
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
-    const dir_path = path_buf[0..dir_path_len];
-    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/callgraph.codedb", .{dir_path});
-    defer testing.allocator.free(snap_path);
-    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
-
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena2.deinit();
     const aa2 = arena2.allocator();
@@ -1150,7 +1161,7 @@ test "issue-537b: snapshot-restored files resolve call edges (symbol_index diver
     var store = Store.init(testing.allocator);
     defer store.deinit();
 
-    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, aa2);
+    const loaded = try snapshotRoundTrip(&exp, &tmp, "callgraph.codedb", &exp2, &store, aa2);
     try testing.expect(loaded);
     try testing.expect(exp2.outlines.get("main_537b.zig") != null);
 
@@ -1180,13 +1191,6 @@ test "issue-539: search recall includes snapshot-restored files (parity with wor
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
-    const dir_path = path_buf[0..dir_path_len];
-    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/recall.codedb", .{dir_path});
-    defer testing.allocator.free(snap_path);
-    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
-
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena2.deinit();
     const aa2 = arena2.allocator();
@@ -1194,7 +1198,7 @@ test "issue-539: search recall includes snapshot-restored files (parity with wor
     var store = Store.init(testing.allocator);
     defer store.deinit();
 
-    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, aa2);
+    const loaded = try snapshotRoundTrip(&exp, &tmp, "recall.codedb", &exp2, &store, aa2);
     try testing.expect(loaded);
 
     // Trigram non-empty (a hot file WITHOUT the term) so Tier 5 is ruled out —
@@ -1217,13 +1221,13 @@ test "issue-539: search recall includes snapshot-restored files (parity with wor
     try testing.expect(whits.len >= 1);
 }
 
-test "issue-539b: search recall ranks a relevant restored file above quota (index-blending)" {
+test "issue-539b: search recall ranks a relevant restored file above quota without rebuilding word index" {
     // #539 quota residual: even with restored files Tier-3-searchable, a MORE
     // relevant cold file was crowded out of a small max_results by less-relevant
-    // hot files — because searchContent never populated the (complete) word index
-    // that Tier 0 ranks from after a fast load. Fix: searchContent rebuilds the
-    // lazy word index (like searchWord), so the canonical file competes on
-    // relevance and isn't lost to tier-ordering.
+    // hot files. Plain search must not rebuild the full word index on every CLI
+    // invocation when a fast snapshot load leaves it incomplete; instead it
+    // reserves quota for restored skip-trigram files so reranking can still surface
+    // the canonical file without a full-repo rebuild.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -1242,27 +1246,20 @@ test "issue-539b: search recall ranks a relevant restored file above quota (inde
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
-    const dir_path = path_buf[0..dir_path_len];
-    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/recallq.codedb", .{dir_path});
-    defer testing.allocator.free(snap_path);
-    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
-
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena2.deinit();
     const aa2 = arena2.allocator();
     var exp2 = Explorer.init(aa2, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     var store = Store.init(testing.allocator);
     defer store.deinit();
-    _ = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, aa2);
+    _ = try snapshotRoundTrip(&exp, &tmp, "recallq.codedb", &exp2, &store, aa2);
 
     // HOT files (trigram) with the term ONCE each — quota pressure at max_results=2.
     try exp2.indexFile("h_a.zig", "pub fn a() void { const y = recallterm539; _ = y; }\n");
     try exp2.indexFile("h_b.zig", "pub fn b() void { const y = recallterm539; _ = y; }\n");
     try exp2.indexFile("h_c.zig", "pub fn c() void { const y = recallterm539; _ = y; }\n");
 
-    // The most-relevant (cold, 3 hits) file must make a 2-slot result set.
+    // The most-relevant restored file must make a 2-slot result set.
     const res = try exp2.searchContent("recallterm539", aa2, 2);
     var found_canonical = false;
     for (res) |r| if (std.mem.eql(u8, r.path, "recallpkg/canonical.zig")) {
@@ -1270,7 +1267,6 @@ test "issue-539b: search recall ranks a relevant restored file above quota (inde
     };
     try testing.expect(found_canonical);
 }
-
 
 test "issue-564: snapshot fast-load defers the symbol index until first symbol use" {
     // Pre-#564 the fast-load eagerly rebuilt the global symbol index for every

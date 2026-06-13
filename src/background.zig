@@ -3,6 +3,7 @@
 //! watchdogs (MCP stdin-HUP and cli-daemon timeout). Extracted from mainImpl;
 //! driven by commands.zig (serve/mcp/cli-daemon).
 const std = @import("std");
+const builtin = @import("builtin");
 const cio = @import("cio.zig");
 const Store = @import("store.zig").Store;
 const Explorer = @import("explore.zig").Explorer;
@@ -206,6 +207,12 @@ pub fn watcherDeferredLoop(ctx: *mcp_server.DeferredScan) void {
 
 pub fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
     const mcp = @import("mcp.zig");
+    if (builtin.os.tag == .windows) {
+        while (!shutdown.load(.acquire)) {
+            cio.sleepMs(mcp.dead_client_poll_ms);
+        }
+        return;
+    }
     const stdin = cio.File.stdin();
     while (!shutdown.load(.acquire)) {
         // Quick liveness check: poll stdin for POLLHUP (client disconnected).

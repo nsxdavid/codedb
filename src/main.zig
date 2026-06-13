@@ -53,14 +53,18 @@ const cliIsQueryCmd = cli_args.cliIsQueryCmd;
 /// fallible work into mainImpl which runs after we've already had a chance
 /// to surface usage / --version output via the fast path.
 pub fn main(init: std.process.Init.Minimal) void {
-    cio.setProcessArgs(init.args.vector);
-    if (handleFastPath(init.args.vector)) return;
+    const argv: []const [*:0]const u8 = if (builtin.os.tag == .windows)
+        (cio.windowsArgv(init.args) catch &.{})
+    else
+        init.args.vector;
+    cio.setProcessArgs(argv);
+    if (handleFastPath(argv)) return;
     mainTrampoline() catch |err| {
         // Surface the failure on stderr so users see something even if the
         // worker thread crashes during startup.
         var buf: [256]u8 = undefined;
         if (std.fmt.bufPrint(&buf, "codedb: fatal startup error: {s}\n", .{@errorName(err)})) |msg| {
-            _ = std.c.write(2, msg.ptr, msg.len);
+            cio.writeFd(2, msg);
         } else |_| {}
         std.process.exit(1);
     };
@@ -78,15 +82,12 @@ fn mainTrampoline() !void {
 /// further down the stack can't take out plain `codedb` / `--help` /
 /// `--version` invocations.
 fn handleFastPath(argv: []const [*:0]const u8) bool {
-    const stdout_fd: c_int = 1;
-    const stderr_fd: c_int = 2;
-
     if (argv.len < 2) {
         const msg =
             "codedb  code intelligence server\n\n" ++
             "  usage: codedb [root] <command> [args...]\n\n" ++
             "  run `codedb --help` for the full command list.\n";
-        _ = std.c.write(stderr_fd, msg.ptr, msg.len);
+        cio.writeFd(2, msg);
         std.process.exit(1);
     }
 
@@ -96,7 +97,7 @@ fn handleFastPath(argv: []const [*:0]const u8) bool {
         const out = std.fmt.bufPrint(&buf, "codedb {s}\n", .{release_info.semver}) catch {
             std.process.exit(0);
         };
-        _ = std.c.write(stdout_fd, out.ptr, out.len);
+        cio.writeFd(1, out);
         std.process.exit(0);
     }
 
@@ -114,6 +115,7 @@ const runQuery = query_mod.runQuery;
 
 const cli_proxy = @import("cli_proxy.zig");
 pub const daemonLockTryAcquire = cli_proxy.daemonLockTryAcquire;
+pub const daemonLockRelease = cli_proxy.daemonLockRelease;
 pub const daemonLockAvailable = cli_proxy.daemonLockAvailable;
 const cliTryProxy = cli_proxy.cliTryProxy;
 
