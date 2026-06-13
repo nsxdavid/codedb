@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cio = @import("cio.zig");
 const testing = std.testing;
 const io = std.testing.io;
@@ -25,10 +26,50 @@ comptime {
     _ = @import("config.zig");
 }
 
+fn zigExe() []const u8 {
+    // Tests should follow the documented pre-merge command: reviewers/CI put
+    // zig on PATH instead of depending on workstation-local tool directories.
+    return "zig";
+}
+
+fn builtCodedbExe() []const u8 {
+    return if (builtin.os.tag == .windows) ".\\zig-out\\bin\\codedb.exe" else "./zig-out/bin/codedb";
+}
+
+/// Save an env var's current value so a test that overrides it can put the
+/// ORIGINAL back, instead of unconditionally unsetting (which would strip e.g.
+/// the runner's HOME/USERPROFILE for every later test in the process).
+const EnvVarGuard = struct {
+    name: []const u8,
+    had_prev: bool,
+    prev_len: usize,
+    prev: [4096]u8,
+
+    fn save(name: []const u8) EnvVarGuard {
+        var g = EnvVarGuard{ .name = name, .had_prev = false, .prev_len = 0, .prev = undefined };
+        if (cio.posixGetenv(name)) |v| {
+            if (v.len <= g.prev.len) {
+                @memcpy(g.prev[0..v.len], v);
+                g.prev_len = v.len;
+                g.had_prev = true;
+            }
+        }
+        return g;
+    }
+
+    fn restore(self: *const EnvVarGuard) void {
+        if (self.had_prev) {
+            cio.posixSetenv(self.name, self.prev[0..self.prev_len]);
+        } else {
+            cio.posixUnsetenv(self.name);
+        }
+    }
+};
+
 fn buildCliForHelpTests() !void {
     const build = try cio.runCapture(.{
         .allocator = testing.allocator,
-        .argv = &.{ "zig", "build" },
+        .argv = &.{ zigExe(), "build", "--global-cache-dir", ".zig-global-cache" },
         .max_output_bytes = 8192,
     });
     defer testing.allocator.free(build.stdout);
@@ -36,6 +77,83 @@ fn buildCliForHelpTests() !void {
 
     try testing.expect(build.term == .Exited);
     try testing.expect(build.term.Exited == 0);
+}
+
+test "windows cli-daemon auto-spawn proxies next query from unicode root" {
+    // POSIX uses the Unix-socket daemon path. This test exercises the Windows
+    // behavior-equivalent path: detached CreateProcessW startup plus named-pipe
+    // proxying for the next process.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    try buildCliForHelpTests();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "project-unicode-å/src");
+    try tmp.dir.createDirPath(io, ".home");
+
+    {
+        const f = try tmp.dir.createFile(io, "project-unicode-å/src/sample.zig", .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "pub fn sampleSymbolForDaemon() void {}\n");
+    }
+
+    var project_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const project_len = try tmp.dir.realPathFile(io, "project-unicode-å", &project_buf);
+    const project_root = project_buf[0..project_len];
+
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home_len = try tmp.dir.realPathFile(io, ".home", &home_buf);
+    const test_home = home_buf[0..home_len];
+
+    const g_allow = EnvVarGuard.save("CODEDB_ALLOW_TEMP");
+    defer g_allow.restore();
+    const g_idle = EnvVarGuard.save("CODEDB_CLI_DAEMON_IDLE_MS");
+    defer g_idle.restore();
+    const g_home = EnvVarGuard.save("HOME");
+    defer g_home.restore();
+    const g_profile = EnvVarGuard.save("USERPROFILE");
+    defer g_profile.restore();
+    cio.posixSetenv("CODEDB_ALLOW_TEMP", "1");
+    cio.posixSetenv("CODEDB_CLI_DAEMON_IDLE_MS", "750");
+    cio.posixSetenv("HOME", test_home);
+    cio.posixSetenv("USERPROFILE", test_home);
+
+    const cold = try cio.runCapture(.{
+        .allocator = testing.allocator,
+        .argv = &.{ builtCodedbExe(), project_root, "status" },
+        .max_output_bytes = 64 * 1024,
+    });
+    defer testing.allocator.free(cold.stdout);
+    defer testing.allocator.free(cold.stderr);
+    try testing.expect(cold.term == .Exited);
+    try testing.expectEqual(@as(u8, 0), cold.term.Exited);
+
+    var warm_seen = false;
+    var attempts: usize = 0;
+    while (attempts < 20) : (attempts += 1) {
+        cio.sleepMs(150);
+        const warm = try cio.runCapture(.{
+            .allocator = testing.allocator,
+            .argv = &.{ builtCodedbExe(), project_root, "find", "sampleSymbolForDaemon" },
+            .max_output_bytes = 64 * 1024,
+        });
+        defer testing.allocator.free(warm.stdout);
+        defer testing.allocator.free(warm.stderr);
+
+        if (warm.term == .Exited and warm.term.Exited == 0 and
+            std.mem.indexOf(u8, warm.stdout, "src/sample.zig") != null and
+            std.mem.indexOf(u8, warm.stdout, "loaded snapshot") == null)
+        {
+            warm_seen = true;
+            break;
+        }
+    }
+
+    // Let the short-idle detached daemon release files before tmp cleanup on Windows.
+    cio.sleepMs(900);
+    try testing.expect(warm_seen);
 }
 
 test "issue-59: telemetry writes session, tool, and codebase stats ndjson" {
@@ -89,9 +207,21 @@ test "issue-60: telemetry disabled path is a no-op" {
 }
 
 test "issue-77: mcp index accepts temporary-directory roots that cause pathological cache growth" {
+    // This regression pins POSIX /private/tmp root-policy behavior. Windows temp
+    // paths do not use that prefix, so native root-policy coverage lives in the
+    // shared root_policy tests instead of this macOS-specific fixture.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     var tmp_name_buf: [128]u8 = undefined;
     const tmp_name = try std.fmt.bufPrint(&tmp_name_buf, "codedb-issue-77-{d}", .{@as(i64, @intCast(@divTrunc(cio.nanoTimestamp(), 1000)))});
-    const tmp_root = try std.fs.path.join(testing.allocator, &.{ "/private/tmp", tmp_name });
+    var win_tmp = if (builtin.os.tag == .windows) testing.tmpDir(.{}) else undefined;
+    defer if (builtin.os.tag == .windows) win_tmp.cleanup();
+    var win_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base_tmp = if (builtin.os.tag == .windows) blk: {
+        const n = try win_tmp.dir.realPathFile(io, ".", &win_root_buf);
+        break :blk win_root_buf[0..n];
+    } else "/private/tmp";
+    const tmp_root = try std.fs.path.join(testing.allocator, &.{ base_tmp, tmp_name });
     defer testing.allocator.free(tmp_root);
 
     std.Io.Dir.cwd().createDirPath(io, tmp_root) catch |err| switch (err) {
@@ -110,7 +240,7 @@ test "issue-77: mcp index accepts temporary-directory roots that cause pathologi
 
     const result = try cio.runCapture(.{
         .allocator = testing.allocator,
-        .argv = &.{ "zig", "build", "run", "--", tmp_root, "snapshot" },
+        .argv = &.{ zigExe(), "build", "--global-cache-dir", ".zig-global-cache", "run", "--", tmp_root, "snapshot" },
         .max_output_bytes = 256 * 1024,
     });
     defer testing.allocator.free(result.stdout);
@@ -220,7 +350,7 @@ test "issue-150: --help prints usage" {
 
     const result = try cio.runCapture(.{
         .allocator = testing.allocator,
-        .argv = &.{ "./zig-out/bin/codedb", "--help" },
+        .argv = &.{ builtCodedbExe(), "--help" },
         .max_output_bytes = 8192,
     });
     defer testing.allocator.free(result.stdout);
@@ -241,7 +371,7 @@ test "issue-150: -h prints usage" {
 
     const result = try cio.runCapture(.{
         .allocator = testing.allocator,
-        .argv = &.{ "./zig-out/bin/codedb", "-h" },
+        .argv = &.{ builtCodedbExe(), "-h" },
         .max_output_bytes = 8192,
     });
     defer testing.allocator.free(result.stdout);
@@ -425,12 +555,16 @@ test "issue-148: dead MCP clients are polled every second" {
 }
 
 test "issue-148: POLLHUP detects closed pipe" {
+    // This test asserts the POSIX pipe/poll primitive directly. Windows uses
+    // handle-based pipes for equivalent disconnect detection, so the shared MCP
+    // behavior stays covered by transport-level tests instead.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     // Verify the polling infrastructure works for pipe-based transports
     const pipe = try cio.makePipe();
-    defer _ = std.c.close(pipe[0]);
+    defer cio.closeFd(pipe[0]);
 
     // Close write end — simulates client disconnect
-    _ = std.c.close(pipe[1]);
+    cio.closeFd(pipe[1]);
 
     // Poll should detect POLLHUP on the read end
     var fds = [_]std.posix.pollfd{.{
@@ -511,9 +645,12 @@ test "issue-278: MCP session may remain idle longer than old timeout" {
 }
 
 test "issue-148: open pipe does not trigger HUP" {
+    // POSIX poll reports HUP on file descriptors; Windows named/anonymous pipes
+    // expose the same client-lifetime signal through HANDLE operations instead.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const pipe = try cio.makePipe();
-    defer _ = std.c.close(pipe[0]);
-    defer _ = std.c.close(pipe[1]);
+    defer cio.closeFd(pipe[0]);
+    defer cio.closeFd(pipe[1]);
 
     var poll_fds = [_]std.posix.pollfd{.{
         .fd = pipe[0],
@@ -526,9 +663,14 @@ test "issue-148: open pipe does not trigger HUP" {
 }
 
 test "issue-148: codedb mcp exits when stdin is closed" {
+    // This integration test depends on POSIX stdin pipe EOF through zig build
+    // run. Windows uses handle/named-pipe disconnect semantics for equivalent
+    // MCP shutdown behavior, covered by the transport tests.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     // Integration test: spawn codedb mcp, close stdin, verify it exits
     var child = std.process.spawn(io, .{
-        .argv = &.{ "zig", "build", "run", "--", "--mcp" },
+        .argv = &.{ zigExe(), "build", "--global-cache-dir", ".zig-global-cache", "run", "--", "--mcp" },
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .ignore,
@@ -1228,9 +1370,10 @@ test "issue-512: direct tools call accepts inline args when arguments is empty" 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, call_json, .{});
     defer parsed.deinit();
 
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const pipe = try cio.makePipe();
-    defer _ = std.c.close(pipe[0]);
-    defer _ = std.c.close(pipe[1]);
+    defer cio.closeFd(pipe[0]);
+    defer cio.closeFd(pipe[1]);
 
     bench_ctx.runHandleCall(
         io,
@@ -2158,8 +2301,7 @@ test "issue-592: cli-daemon spawn lock is exclusive per project" {
     // ...and the CLI spawn probe must report the lock as taken.
     try testing.expect(!main_mod.daemonLockAvailable(dir_path));
 
-    _ = std.c.flock(held.?, std.c.LOCK.UN);
-    _ = std.c.close(held.?);
+    main_mod.daemonLockRelease(held.?);
     try testing.expect(main_mod.daemonLockAvailable(dir_path));
 }
 
@@ -2295,4 +2437,32 @@ test "issue-531: codedb_context max_tokens packs sections by value under the bud
     try testing.expect(std.mem.indexOf(u8, out_budget.items, "# Task") != null);
     try testing.expect(std.mem.indexOf(u8, out_budget.items, "## Most-relevant files") != null);
     try testing.expect(std.mem.indexOf(u8, out_budget.items, "## Top sites") == null);
+}
+
+test "windows: spawnDetached command line round-trips argv with trailing backslashes" {
+    // spawnDetachedWindows quotes every arg but escapes only embedded quotes.
+    // Per CommandLineToArgvW rules, backslashes preceding a quote must be
+    // doubled: an arg ending in a backslash (any Windows root path like
+    // `D:\` or `D:\proj\`) is emitted as "D:\proj\" whose trailing \" escapes
+    // the CLOSING quote, so the spawned child sees that arg fused with
+    // whatever follows. This is the real cli-daemon auto-spawn argv shape
+    // (self_exe, abs_root, "cli-daemon") with a drive-root project. The
+    // command line is split back with std's Windows argv parser — the same
+    // CRT-compatible rules every spawned child applies.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    const argv = [_][]const u8{ "C:\\tools\\codedb.exe", "D:\\", "cli-daemon", "say \"hi\"", "a\\\\b", "tail\\\\" };
+    const cmd = cio.windowsCommandLine(alloc, &argv) orelse return error.TestUnexpectedResult;
+    defer alloc.free(cmd);
+    const cmd_w = try std.unicode.utf8ToUtf16LeAlloc(alloc, cmd);
+    defer alloc.free(cmd_w);
+
+    var it = try std.process.Args.Iterator.Windows.init(alloc, cmd_w);
+    defer it.deinit();
+    for (argv) |expected| {
+        const got = it.next() orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(expected, got);
+    }
+    try testing.expect(it.next() == null);
 }

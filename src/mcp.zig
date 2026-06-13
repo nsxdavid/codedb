@@ -208,7 +208,7 @@ const ProjectCtx = struct {
 
 fn getProjectDataDir(allocator: std.mem.Allocator, project_path: []const u8) ?[]u8 {
     const hash = std.hash.Wyhash.hash(0, project_path);
-    const home = cio.posixGetenv("HOME") orelse {
+    const home = cio.userHome() orelse {
         return std.fmt.allocPrint(allocator, "{s}/.codedb", .{project_path}) catch null;
     };
 
@@ -427,7 +427,7 @@ const ProjectCache = struct {
             const hash = std.hash.Wyhash.hash(0, p);
             var central_buf: [std.fs.max_path_bytes]u8 = undefined;
             const loaded_central = blk: {
-                const home = cio.posixGetenv("HOME") orelse break :blk false;
+                const home = cio.userHome() orelse break :blk false;
                 const central = std.fmt.bufPrint(&central_buf, "{s}/.codedb/projects/{x}/codedb.snapshot", .{ home, hash }) catch break :blk false;
                 break :blk snapshot_mod.loadSnapshot(io, central, &new_entry.explorer, &new_entry.store, self.alloc);
             };
@@ -543,7 +543,7 @@ pub const BenchContext = struct {
         dispatch(io, alloc, tool, args, &out, store, explorer, agents, &self.cache, null, 1);
         const elapsed = cio.nanoTimestamp() - t0;
 
-        const is_error = std.mem.startsWith(u8, out.items, "error:");
+        const is_error = toolOutputIsError(out.items);
         telem.recordToolCall(name, elapsed, is_error, out.items.len);
 
         var summary: std.ArrayList(u8) = .empty;
@@ -1167,7 +1167,7 @@ fn handleCall(
     dispatch(io, alloc, tool, args, &out, store, explorer, agents, cache, deferred_scan, edit_agent_id);
     const elapsed = cio.nanoTimestamp() - t0;
 
-    const is_error = std.mem.startsWith(u8, out.items, "error:");
+    const is_error = toolOutputIsError(out.items);
     telem.recordToolCall(name, elapsed, is_error, out.items.len);
 
     if (std.mem.eql(u8, name, "codedb_search") or std.mem.eql(u8, name, "codedb_find") or std.mem.eql(u8, name, "codedb_word")) {
@@ -1453,8 +1453,8 @@ fn handleSymbol(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             writeJsonToolError(out, alloc, "codedb_symbol", "missing_query", "need name, prefix, pattern, or kind");
         } else {
             out.appendSlice(alloc, "error: need name, prefix, pattern, or kind") catch {};
+            appendBundleArgKeysDiagnostic(alloc, out, args);
         }
-        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     }
 
@@ -1507,12 +1507,8 @@ fn handleSymbol(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     }
 
     if (json_fmt) {
-        out.appendSlice(alloc, "{\"ok\":true,\"tool\":\"codedb_symbol\",\"count\":") catch {};
-        var cnt_buf: [16]u8 = undefined;
-        const cnt_s = std.fmt.bufPrint(&cnt_buf, "{d}", .{results.len}) catch "0";
-        out.appendSlice(alloc, cnt_s) catch {};
-        out.appendSlice(alloc, ",\"match_mode\":") catch {};
-        appendJsonStr(out, alloc, symbolMatchModeLabel(spec));
+        out.appendSlice(alloc, "{\"ok\":true,\"tool\":\"codedb_symbol\",") catch {};
+        appendJsonKeyNum(out, alloc, "count", results.len);
         out.appendSlice(alloc, ",\"meta\":{\"index\":\"symbol_index+outline\",\"match_mode\":") catch {};
         appendJsonStr(out, alloc, symbolMatchModeLabel(spec));
         out.append(alloc, '}') catch {};
@@ -1521,19 +1517,23 @@ fn handleSymbol(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             if (i > 0) out.append(alloc, ',') catch {};
             out.appendSlice(alloc, "{\"path\":") catch {};
             appendJsonStr(out, alloc, r.path);
-            out.appendSlice(alloc, ",\"line\":") catch {};
-            var line_buf: [16]u8 = undefined;
-            const line_s = std.fmt.bufPrint(&line_buf, "{d}", .{r.symbol.line_start}) catch "0";
-            out.appendSlice(alloc, line_s) catch {};
+            out.append(alloc, ',') catch {};
+            appendJsonKeyNum(out, alloc, "line", r.symbol.line_start);
             out.appendSlice(alloc, ",\"kind\":") catch {};
             appendJsonStr(out, alloc, @tagName(r.symbol.kind));
             out.appendSlice(alloc, ",\"name\":") catch {};
             appendJsonStr(out, alloc, r.symbol.name);
-            out.appendSlice(alloc, ",\"score\":") catch {};
-            var score_buf: [32]u8 = undefined;
-            const score_s = std.fmt.bufPrint(&score_buf, "{d}", .{@as(f64, r.score)}) catch "0";
-            out.appendSlice(alloc, score_s) catch {};
-            out.appendSlice(alloc, ",\"confidence\":\"indexed\"}") catch {};
+            out.append(alloc, ',') catch {};
+            appendJsonKeyNum(out, alloc, "score", r.score);
+            out.appendSlice(alloc, ",\"confidence\":\"indexed\"") catch {};
+            if (include_body) {
+                if (explorer.getSymbolBody(r.path, r.symbol.line_start, r.symbol.line_end, alloc) catch null) |b| {
+                    defer alloc.free(b);
+                    out.append(alloc, ',') catch {};
+                    appendJsonKeyStr(out, alloc, "body", b);
+                }
+            }
+            out.append(alloc, '}') catch {};
         }
         out.appendSlice(alloc, "]}") catch {};
         return;
@@ -1570,15 +1570,23 @@ fn handleSymbol(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
 
 fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const query = getStr(args, "query") orelse {
-        out.appendSlice(alloc, "error: missing 'query' argument") catch {};
-        appendBundleArgKeysDiagnostic(alloc, out, args);
+        if (wantsJsonFormat(args)) {
+            writeJsonToolError(out, alloc, "codedb_search", "missing_query", "missing 'query' argument");
+        } else {
+            out.appendSlice(alloc, "error: missing 'query' argument") catch {};
+            appendBundleArgKeysDiagnostic(alloc, out, args);
+        }
         return;
     };
     // Bug 7: validate args explicitly. Pre-fix: empty query / non-positive
     // max_results all returned "0 results" and the agent thought the search
     // ran with nothing matching, when really the call was malformed.
     if (query.len == 0) {
-        out.appendSlice(alloc, "error: empty query — pass a non-empty 'query' string") catch {};
+        if (wantsJsonFormat(args)) {
+            writeJsonToolError(out, alloc, "codedb_search", "missing_query", "empty query — pass a non-empty 'query' string");
+        } else {
+            out.appendSlice(alloc, "error: empty query — pass a non-empty 'query' string") catch {};
+        }
         return;
     }
     if (getInt(args, "max_results")) |n| {
@@ -1720,7 +1728,12 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         }
     } else if (is_regex) {
         const results = explorer.searchContentRegex(query, alloc, max_results) catch |e| {
-            out.appendSlice(alloc, if (e == error.InvalidRegex) "error: invalid regex" else "error: regex search failed") catch {};
+            const invalid = e == error.InvalidRegex;
+            if (json_fmt) {
+                writeJsonToolError(out, alloc, "codedb_search", if (invalid) "invalid_regex" else "search_failed", if (invalid) "invalid regex" else "regex search failed");
+            } else {
+                out.appendSlice(alloc, if (invalid) "error: invalid regex" else "error: regex search failed") catch {};
+            }
             return;
         };
         defer {
@@ -1773,7 +1786,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, visible_total - shown }) catch {};
         }
     } else {
-        if (path_glob == null and !compact) {
+        if (path_glob == null and !compact and !json_fmt) {
             const rendered = explorer.renderPlainSearch(query, alloc, out, max_results, paths_only) catch {
                 out.appendSlice(alloc, "error: search failed") catch {};
                 return;
@@ -1791,7 +1804,11 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         const want_count = @min(offset_n + max_results + 1, 100000);
         var fetch_count = want_count;
         var fetched = explorer.searchContentAuto(query, alloc, fetch_count) catch {
-            out.appendSlice(alloc, "error: search failed") catch {};
+            if (json_fmt) {
+                writeJsonToolError(out, alloc, "codedb_search", "search_failed", "search failed");
+            } else {
+                out.appendSlice(alloc, "error: search failed") catch {};
+            }
             return;
         };
         // #560: path_glob filters AFTER ranking, so a window of global results
@@ -1814,7 +1831,11 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
                 }
                 alloc.free(fetched);
                 fetched = explorer.searchContentAuto(query, alloc, fetch_count) catch {
-                    out.appendSlice(alloc, "error: search failed") catch {};
+                    if (json_fmt) {
+                        writeJsonToolError(out, alloc, "codedb_search", "search_failed", "search failed");
+                    } else {
+                        out.appendSlice(alloc, "error: search failed") catch {};
+                    }
                     return;
                 };
             }
@@ -2051,7 +2072,13 @@ fn handleCallpath(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out
         w.print("no call path from '{s}' to '{s}' within {d} hops\n", .{ from_name, to_name, max_hops }) catch {};
         return;
     };
-    defer alloc.free(path);
+    defer {
+        for (path) |step| {
+            alloc.free(step.path);
+            alloc.free(step.name);
+        }
+        alloc.free(path);
+    }
 
     const w = cio.listWriter(out, alloc);
     w.print("call path ({d} hops): {s} → {s}\n", .{ path.len - 1, from_name, to_name }) catch {};
@@ -3447,7 +3474,7 @@ fn handleBundle(
         // Issue #357 / #423: per-tool handlers already append the
         // `received keys` diagnostic on missing-arg errors, so the bundle
         // wrapper does NOT re-append it. Doing so emits the line twice.
-        if (std.mem.startsWith(u8, sub_out.items, "error:")) {
+        if (toolOutputIsError(sub_out.items)) {
             fail_count += 1;
         } else {
             ok_count += 1;
@@ -3845,7 +3872,7 @@ pub fn appendRemoteErrorHint(alloc: std.mem.Allocator, out: *std.ArrayList(u8), 
 // ── Local project tools ─────────────────────────────────────────────────────
 
 fn handleProjects(io: std.Io, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) void {
-    const home = cio.posixGetenv("HOME") orelse {
+    const home = cio.userHome() orelse {
         out.appendSlice(alloc, "error: cannot read HOME") catch {};
         return;
     };
@@ -4319,7 +4346,7 @@ fn cliUsage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), usage: []const u8
 /// Zero-result paths (e.g. find's "no matches") use non-`error:` wording and
 /// therefore keep exit 0.
 pub fn finishCli(out: *std.ArrayList(u8), start: usize) u8 {
-    return if (std.mem.startsWith(u8, out.items[start..], "error:")) 1 else 0;
+    return if (toolOutputIsError(out.items[start..])) 1 else 0;
 }
 /// Parsed `deps` invocation. `max_depth` stays null unless `--max-depth N` was
 /// given so the handler keeps its own default for transitive walks.
@@ -5116,7 +5143,7 @@ fn wantsJsonFormat(args: *const std.json.ObjectMap) bool {
 
 fn appendJsonStr(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) void {
     out.append(alloc, '"') catch return;
-    mcpj.writeEscaped(alloc, out, s);
+    writeEscaped(alloc, out, s);
     out.append(alloc, '"') catch return;
 }
 
@@ -5131,28 +5158,21 @@ fn appendJsonKeyBool(out: *std.ArrayList(u8), alloc: std.mem.Allocator, key: []c
     out.appendSlice(alloc, if (value) ":true" else ":false") catch {};
 }
 
-fn appendJsonKeyUsize(out: *std.ArrayList(u8), alloc: std.mem.Allocator, key: []const u8, value: usize) void {
+fn appendJsonKeyNum(out: *std.ArrayList(u8), alloc: std.mem.Allocator, key: []const u8, value: anytype) void {
     appendJsonStr(out, alloc, key);
     out.append(alloc, ':') catch return;
-    var buf: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return;
+    var buf: [40]u8 = undefined;
+    const s = switch (@typeInfo(@TypeOf(value))) {
+        .float, .comptime_float => std.fmt.bufPrint(&buf, "{d}", .{@as(f64, value)}) catch return,
+        else => std.fmt.bufPrint(&buf, "{d}", .{value}) catch return,
+    };
     out.appendSlice(alloc, s) catch {};
 }
 
-fn appendJsonKeyU8(out: *std.ArrayList(u8), alloc: std.mem.Allocator, key: []const u8, value: u8) void {
-    appendJsonStr(out, alloc, key);
-    out.append(alloc, ':') catch return;
-    var buf: [8]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return;
-    out.appendSlice(alloc, s) catch {};
-}
-
-fn appendJsonKeyF32(out: *std.ArrayList(u8), alloc: std.mem.Allocator, key: []const u8, value: f32) void {
-    appendJsonStr(out, alloc, key);
-    out.append(alloc, ':') catch return;
-    var buf: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{@as(f64, value)}) catch return;
-    out.appendSlice(alloc, s) catch {};
+/// True when a tool handler's output indicates failure: the plain-text
+/// "error:" marker, or the format=json error envelope from writeJsonToolError.
+pub fn toolOutputIsError(out: []const u8) bool {
+    return std.mem.startsWith(u8, out, "error:") or std.mem.startsWith(u8, out, "{\"ok\":false");
 }
 
 fn writeJsonToolError(out: *std.ArrayList(u8), alloc: std.mem.Allocator, tool: []const u8, code: []const u8, message: []const u8) void {
@@ -5172,14 +5192,20 @@ fn appendSearchProvenanceMeta(out: *std.ArrayList(u8), alloc: std.mem.Allocator,
     out.appendSlice(alloc, "\"meta\":{") catch {};
     appendJsonKeyStr(out, alloc, "index", "trigram+outline");
     out.appendSlice(alloc, ",") catch {};
-    appendJsonKeyU8(out, alloc, "tier_reached", bd.tier_reached);
+    appendJsonKeyNum(out, alloc, "tier_reached", bd.tier_reached);
     out.appendSlice(alloc, ",") catch {};
-    appendJsonKeyUsize(out, alloc, "skip_trigram_files", skip);
+    appendJsonKeyNum(out, alloc, "skip_trigram_files", skip);
     out.appendSlice(alloc, ",") catch {};
-    appendJsonKeyUsize(out, alloc, "trigram_cap", watcher.trigramFileCap());
+    appendJsonKeyNum(out, alloc, "trigram_cap", watcher.trigramFileCap());
     out.appendSlice(alloc, ",") catch {};
     appendJsonKeyBool(out, alloc, "recall_complete", recall_complete);
     out.append(alloc, '}') catch {};
+}
+
+fn searchResultVisible(r: explore_mod.SearchResult, path_glob: ?[]const u8, compact: bool) bool {
+    if (path_glob) |g| if (!globMatch(g, r.path)) return false;
+    if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) return false;
+    return true;
 }
 
 fn writeSearchResultsJson(
@@ -5196,44 +5222,33 @@ fn writeSearchResultsJson(
 ) void {
     var visible: usize = 0;
     for (results) |r| {
-        if (path_glob) |g| if (!globMatch(g, r.path)) continue;
-        if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
-        visible += 1;
+        if (searchResultVisible(r, path_glob, compact)) visible += 1;
     }
 
     out.appendSlice(alloc, "{\"ok\":true,\"tool\":\"codedb_search\",\"query\":") catch {};
     appendJsonStr(out, alloc, query);
-    out.appendSlice(alloc, ",\"count\":") catch {};
-    var cnt_buf: [16]u8 = undefined;
-    const cnt_s = std.fmt.bufPrint(&cnt_buf, "{d}", .{visible}) catch "0";
-    out.appendSlice(alloc, cnt_s) catch {};
+    out.append(alloc, ',') catch {};
+    appendJsonKeyNum(out, alloc, "count", visible);
     out.appendSlice(alloc, ",") catch {};
     appendSearchProvenanceMeta(out, alloc, explorer);
     if (has_more) {
-        out.appendSlice(alloc, ",\"has_more\":true,\"next_offset\":") catch {};
-        var off_buf: [16]u8 = undefined;
-        const off_s = std.fmt.bufPrint(&off_buf, "{d}", .{offset + results.len}) catch "0";
-        out.appendSlice(alloc, off_s) catch {};
+        out.appendSlice(alloc, ",\"has_more\":true,") catch {};
+        appendJsonKeyNum(out, alloc, "next_offset", offset + results.len);
     }
     out.appendSlice(alloc, ",\"results\":[") catch {};
     var first = true;
     for (results) |r| {
-        if (path_glob) |g| if (!globMatch(g, r.path)) continue;
-        if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
+        if (!searchResultVisible(r, path_glob, compact)) continue;
         if (!first) out.append(alloc, ',') catch {} else first = false;
         out.appendSlice(alloc, "{\"path\":") catch {};
         appendJsonStr(out, alloc, r.path);
-        out.appendSlice(alloc, ",\"line\":") catch {};
-        var line_buf: [16]u8 = undefined;
-        const line_s = std.fmt.bufPrint(&line_buf, "{d}", .{r.line_num}) catch "0";
-        out.appendSlice(alloc, line_s) catch {};
+        out.append(alloc, ',') catch {};
+        appendJsonKeyNum(out, alloc, "line", r.line_num);
         if (!paths_only) {
             out.appendSlice(alloc, ",\"text\":") catch {};
             appendJsonStr(out, alloc, r.line_text);
-            out.appendSlice(alloc, ",\"score\":") catch {};
-            var score_buf: [32]u8 = undefined;
-            const score_s = std.fmt.bufPrint(&score_buf, "{d}", .{@as(f64, r.score)}) catch "0";
-            out.appendSlice(alloc, score_s) catch {};
+            out.append(alloc, ',') catch {};
+            appendJsonKeyNum(out, alloc, "score", r.score);
             out.appendSlice(alloc, ",\"confidence\":\"ranked\"") catch {};
         }
         out.append(alloc, '}') catch {};
@@ -5615,6 +5630,38 @@ test "issue-258: cached project reads use the project root after contents are re
     try testing.expect(std.mem.indexOf(u8, out.items, "const project = \"secondary\";") != null);
 }
 
+/// Point HOME at a `.home` directory inside `tmp` so central-cache tests
+/// (which derive their path from cio.userHome) stay inside the tmp dir.
+const TestHomeGuard = struct {
+    had_prev: bool,
+    prev_len: usize,
+    prev: [std.fs.max_path_bytes]u8,
+
+    fn restore(self: *const TestHomeGuard) void {
+        if (self.had_prev) {
+            cio.posixSetenv("HOME", self.prev[0..self.prev_len]);
+        } else {
+            cio.posixUnsetenv("HOME");
+        }
+    }
+};
+
+fn setTestHome(io_p: std.Io, tmp_dir: std.Io.Dir) !TestHomeGuard {
+    var guard = TestHomeGuard{ .had_prev = false, .prev_len = 0, .prev = undefined };
+    if (cio.posixGetenv("HOME")) |prev| {
+        if (prev.len <= guard.prev.len) {
+            @memcpy(guard.prev[0..prev.len], prev);
+            guard.prev_len = prev.len;
+            guard.had_prev = true;
+        }
+    }
+    try tmp_dir.createDirPath(io_p, ".home");
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home_len = try tmp_dir.realPathFile(io_p, ".home", &home_buf);
+    cio.posixSetenv("HOME", home_buf[0..home_len]);
+    return guard;
+}
+
 test "ProjectCache loads project from central snapshot cache" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -5629,6 +5676,8 @@ test "ProjectCache loads project from central snapshot cache" {
     var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
     const project_path = project_path_buf[0..project_path_len];
+    const home_guard = try setTestHome(io, tmp.dir);
+    defer home_guard.restore();
 
     const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
     defer testing.allocator.free(data_dir);
@@ -5684,6 +5733,8 @@ test "issue-353: explicit default project loads snapshot when default explorer i
     var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
     const project_path = project_path_buf[0..project_path_len];
+    const home_guard = try setTestHome(io, tmp.dir);
+    defer home_guard.restore();
 
     const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
     defer testing.allocator.free(data_dir);
@@ -5728,6 +5779,8 @@ test "issue-353: project cache invalidation reloads newly written snapshots" {
     var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
     const project_path = project_path_buf[0..project_path_len];
+    const home_guard = try setTestHome(io, tmp.dir);
+    defer home_guard.restore();
 
     const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
     defer testing.allocator.free(data_dir);
@@ -5811,4 +5864,147 @@ test "codedb_snapshot cache reuses output until store seq changes" {
     bench_ctx.runDispatch(io, alloc, .codedb_snapshot, args, &third, &store, &explorer, &agents);
     try testing.expect(std.mem.indexOf(u8, third.items, "changed") != null);
     try testing.expect(!std.mem.eql(u8, first.items, third.items));
+}
+
+// ── format=json schema tests ────────────────────────────────────────────────
+// The JSON tool surface is a wire contract: clients parse these responses, so
+// the schema (field names, types, count/results consistency) must not drift
+// silently. Each test runs the REAL dispatch path and then parses the output —
+// a parse failure also catches broken string escaping end-to-end.
+
+const JsonToolHarness = struct {
+    explorer: Explorer,
+    store: Store,
+    agents: AgentRegistry,
+    bench_ctx: BenchContext,
+
+    fn init(alloc: std.mem.Allocator) !JsonToolHarness {
+        var h = JsonToolHarness{
+            .explorer = Explorer.init(alloc, explore_mod.Explorer.DEFAULT_CONTENT_CACHE_CAPACITY),
+            .store = Store.init(alloc),
+            .agents = AgentRegistry.init(alloc),
+            .bench_ctx = BenchContext.init(alloc, ".", explore_mod.Explorer.DEFAULT_CONTENT_CACHE_CAPACITY),
+        };
+        errdefer h.deinit();
+        _ = try h.agents.register("__filesystem__");
+        return h;
+    }
+
+    fn deinit(self: *JsonToolHarness) void {
+        self.bench_ctx.deinit();
+        self.agents.deinit();
+        self.store.deinit();
+        self.explorer.deinit();
+    }
+
+    /// Dispatch `tool` with raw JSON `args_json`, parse the response, return it.
+    fn call(self: *JsonToolHarness, alloc: std.mem.Allocator, tool: Tool, args_json: []const u8) !std.json.Parsed(std.json.Value) {
+        var parsed_args = try std.json.parseFromSlice(std.json.Value, alloc, args_json, .{});
+        defer parsed_args.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        self.bench_ctx.runDispatch(testing.io, alloc, tool, &parsed_args.value.object, &out, &self.store, &self.explorer, &self.agents);
+        return std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
+    }
+};
+
+fn expectJsonNumber(v: std.json.Value) !void {
+    switch (v) {
+        .integer, .float => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "codedb_search format=json: response is valid JSON matching the documented schema" {
+    const alloc = testing.allocator;
+    var h = try JsonToolHarness.init(alloc);
+    defer h.deinit();
+    // JSON-hostile content (quotes, backslashes, tab) so a broken escaper makes
+    // the response unparseable instead of silently corrupt.
+    try h.explorer.indexFile("src/alpha.zig", "pub fn jsonNeedle() void {} // \"quoted\" C:\\path\\ and\ttab\n");
+    try h.explorer.indexFile("src/beta.zig", "const x = jsonNeedle();\n");
+
+    var doc = try h.call(alloc, .codedb_search, "{\"query\":\"jsonNeedle\",\"format\":\"json\"}");
+    defer doc.deinit();
+    const root = doc.value.object;
+
+    try testing.expect(root.get("ok").?.bool);
+    try testing.expectEqualStrings("codedb_search", root.get("tool").?.string);
+    try testing.expectEqualStrings("jsonNeedle", root.get("query").?.string);
+
+    const results = root.get("results").?.array;
+    try testing.expect(results.items.len >= 2);
+    try testing.expectEqual(@as(i64, @intCast(results.items.len)), root.get("count").?.integer);
+    for (results.items) |item| {
+        const obj = item.object;
+        try testing.expect(obj.get("path").?.string.len > 0);
+        try testing.expect(obj.get("line").?.integer >= 1);
+        try testing.expect(obj.get("text").?.string.len > 0);
+        try expectJsonNumber(obj.get("score").?);
+        try testing.expectEqualStrings("ranked", obj.get("confidence").?.string);
+    }
+
+    const meta = root.get("meta").?.object;
+    try testing.expectEqualStrings("trigram+outline", meta.get("index").?.string);
+    try testing.expect(meta.get("tier_reached").?.integer >= 0);
+    try testing.expect(meta.get("skip_trigram_files").?.integer >= 0);
+    try testing.expectEqual(@as(i64, 15_000), meta.get("trigram_cap").?.integer);
+    _ = meta.get("recall_complete").?.bool;
+}
+
+test "codedb_symbol format=json: response is valid JSON matching the documented schema" {
+    const alloc = testing.allocator;
+    var h = try JsonToolHarness.init(alloc);
+    defer h.deinit();
+    try h.explorer.indexFile("src/widget.zig", "pub fn jsonSymbolNeedle() void {} // \"quoted\" C:\\path\\\n");
+
+    var doc = try h.call(alloc, .codedb_symbol, "{\"name\":\"jsonSymbolNeedle\",\"format\":\"json\"}");
+    defer doc.deinit();
+    const root = doc.value.object;
+
+    try testing.expect(root.get("ok").?.bool);
+    try testing.expectEqualStrings("codedb_symbol", root.get("tool").?.string);
+
+    const meta = root.get("meta").?.object;
+    try testing.expectEqualStrings("symbol_index+outline", meta.get("index").?.string);
+    try testing.expectEqualStrings("exact", meta.get("match_mode").?.string);
+
+    const results = root.get("results").?.array;
+    try testing.expect(results.items.len >= 1);
+    try testing.expectEqual(@as(i64, @intCast(results.items.len)), root.get("count").?.integer);
+    for (results.items) |item| {
+        const obj = item.object;
+        try testing.expectEqualStrings("src/widget.zig", obj.get("path").?.string);
+        try testing.expect(obj.get("line").?.integer >= 1);
+        try testing.expect(obj.get("kind").?.string.len > 0);
+        try testing.expectEqualStrings("jsonSymbolNeedle", obj.get("name").?.string);
+        try expectJsonNumber(obj.get("score").?);
+        try testing.expectEqualStrings("indexed", obj.get("confidence").?.string);
+    }
+}
+
+test "codedb_symbol format=json: error envelope has ok=false, tool, code, and message" {
+    const alloc = testing.allocator;
+    var h = try JsonToolHarness.init(alloc);
+    defer h.deinit();
+    try h.explorer.indexFile("src/widget.zig", "pub fn anything() void {}\n");
+
+    // No name/prefix/pattern/kind => missing_query error, still valid JSON.
+    var doc = try h.call(alloc, .codedb_symbol, "{\"format\":\"json\"}");
+    defer doc.deinit();
+    const root = doc.value.object;
+
+    try testing.expect(!root.get("ok").?.bool);
+    try testing.expectEqualStrings("codedb_symbol", root.get("tool").?.string);
+    const err = root.get("error").?.object;
+    try testing.expectEqualStrings("missing_query", err.get("code").?.string);
+    try testing.expect(err.get("message").?.string.len > 0);
+
+    // Same envelope contract for codedb_search with a missing query.
+    var sdoc = try h.call(alloc, .codedb_search, "{\"format\":\"json\"}");
+    defer sdoc.deinit();
+    const sroot = sdoc.value.object;
+    try testing.expect(!sroot.get("ok").?.bool);
+    try testing.expectEqualStrings("codedb_search", sroot.get("tool").?.string);
+    try testing.expectEqualStrings("missing_query", sroot.get("error").?.object.get("code").?.string);
 }

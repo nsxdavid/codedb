@@ -1426,7 +1426,7 @@ pub const Explorer = struct {
         // munmap'd after contents.deinit (above): the cache holds borrowed slices
         // into these maps, but deinit skips freeing borrowed values, so the maps
         // are still valid through it and only released here.
-        for (self.content_section_maps.items) |m| std.posix.munmap(m);
+        for (self.content_section_maps.items) |m| cio.unmapFileRead(self.allocator, m);
         self.content_section_maps.deinit(self.allocator);
         if (self.root_dir) |d| {
             if (self.io) |io| d.close(io);
@@ -1439,10 +1439,49 @@ pub const Explorer = struct {
         try self.outline_section_bufs.append(self.allocator, buf);
     }
 
+    pub fn outlineSectionMark(self: *const Explorer) usize {
+        return self.outline_section_bufs.items.len;
+    }
+
+    pub fn releaseOutlineSectionsFrom(self: *Explorer, mark: usize) void {
+        while (self.outline_section_bufs.items.len > mark) {
+            const buf = self.outline_section_bufs.pop().?;
+            self.allocator.free(buf);
+        }
+    }
+
     /// Take ownership of an mmap'd snapshot content section that the ContentCache
     /// borrows (value_owned=false) slices from. munmap'd at deinit.
     pub fn adoptContentSection(self: *Explorer, map: []align(std.heap.page_size_min) const u8) !void {
         try self.content_section_maps.append(self.allocator, map);
+    }
+
+    pub fn contentSectionMark(self: *const Explorer) usize {
+        return self.content_section_maps.items.len;
+    }
+
+    pub fn releaseContentSectionsFrom(self: *Explorer, mark: usize) void {
+        while (self.content_section_maps.items.len > mark) {
+            const map = self.content_section_maps.pop().?;
+            cio.unmapFileRead(self.allocator, map);
+        }
+    }
+
+    fn invalidateCallGraphLocked(self: *Explorer) void {
+        if (self.call_centrality) |*c| {
+            c.deinit();
+            self.call_centrality = null;
+        }
+        if (self.call_graph) |*cg| {
+            cg.deinit(self.allocator);
+            self.call_graph = null;
+        }
+    }
+
+    pub fn invalidateCallGraph(self: *Explorer) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.invalidateCallGraphLocked();
     }
 
     /// Number of slots in the heap trigram index id_to_path array (benchmark helper).
@@ -1579,6 +1618,7 @@ pub const Explorer = struct {
 
         try self.rebuildDepsFor(stable_path, &persistent_outline);
         self.rebuildSymbolIndexFor(stable_path, &persistent_outline, !is_new);
+        self.invalidateCallGraphLocked();
 
         // Last fallible step: put frees the prior cache value in place, so it
         // must run only once nothing after it can still need prior_content.
@@ -2284,6 +2324,7 @@ pub const Explorer = struct {
         self.line_offsets.invalidate(path);
         self.word_index.removeFile(path);
         self.trigram_index.removeFile(path);
+        self.invalidateCallGraphLocked();
 
         if (self.outlines.fetchRemove(path)) |kv| {
             var outline = kv.value;
@@ -2873,11 +2914,12 @@ pub const Explorer = struct {
                     .line_end = loc.line_end,
                     .detail = detail,
                 }, score);
-                if (list.items.len >= spec.max_results) break;
             }
-            if (list.items.len >= spec.max_results) break;
         }
 
+        // Collect ALL candidates before sorting — capping during collection
+        // would keep whichever matches hash-map iteration order surfaced
+        // first, not the best-scored ones. The cap applies after the sort.
         var ol_iter = self.outlines.iterator();
         while (ol_iter.next()) |entry| {
             for (entry.value_ptr.symbols.items) |sym| {
@@ -2885,9 +2927,7 @@ pub const Explorer = struct {
                 if (spec.kind) |k| if (sym.kind != k) continue;
                 if (Dedup.contains(list.items, entry.key_ptr.*, sym.line_start)) continue;
                 try appendOne(&list, allocator, entry.key_ptr.*, sym, score);
-                if (list.items.len >= spec.max_results) break;
             }
-            if (list.items.len >= spec.max_results) break;
         }
 
         const SortCtx = struct {
@@ -2899,7 +2939,14 @@ pub const Explorer = struct {
             }
         };
         std.mem.sort(ScoredSymbolResult, list.items, {}, SortCtx.lessThan);
-        if (list.items.len > spec.max_results) list.shrinkRetainingCapacity(spec.max_results);
+        if (list.items.len > spec.max_results) {
+            for (list.items[spec.max_results..]) |r| {
+                allocator.free(r.path);
+                allocator.free(r.symbol.name);
+                if (r.symbol.detail) |d| allocator.free(d);
+            }
+            list.shrinkRetainingCapacity(spec.max_results);
+        }
         return list.toOwnedSlice(allocator);
     }
 
@@ -3190,6 +3237,11 @@ pub const Explorer = struct {
         defer self.mu.unlockShared();
 
         if (max_results == 0) return try allocator.alloc(SearchResult, 0);
+        const reserve_skip_trigram_quota = !self.word_index_complete and self.skip_trigram_files.count() > 0;
+        const primary_tier_limit = if (reserve_skip_trigram_quota and max_results > 1)
+            max_results - 1
+        else
+            max_results;
 
         var breakdown: SearchBreakdown = .{};
         defer self.last_search_breakdown = breakdown;
@@ -3348,16 +3400,16 @@ pub const Explorer = struct {
             if (tier0_order.items.len > 1) {
                 std.sort.pdq(u64, tier0_order.items, {}, std.sort.asc(u64));
             }
-            const tier0_per_file_cap: usize = if (tier0_files.items.len <= 1) max_results else @max(1, max_results / 5);
+            const tier0_per_file_cap: usize = if (tier0_files.items.len <= 1) primary_tier_limit else @max(1, primary_tier_limit / 5);
             var tier0_exact_capacity: usize = 0;
             for (tier0_order.items) |key| {
                 tier0_exact_capacity += @min(@as(usize, tier0_files.items[@as(u32, @truncate(key))].count), tier0_per_file_cap);
-                if (tier0_exact_capacity >= max_results) break;
+                if (tier0_exact_capacity >= primary_tier_limit) break;
             }
-            const use_line_hits = tier0_exact_capacity >= max_results and tier0_per_file_cap <= 256;
+            const use_line_hits = tier0_exact_capacity >= primary_tier_limit and tier0_per_file_cap <= 256;
             for (tier0_order.items) |key| {
                 const stats = tier0_files.items[@as(u32, @truncate(key))];
-                if (result_list.items.len >= max_results) break;
+                if (result_list.items.len >= primary_tier_limit) break;
                 const ref = self.readContentForSearch(stats.path, allocator) orelse continue;
                 defer ref.deinit();
                 if (use_line_hits) {
@@ -3373,9 +3425,9 @@ pub const Explorer = struct {
                     }
                     var spans: [256]LineOffsetCache.Span = undefined;
                     if (self.line_offsets.lineSpans(stats.path, ref.data, target_lines[0..target_count], &spans)) |n_spans| {
-                        result_list.ensureUnusedCapacity(allocator, @min(n_spans, max_results - result_list.items.len)) catch {};
+                        result_list.ensureUnusedCapacity(allocator, @min(n_spans, primary_tier_limit - result_list.items.len)) catch {};
                         for (spans[0..n_spans]) |sp| {
-                            if (result_list.items.len >= max_results) break;
+                            if (result_list.items.len >= primary_tier_limit) break;
                             const line_text = try allocator.dupe(u8, ref.data[sp.start..sp.end]);
                             errdefer allocator.free(line_text);
                             const path_copy = try allocator.dupe(u8, stats.path);
@@ -3383,22 +3435,31 @@ pub const Explorer = struct {
                             try result_list.append(allocator, .{ .path = path_copy, .line_num = sp.line, .line_text = line_text });
                         }
                     } else {
-                        try appendTargetLineHits(stats.path, ref.data, allocator, target_lines[0..target_count], max_results, &result_list);
+                        try appendTargetLineHits(stats.path, ref.data, allocator, target_lines[0..target_count], primary_tier_limit, &result_list);
                     }
-                    if (result_list.items.len < max_results) searched.put(stats.path, {}) catch {};
+                    if (reserve_skip_trigram_quota or result_list.items.len < primary_tier_limit) searched.put(stats.path, {}) catch {};
                 } else {
                     searched.put(stats.path, {}) catch {};
-                    try searchInContent(stats.path, ref.data, query, allocator, tier0_per_file_cap, max_results, &result_list);
+                    try searchInContent(stats.path, ref.data, query, allocator, tier0_per_file_cap, primary_tier_limit, &result_list);
                 }
             }
-            if (result_list.items.len >= max_results) {
+            if (result_list.items.len >= primary_tier_limit) {
                 breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
                 breakdown.tier_reached = 0;
                 breakdown.result_count = @intCast(result_list.items.len);
-                const t_rerank = cio.nanoTimestamp();
-                const res = self.rerankAndFinalize(&result_list, query, allocator);
-                breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
-                return res;
+                if (reserve_skip_trigram_quota) {
+                    // Keep one result slot open for restored/outline-only files in
+                    // Tier 3. A partial word index can contain newly hot files only;
+                    // returning here would starve snapshot-restored files and
+                    // rebuilding the full index here regresses warm search latency.
+                } else if (use_line_hits) {
+                    return result_list.toOwnedSlice(allocator);
+                } else {
+                    const t_rerank = cio.nanoTimestamp();
+                    const res = self.rerankAndFinalize(&result_list, query, allocator);
+                    breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
+                    return res;
+                }
             }
         }
         breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
@@ -3490,11 +3551,12 @@ pub const Explorer = struct {
                     if (searched.contains(path)) continue;
                     const ref = self.readContentForSearch(path, allocator) orelse continue;
                     defer ref.deinit();
-                    try searchInContent(path, ref.data, query, allocator, max_per_file, max_results, &result_list);
-                    if (result_list.items.len >= max_results) {
+                    try searchInContent(path, ref.data, query, allocator, max_per_file, primary_tier_limit, &result_list);
+                    if (result_list.items.len >= primary_tier_limit) {
                         breakdown.tier1_ns = cio.nanoTimestamp() - t1_start;
                         breakdown.tier_reached = 2;
                         breakdown.result_count = @intCast(result_list.items.len);
+                        if (reserve_skip_trigram_quota) break;
                         const t_rerank = cio.nanoTimestamp();
                         const res = self.rerankAndFinalize(&result_list, query, allocator);
                         breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
@@ -4196,16 +4258,17 @@ pub const Explorer = struct {
         @memcpy(buf[pos..][0..close.len], close);
         pos += close.len;
 
-        var file = std.Io.Dir.cwd().openFile(io_inst, path, .{ .mode = .write_only }) catch blk: {
-            break :blk std.Io.Dir.cwd().createFile(io_inst, path, .{ .truncate = false }) catch return;
-        };
+        // .truncate = false opens the existing file or creates it in one call.
+        // .read = true because Windows requires read access on the handle for
+        // length() below, even though we only append with positional writes.
+        var file = std.Io.Dir.cwd().createFile(io_inst, path, .{ .read = true, .truncate = false }) catch return;
         var current_size = file.length(io_inst) catch {
             file.close(io_inst);
             return;
         };
         if (current_size >= size_limit) {
             file.close(io_inst);
-            file = std.Io.Dir.cwd().createFile(io_inst, path, .{ .truncate = true }) catch return;
+            file = std.Io.Dir.cwd().createFile(io_inst, path, .{ .read = true, .truncate = true }) catch return;
             current_size = 0;
         }
         defer file.close(io_inst);
@@ -4478,73 +4541,62 @@ pub const Explorer = struct {
         var edges_tmp = codegraph.buildEdges(a, funcs.items, &resolve, false) catch return;
         defer edges_tmp.deinit(a);
 
-        const edges_owned = self.allocator.alloc(codegraph.Edge, edges_tmp.items.len) catch return;
-        @memcpy(edges_owned, edges_tmp.items);
+        const buildOwned = struct {
+            fn call(
+                exp: *Explorer,
+                edges_src: []const codegraph.Edge,
+                paths: []const []const u8,
+                names: []const []const u8,
+                lines: []const u32,
+            ) !void {
+                const alloc = exp.allocator;
+                const n = paths.len;
 
-        const adj = codegraph.buildAdjacency(self.allocator, edges_owned, n_nodes) catch {
-            self.allocator.free(edges_owned);
-            return;
-        };
+                const edges_owned = try alloc.dupe(codegraph.Edge, edges_src);
+                errdefer alloc.free(edges_owned);
 
-        const np = self.allocator.alloc([]const u8, n_nodes) catch {
-            self.allocator.free(edges_owned);
-            codegraph.freeAdjacency(self.allocator, adj);
-            return;
-        };
-        @memcpy(np, node_path.items);
+                const adj = try codegraph.buildAdjacency(alloc, edges_owned, n);
+                errdefer codegraph.freeAdjacency(alloc, adj);
 
-        const nn = self.allocator.alloc([]const u8, n_nodes) catch {
-            self.allocator.free(edges_owned);
-            codegraph.freeAdjacency(self.allocator, adj);
-            self.allocator.free(np);
-            return;
-        };
-        @memcpy(nn, node_name.items);
+                const np = try alloc.dupe([]const u8, paths);
+                errdefer alloc.free(np);
 
-        const nl = self.allocator.alloc(u32, n_nodes) catch {
-            self.allocator.free(edges_owned);
-            codegraph.freeAdjacency(self.allocator, adj);
-            self.allocator.free(np);
-            self.allocator.free(nn);
-            return;
-        };
-        @memcpy(nl, node_line.items);
+                const nn = try alloc.dupe([]const u8, names);
+                errdefer alloc.free(nn);
 
-        const node_scores = if (cio.posixGetenv("CODEDB_IN_DEGREE_CENTRALITY") != null)
-            codegraph.inDegreeCentrality(self.allocator, edges_owned, n_nodes) catch null
-        else
-            codegraph.pageRank(self.allocator, edges_owned, n_nodes, 0.85, 20) catch null;
-        if (node_scores == null) {
-            self.allocator.free(edges_owned);
-            codegraph.freeAdjacency(self.allocator, adj);
-            self.allocator.free(np);
-            self.allocator.free(nn);
-            self.allocator.free(nl);
-            return;
-        }
-        defer self.allocator.free(node_scores.?);
+                const nl = try alloc.dupe(u32, lines);
+                errdefer alloc.free(nl);
 
-        if (self.call_centrality == null) {
-            var cmap = std.StringHashMap(f32).init(self.allocator);
-            for (np, node_scores.?) |path, score| {
-                if (score == 0) continue;
-                const gop = cmap.getOrPut(path) catch continue;
-                if (!gop.found_existing) gop.value_ptr.* = 0;
-                gop.value_ptr.* += score;
+                const node_scores = if (cio.posixGetenv("CODEDB_IN_DEGREE_CENTRALITY") != null)
+                    try codegraph.inDegreeCentrality(alloc, edges_owned, n)
+                else
+                    try codegraph.pageRank(alloc, edges_owned, n, 0.85, 20);
+                defer alloc.free(node_scores);
+
+                if (exp.call_centrality == null) {
+                    var cmap = std.StringHashMap(f32).init(alloc);
+                    for (np, node_scores) |path, score| {
+                        if (score == 0) continue;
+                        const gop = cmap.getOrPut(path) catch continue;
+                        if (!gop.found_existing) gop.value_ptr.* = 0;
+                        gop.value_ptr.* += score;
+                    }
+                    exp.call_centrality = cmap;
+                }
+
+                exp.call_graph = .{
+                    .edges = edges_owned,
+                    .adj = adj,
+                    .node_path = np,
+                    .node_name = nn,
+                    .node_line = nl,
+                };
+                // The graph-distance boost gate just flipped:
+                // results cached before the build could differ from a fresh search.
+                exp.bumpSearchGen();
             }
-            self.call_centrality = cmap;
-        }
-
-        self.call_graph = .{
-            .edges = edges_owned,
-            .adj = adj,
-            .node_path = np,
-            .node_name = nn,
-            .node_line = nl,
-        };
-        // The graph-distance boost gate (`call_graph != null`) just flipped:
-        // results cached before the build could differ from a fresh search.
-        self.bumpSearchGen();
+        }.call;
+        buildOwned(self, edges_tmp.items, node_path.items, node_name.items, node_line.items) catch return;
     }
 
     /// Build `call_centrality` once (idempotent, mutex-guarded). Must be called
@@ -4595,10 +4647,22 @@ pub const Explorer = struct {
 
         var steps: std.ArrayList(CallPathStep) = .empty;
         errdefer steps.deinit(allocator);
+        errdefer {
+            for (steps.items) |s| {
+                allocator.free(s.path);
+                allocator.free(s.name);
+            }
+        }
+        // Dupe into the caller's allocator: cg.node_path/node_name live in the
+        // call graph, which any indexFile/removeFile invalidates after the
+        // shared lock here is released. Borrowed slices would dangle.
         for (path) |nid| {
+            const step_path = try allocator.dupe(u8, cg.node_path[nid]);
+            errdefer allocator.free(step_path);
+            const step_name = try allocator.dupe(u8, cg.node_name[nid]);
             try steps.append(allocator, .{
-                .path = cg.node_path[nid],
-                .name = cg.node_name[nid],
+                .path = step_path,
+                .name = step_name,
                 .line = cg.node_line[nid],
             });
         }
@@ -7993,11 +8057,8 @@ fn isRelativeImport(spec: []const u8) bool {
 /// File extension of a path including the leading dot (".ts"), or null if the
 /// final segment has none. A leading-dot file (".env") counts as no extension.
 fn pathExtension(path: []const u8) ?[]const u8 {
-    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| path[s + 1 ..] else path;
-    if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| {
-        if (dot > 0) return base[dot..];
-    }
-    return null;
+    const ext = std.fs.path.extension(path);
+    return if (ext.len == 0) null else ext;
 }
 
 /// Resolve a relative import specifier (`./` or `../`) against the importing
@@ -8057,14 +8118,7 @@ fn resolveDartImport(raw: []const u8, file_path: []const u8, allocator: std.mem.
         return allocator.dupe(u8, raw) catch null;
     }
 
-    const dir = if (std.mem.lastIndexOfScalar(u8, file_path, '/')) |sep|
-        file_path[0..sep]
-    else
-        ".";
-    const joined = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, raw }) catch return null;
-    const result = normalizePath(joined, allocator);
-    allocator.free(joined);
-    return result;
+    return resolveRelativeImportPath(file_path, raw, allocator);
 }
 
 fn containsAny(s: []const u8, needles: []const []const u8) bool {

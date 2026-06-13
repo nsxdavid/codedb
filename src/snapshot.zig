@@ -793,6 +793,7 @@ fn rebuildDepsFromOutline(explorer: *Explorer, path: []const u8, outline: *const
 // Process max-RSS in bytes (macOS getrusage reports bytes; Linux reports KiB).
 // Profiler-only: attribution of load-phase memory growth, not a public API.
 fn loadMaxRssBytes() u64 {
+    if (@import("builtin").os.tag == .windows) return 0;
     var ru: std.c.rusage = undefined;
     if (std.c.getrusage(0, &ru) != 0) return 0;
     const raw: u64 = @intCast(@max(0, ru.maxrss));
@@ -905,6 +906,21 @@ fn loadSnapshotFast(
     store: *Store,
     allocator: std.mem.Allocator,
 ) !bool {
+    const outline_section_mark = explorer.outlineSectionMark();
+    const content_section_mark = explorer.contentSectionMark();
+    var inserted_paths: std.ArrayList([]const u8) = .empty;
+    defer inserted_paths.deinit(allocator);
+    var load_ok = false;
+    defer if (!load_ok) {
+        // POSIX mmap and Windows' aligned heap-read fallback both feed borrowed
+        // content slices into Explorer. If validation rejects the snapshot after
+        // adoption, remove files inserted during this attempt before dropping the
+        // backing sections they may still borrow from.
+        for (inserted_paths.items) |path| explorer.removeFile(path);
+        explorer.releaseOutlineSectionsFrom(outline_section_mark);
+        explorer.releaseContentSectionsFrom(content_section_mark);
+    };
+
     // Optional phase profiler (CODEDB_LOAD_PROFILE): prints a load breakdown to
     // stderr. Near-zero cost when off (one getenv + a few timestamps).
     const prof = cio.posixGetenv("CODEDB_LOAD_PROFILE") != null;
@@ -981,12 +997,15 @@ fn loadSnapshotFast(
     var content_borrowed = false;
     const section: []const u8 = section_blk: {
         const fsize: usize = std.math.cast(usize, file_stat.size) orelse return false;
-        if (std.posix.mmap(null, fsize, .{ .READ = true }, .{ .TYPE = .SHARED }, content_file.handle, 0)) |m| {
+        // POSIX returns a true mmap that can be unmapped with any allocator
+        // parameter; Windows uses an aligned heap buffer, so allocate with the
+        // Explorer allocator that will own the adopted section on success.
+        if (cio.mapFileRead(io, explorer.allocator, content_file, fsize)) |m| {
             if (explorer.adoptContentSection(m)) {
                 content_borrowed = true;
                 break :section_blk m[sec_base..][0..sec_len];
             } else |_| {
-                std.posix.munmap(m);
+                cio.unmapFileRead(explorer.allocator, m);
             }
         } else |_| {}
         const h = allocator.alloc(u8, sec_len) catch return false;
@@ -1098,6 +1117,13 @@ fn loadSnapshotFast(
     if (prof) fresh_ns += cio.nanoTimestamp() - t_fresh0;
     const rss_fresh: u64 = if (prof) loadMaxRssBytes() else 0;
     // ── Pass C: insert restored / changed / outline-only files (sequential). ──
+    // Invalidate the stale call graph at the first explorer mutation — after
+    // header/section validation (so an early-rejected snapshot leaves the
+    // existing graph untouched) but before the snapshot's restored centrality
+    // lands (which this must not wipe). Failed loads from here roll back via
+    // removeFile, which re-invalidates as it goes.
+    explorer.invalidateCallGraph();
+
     // #564: defer the global symbol index — Pass C's per-file rebuilds become
     // no-ops and ensureSymbolIndex builds it from outlines on first
     // symbol/caller/callpath use. Plain search never needs it, so one-shot
@@ -1105,6 +1131,7 @@ fn loadSnapshotFast(
     explorer.markSymbolIndexIncomplete();
     var insert_ns: i128 = 0;
     var store_ns: i128 = 0;
+    inserted_paths.ensureTotalCapacity(allocator, records.items.len) catch return false;
     for (records.items, fresh_results) |record, fr| {
         const path = record.path;
         const content = record.content;
@@ -1125,6 +1152,7 @@ fn loadSnapshotFast(
                 stale_outline.deinit();
             }
             explorer.indexFile(path, dc) catch continue;
+            inserted_paths.appendAssumeCapacity(path);
             const hash = std.hash.Wyhash.hash(0, dc);
             _ = store.recordSnapshot(path, dc.len, hash) catch {};
         } else if (outline_states.fetchRemove(path)) |removed| {
@@ -1136,6 +1164,7 @@ fn loadSnapshotFast(
                 continue;
             };
             if (prof) insert_ns += cio.nanoTimestamp() - t_ins;
+            inserted_paths.appendAssumeCapacity(removed.key);
             const hash = record.stored_hash orelse std.hash.Wyhash.hash(0, content);
             const t_st: i128 = if (prof) cio.nanoTimestamp() else 0;
             _ = store.recordSnapshot(removed.key, content.len, hash) catch {};
@@ -1143,6 +1172,7 @@ fn loadSnapshotFast(
         } else {
             word_index_can_load_from_disk = false;
             explorer.indexFileOutlineOnly(path, content) catch continue;
+            inserted_paths.appendAssumeCapacity(path);
             const hash = record.stored_hash orelse std.hash.Wyhash.hash(0, content);
             _ = store.recordSnapshot(path, content.len, hash) catch {};
         }
@@ -1161,27 +1191,23 @@ fn loadSnapshotFast(
     explorer.markWordIndexIncomplete(word_index_can_load_from_disk);
 
     if (sections.get(@intFromEnum(SectionId.freq_table))) |freq_entry| {
-        if (freq_entry.length == 256 * 256 * 2) {
+        if (freq_entry.length == 256 * 256 * 2) freq_load: {
             const index_mod = @import("index.zig");
-            const ft = allocator.create([256][256]u16) catch return file_count > 0;
-            const freq_file = std.Io.Dir.cwd().openFile(io, snapshot_path, .{}) catch return file_count > 0;
+            // setFrequencyTable copies the table, so ft is freed on every
+            // path -- including success -- and a single defer covers them all.
+            const ft = allocator.create([256][256]u16) catch break :freq_load;
+            defer allocator.destroy(ft);
+            const freq_file = std.Io.Dir.cwd().openFile(io, snapshot_path, .{}) catch break :freq_load;
             defer freq_file.close(io);
             var bulk_buf: [256 * 256 * 2]u8 = undefined;
-            const nr = freq_file.readPositionalAll(io, &bulk_buf, freq_entry.offset) catch {
-                allocator.destroy(ft);
-                return file_count > 0;
-            };
-            if (nr != bulk_buf.len) {
-                allocator.destroy(ft);
-                return file_count > 0;
-            }
+            const nr = freq_file.readPositionalAll(io, &bulk_buf, freq_entry.offset) catch break :freq_load;
+            if (nr != bulk_buf.len) break :freq_load;
             for (0..256) |a| {
                 for (0..256) |b| {
                     ft[a][b] = std.mem.readInt(u16, bulk_buf[(a * 256 + b) * 2 ..][0..2], .little);
                 }
             }
             index_mod.setFrequencyTable(ft);
-            allocator.destroy(ft);
         }
     }
 
@@ -1221,6 +1247,7 @@ fn loadSnapshotFast(
         );
     }
 
+    load_ok = true;
     return true;
 }
 
@@ -1400,7 +1427,7 @@ pub fn writeProjectCacheSnapshot(
     allocator: std.mem.Allocator,
 ) !void {
     const hash = std.hash.Wyhash.hash(0, root_path);
-    const home_raw = cio.posixGetenv("HOME") orelse return;
+    const home_raw = cio.userHome() orelse return;
     const home = allocator.dupe(u8, home_raw) catch return;
     defer allocator.free(home);
     const secondary = std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}/codedb.snapshot", .{ home, hash }) catch return;
@@ -1418,6 +1445,7 @@ pub fn writeProjectCacheSnapshot(
 
     try writeSnapshot(io, explorer, root_path, secondary, allocator);
 }
+
 
 fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
     for (s) |c| {
